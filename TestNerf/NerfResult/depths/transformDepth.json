@@ -8,7 +8,7 @@
     "fl_y": 2666.666748046875,
     "frames": [
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Back_1.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Back_1.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Back_1.png",
             "transform_matrix": [
                 [
@@ -38,7 +38,7 @@
             ]
         },
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Back Right_2.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Back Right_2.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Back Right_2.png",
             "transform_matrix": [
                 [
@@ -68,7 +68,7 @@
             ]
         },
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Right_3.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Right_3.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Right_3.png",
             "transform_matrix": [
                 [
@@ -98,7 +98,7 @@
             ]
         },
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Front Right_4.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Front Right_4.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Front Right_4.png",
             "transform_matrix": [
                 [
@@ -128,7 +128,7 @@
             ]
         },
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Front_5.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Front_5.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Front_5.png",
             "transform_matrix": [
                 [
@@ -158,7 +158,7 @@
             ]
         },
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Front Left_6.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Front Left_6.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Front Left_6.png",
             "transform_matrix": [
                 [
@@ -188,7 +188,7 @@
             ]
         },
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Left_7.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Left_7.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Left_7.png",
             "transform_matrix": [
                 [
@@ -218,7 +218,7 @@
             ]
         },
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Back Left_8.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Back Left_8.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Back Left_8.png",
             "transform_matrix": [
                 [
@@ -248,7 +248,7 @@
             ]
         },
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top Back_9.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top Back_9.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Top Back_9.png",
             "transform_matrix": [
                 [
@@ -278,7 +278,7 @@
             ]
         },
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top Back Right_10.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top Back Right_10.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Top Back Right_10.png",
             "transform_matrix": [
                 [
@@ -308,7 +308,7 @@
             ]
         },
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top Right_11.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top Right_11.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Top Right_11.png",
             "transform_matrix": [
                 [
@@ -338,7 +338,7 @@
             ]
         },
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top Front Right_12.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top Front Right_12.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Top Front Right_12.png",
             "transform_matrix": [
                 [
@@ -368,7 +368,7 @@
             ]
         },
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top Front_13.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top Front_13.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Top Front_13.png",
             "transform_matrix": [
                 [
@@ -398,7 +398,7 @@
             ]
         },
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top Front Left_14.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top Front Left_14.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Top Front Left_14.png",
             "transform_matrix": [
                 [
@@ -428,7 +428,7 @@
             ]
         },
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top Left_15.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top Left_15.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Top Left_15.png",
             "transform_matrix": [
                 [
@@ -458,7 +458,7 @@
             ]
         },
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top Back Left_16.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top Back Left_16.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Top Back Left_16.png",
             "transform_matrix": [
                 [
@@ -488,7 +488,7 @@
             ]
         },
         {
-            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top_17.bin",
+            "depth_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\NeRF_Pytorch\\TestNerf\\NerfResult\\depths\\depth_render_Camera_Top_17.bin",
             "file_path": "C:\\Users\\adria\\Documents\\GitHub\\OptixProjectCMake\\TestNerf\\NerfResult\\images\\render_Camera_Top_17.png",
             "transform_matrix": [
                 [

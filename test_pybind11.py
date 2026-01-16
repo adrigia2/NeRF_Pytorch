@@ -4,7 +4,8 @@ import os
 
 from matplotlib import pyplot as plt
 
-REPO = Path(__file__).resolve().parents[1]  # ...\OptixProjectCMake
+# ..\OptixProjectCMake
+REPO = Path(__file__).resolve().parents[1] / "OptixProjectCMake"
 PYD_DIR = (REPO / "out" / "build" / "x64-debug").resolve()
 
 # Windows + Python 3.8+: aiuta per trovare DLL dipendenti
@@ -20,14 +21,14 @@ print("Loaded:", dm.__file__)
 mesh = dm.TriangleMesh()
 
 # resolve full path
-# /TestNerf/vase.obj
-obj_path = REPO / "NeRF_Pytorch" / "TestNerf" / "vase.obj"
+# /SwordShield/vase.obj
+obj_path = REPO / "Scenes" / "SwordShield" / "Models" / "SwordShield.obj"
 print("Obj path:", obj_path.resolve())
 
-transform_json_path = REPO / "NeRF_Pytorch" / "TestNerf" / "NerfResult" / "transforms.json"
+transform_json_path = REPO / "Scenes" / "SwordShield" / "Nerf" / "transforms.json"
 print("Transform JSON path:", transform_json_path.resolve())
 
-depths_output_path = REPO / "NeRF_Pytorch" / "TestNerf" / "NerfResult" / "depths"
+depths_output_path = REPO / "Scenes" / "SwordShield" / "Depth"
 print("Depths output path:", depths_output_path.resolve())
 
 mesh.addFromObjFile(str(obj_path.resolve()))
@@ -42,7 +43,7 @@ import json
 from pathlib import Path
 import numpy as np
 
-json_path = REPO / "NeRF_Pytorch" / "TestNerf" / "NerfResult" / "depths" / "transformDepth.json"
+json_path = REPO / "Scenes" / "SwordShield" / "Depth" / "transformDepth.json"
 # oppure: json_path = Path(r"C:\percorso\completo\transformDepth.json")
 
 data = json.loads(json_path.read_text(encoding="utf-8"))
