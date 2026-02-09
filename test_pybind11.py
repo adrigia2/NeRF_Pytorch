@@ -3,6 +3,7 @@ import sys
 import os
 
 from matplotlib import pyplot as plt
+from PIL import Image
 
 # ..\OptixProjectCMake
 REPO = Path(__file__).resolve().parents[1] / "OptixProjectCMake"
@@ -84,17 +85,19 @@ if num_frames > 0:
         # Ridimensiona l'array in una matrice 2D usando le dimensioni dal JSON padre
         depth_map = depth_data.reshape((height, width))
         
-        # Leggi l'immagine RGB
-        rgb_image = plt.imread(str(image_file))
+        # Leggi l'immagine RGB e ridimensionala per corrispondere alle dimensioni della depth map
+        rgb_pil = Image.open(str(image_file))
+        rgb_pil_resized = rgb_pil.resize((width, height), Image.LANCZOS)
+        rgb_image = np.array(rgb_pil_resized)
         
         # Visualizza l'immagine RGB nel subplot corrente (colonna sinistra)
-        axes[i*2].imshow(rgb_image)
-        axes[i*2].set_title(f"Frame {i+1:03d} - RGB\n{Path(frame['file_path']).name}")
+        axes[i*2].imshow(rgb_image, aspect='auto')
+        axes[i*2].set_title(f"Frame {i+1:03d} - RGB ({rgb_image.shape[1]}x{rgb_image.shape[0]})\n{Path(frame['file_path']).name}")
         axes[i*2].axis('off')
         
         # Visualizza la depth map nel subplot successivo (colonna destra)
-        im = axes[i*2+1].imshow(depth_map, cmap='viridis')
-        axes[i*2+1].set_title(f"Frame {i+1:03d} - Depth\n{Path(frame['depth_path']).name}")
+        im = axes[i*2+1].imshow(depth_map, cmap='viridis', aspect='auto')
+        axes[i*2+1].set_title(f"Frame {i+1:03d} - Depth ({depth_map.shape[1]}x{depth_map.shape[0]})\n{Path(frame['depth_path']).name}")
         axes[i*2+1].axis('off')
         plt.colorbar(im, ax=axes[i*2+1], fraction=0.046, pad=0.04)
     
