@@ -59,8 +59,8 @@ IUM_OUTPUT_DIR = f"{OUTPUT_DIR}/ium/"
 TRANSFORMS_OUTPUT = f"{OUTPUT_DIR}/transforms_with_depth.json"
 
 # Risoluzione per IUM
-IUM_WIDTH = 1024
-IUM_HEIGHT = 1024
+IUM_WIDTH = 256
+IUM_HEIGHT = 256
 
 # Tipo di immagine per depth maps e IUM
 IMAGE_TYPE = optix.ImageResultType.OpenEXR  # o ImageResultType.BMP
