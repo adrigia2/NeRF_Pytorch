@@ -1,0 +1,596 @@
+{
+    "camera_angle_x": 0.6911111611634243,
+    "camera_angle_y": 0.39959649248062956,
+    "fl_x": 2666.6666666666665,
+    "fl_y": 2666.6666666666665,
+    "cx": 960.0,
+    "cy": 540.0,
+    "w": 1920,
+    "h": 1080,
+    "scale": 0.2,
+    "aabb_scale": 16,
+    "frames": [
+        {
+            "file_path": "images/render_Camera_Back_1.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    -1.0,
+                    0.0,
+                    6.123234262925839e-17,
+                    6.123233998228043e-16
+                ],
+                [
+                    6.123234262925839e-17,
+                    0.0,
+                    1.0,
+                    10.0
+                ],
+                [
+                    0.0,
+                    1.0,
+                    0.0,
+                    1.0
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Back_1_depth.png",
+            "position_path": "position/render_Camera_Back_1_position.png",
+            "normal_path": "normal/render_Camera_Back_1_normal.png",
+            "mask_path": "mask/render_Camera_Back_1_mask.png"
+        },
+        {
+            "file_path": "images/render_Camera_Back Right_2.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    -0.7071068286895752,
+                    0.0,
+                    -0.7071067690849304,
+                    -7.071067810058594
+                ],
+                [
+                    -0.7071068286895752,
+                    0.0,
+                    0.7071067690849304,
+                    7.071067810058594
+                ],
+                [
+                    0.0,
+                    1.0,
+                    0.0,
+                    1.0
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Back Right_2_depth.png",
+            "position_path": "position/render_Camera_Back Right_2_position.png",
+            "normal_path": "normal/render_Camera_Back Right_2_normal.png",
+            "mask_path": "mask/render_Camera_Back Right_2_mask.png"
+        },
+        {
+            "file_path": "images/render_Camera_Right_3.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    -1.2246468525851679e-16,
+                    0.0,
+                    -1.0,
+                    -10.0
+                ],
+                [
+                    -1.0,
+                    0.0,
+                    1.2246468525851679e-16,
+                    1.2246467996456087e-15
+                ],
+                [
+                    0.0,
+                    1.0,
+                    0.0,
+                    1.0
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Right_3_depth.png",
+            "position_path": "position/render_Camera_Right_3_position.png",
+            "normal_path": "normal/render_Camera_Right_3_normal.png",
+            "mask_path": "mask/render_Camera_Right_3_mask.png"
+        },
+        {
+            "file_path": "images/render_Camera_Front Right_4.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    0.7071068286895752,
+                    0.0,
+                    -0.7071067690849304,
+                    -7.071067810058594
+                ],
+                [
+                    -0.7071068286895752,
+                    0.0,
+                    -0.7071067690849304,
+                    -7.071067810058594
+                ],
+                [
+                    0.0,
+                    1.0,
+                    0.0,
+                    1.0
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Front Right_4_depth.png",
+            "position_path": "position/render_Camera_Front Right_4_position.png",
+            "normal_path": "normal/render_Camera_Front Right_4_normal.png",
+            "mask_path": "mask/render_Camera_Front Right_4_mask.png"
+        },
+        {
+            "file_path": "images/render_Camera_Front_5.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    1.0,
+                    0.0,
+                    -1.8369701465288538e-16,
+                    -1.8369700935892946e-15
+                ],
+                [
+                    -1.8369701465288538e-16,
+                    0.0,
+                    -1.0,
+                    -10.0
+                ],
+                [
+                    0.0,
+                    1.0,
+                    0.0,
+                    1.0
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Front_5_depth.png",
+            "position_path": "position/render_Camera_Front_5_position.png",
+            "normal_path": "normal/render_Camera_Front_5_normal.png",
+            "mask_path": "mask/render_Camera_Front_5_mask.png"
+        },
+        {
+            "file_path": "images/render_Camera_Front Left_6.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    0.7071068286895752,
+                    0.0,
+                    0.7071067690849304,
+                    7.071067810058594
+                ],
+                [
+                    0.7071068286895752,
+                    0.0,
+                    -0.7071067690849304,
+                    -7.071067810058594
+                ],
+                [
+                    0.0,
+                    1.0,
+                    0.0,
+                    1.0
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Front Left_6_depth.png",
+            "position_path": "position/render_Camera_Front Left_6_position.png",
+            "normal_path": "normal/render_Camera_Front Left_6_normal.png",
+            "mask_path": "mask/render_Camera_Front Left_6_mask.png"
+        },
+        {
+            "file_path": "images/render_Camera_Left_7.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    0.0,
+                    0.0,
+                    1.0,
+                    10.0
+                ],
+                [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0
+                ],
+                [
+                    0.0,
+                    1.0,
+                    0.0,
+                    1.0
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Left_7_depth.png",
+            "position_path": "position/render_Camera_Left_7_position.png",
+            "normal_path": "normal/render_Camera_Left_7_normal.png",
+            "mask_path": "mask/render_Camera_Left_7_mask.png"
+        },
+        {
+            "file_path": "images/render_Camera_Back Left_8.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    -0.7071068286895752,
+                    0.0,
+                    0.7071067690849304,
+                    7.071067810058594
+                ],
+                [
+                    0.7071068286895752,
+                    0.0,
+                    0.7071067690849304,
+                    7.071067810058594
+                ],
+                [
+                    0.0,
+                    1.0,
+                    0.0,
+                    1.0
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Back Left_8_depth.png",
+            "position_path": "position/render_Camera_Back Left_8_position.png",
+            "normal_path": "normal/render_Camera_Back Left_8_normal.png",
+            "mask_path": "mask/render_Camera_Back Left_8_mask.png"
+        },
+        {
+            "file_path": "images/render_Camera_Top Back_9.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    -1.0,
+                    -4.329780301713277e-17,
+                    4.329780301713277e-17,
+                    4.329780169364379e-16
+                ],
+                [
+                    6.123234262925839e-17,
+                    -0.7071067690849304,
+                    0.7071067690849304,
+                    7.071067810058594
+                ],
+                [
+                    0.0,
+                    0.7071067690849304,
+                    0.7071067690849304,
+                    8.071067810058594
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Top Back_9_depth.png",
+            "position_path": "position/render_Camera_Top Back_9_position.png",
+            "normal_path": "normal/render_Camera_Top Back_9_normal.png",
+            "mask_path": "mask/render_Camera_Top Back_9_mask.png"
+        },
+        {
+            "file_path": "images/render_Camera_Top Back Right_10.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    -0.7071067690849304,
+                    0.4999999701976776,
+                    -0.5,
+                    -5.0
+                ],
+                [
+                    -0.7071067690849304,
+                    -0.4999999701976776,
+                    0.5,
+                    5.0
+                ],
+                [
+                    0.0,
+                    0.7071067690849304,
+                    0.7071067690849304,
+                    8.071067810058594
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Top Back Right_10_depth.png",
+            "position_path": "position/render_Camera_Top Back Right_10_position.png",
+            "normal_path": "normal/render_Camera_Top Back Right_10_normal.png",
+            "mask_path": "mask/render_Camera_Top Back Right_10_mask.png"
+        },
+        {
+            "file_path": "images/render_Camera_Top Right_11.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    -1.2246468525851679e-16,
+                    0.7071067690849304,
+                    -0.7071067690849304,
+                    -7.071067810058594
+                ],
+                [
+                    -1.0,
+                    -8.659560603426554e-17,
+                    8.659560603426554e-17,
+                    8.659560338728758e-16
+                ],
+                [
+                    0.0,
+                    0.7071067690849304,
+                    0.7071067690849304,
+                    8.071067810058594
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Top Right_11_depth.png",
+            "position_path": "position/render_Camera_Top Right_11_position.png",
+            "normal_path": "normal/render_Camera_Top Right_11_normal.png",
+            "mask_path": "mask/render_Camera_Top Right_11_mask.png"
+        },
+        {
+            "file_path": "images/render_Camera_Top Front Right_12.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    0.7071067690849304,
+                    0.4999999701976776,
+                    -0.5,
+                    -5.0
+                ],
+                [
+                    -0.7071067690849304,
+                    0.4999999701976776,
+                    -0.5,
+                    -5.0
+                ],
+                [
+                    0.0,
+                    0.7071067690849304,
+                    0.7071067690849304,
+                    8.071067810058594
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Top Front Right_12_depth.png",
+            "position_path": "position/render_Camera_Top Front Right_12_position.png",
+            "normal_path": "normal/render_Camera_Top Front Right_12_normal.png",
+            "mask_path": "mask/render_Camera_Top Front Right_12_mask.png"
+        },
+        {
+            "file_path": "images/render_Camera_Top Front_13.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    1.0,
+                    1.2989341566884322e-16,
+                    -1.2989341566884322e-16,
+                    -1.2989341302186526e-15
+                ],
+                [
+                    -1.8369705435755478e-16,
+                    0.7071067690849304,
+                    -0.7071067690849304,
+                    -7.071067810058594
+                ],
+                [
+                    0.0,
+                    0.7071067690849304,
+                    0.7071067690849304,
+                    8.071067810058594
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Top Front_13_depth.png",
+            "position_path": "position/render_Camera_Top Front_13_position.png",
+            "normal_path": "normal/render_Camera_Top Front_13_normal.png",
+            "mask_path": "mask/render_Camera_Top Front_13_mask.png"
+        },
+        {
+            "file_path": "images/render_Camera_Top Front Left_14.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    0.7071067690849304,
+                    -0.4999999701976776,
+                    0.5,
+                    5.0
+                ],
+                [
+                    0.7071067690849304,
+                    0.4999999701976776,
+                    -0.5,
+                    -5.0
+                ],
+                [
+                    0.0,
+                    0.7071067690849304,
+                    0.7071067690849304,
+                    8.071067810058594
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Top Front Left_14_depth.png",
+            "position_path": "position/render_Camera_Top Front Left_14_position.png",
+            "normal_path": "normal/render_Camera_Top Front Left_14_normal.png",
+            "mask_path": "mask/render_Camera_Top Front Left_14_mask.png"
+        },
+        {
+            "file_path": "images/render_Camera_Top Left_15.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    0.0,
+                    -0.7071067690849304,
+                    0.7071067690849304,
+                    7.071067810058594
+                ],
+                [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0
+                ],
+                [
+                    0.0,
+                    0.7071067690849304,
+                    0.7071067690849304,
+                    8.071067810058594
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Top Left_15_depth.png",
+            "position_path": "position/render_Camera_Top Left_15_position.png",
+            "normal_path": "normal/render_Camera_Top Left_15_normal.png",
+            "mask_path": "mask/render_Camera_Top Left_15_mask.png"
+        },
+        {
+            "file_path": "images/render_Camera_Top Back Left_16.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    -0.7071067690849304,
+                    -0.4999999701976776,
+                    0.5,
+                    5.0
+                ],
+                [
+                    0.7071067690849304,
+                    -0.4999999701976776,
+                    0.5,
+                    5.0
+                ],
+                [
+                    0.0,
+                    0.7071067690849304,
+                    0.7071067690849304,
+                    8.071067810058594
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Top Back Left_16_depth.png",
+            "position_path": "position/render_Camera_Top Back Left_16_position.png",
+            "normal_path": "normal/render_Camera_Top Back Left_16_normal.png",
+            "mask_path": "mask/render_Camera_Top Back Left_16_mask.png"
+        },
+        {
+            "file_path": "images/render_Camera_Top_17.png",
+            "sharpness": 1.0,
+            "transform_matrix": [
+                [
+                    -1.0,
+                    8.742277657347586e-08,
+                    0.0,
+                    0.0
+                ],
+                [
+                    -8.742277657347586e-08,
+                    -1.0,
+                    0.0,
+                    0.0
+                ],
+                [
+                    0.0,
+                    0.0,
+                    1.0,
+                    11.0
+                ],
+                [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            ],
+            "depth_path": "depth/render_Camera_Top_17_depth.png",
+            "position_path": "position/render_Camera_Top_17_position.png",
+            "normal_path": "normal/render_Camera_Top_17_normal.png",
+            "mask_path": "mask/render_Camera_Top_17_mask.png"
+        }
+    ],
+    "ium": {
+        "ium_positions_path": "ium/ium_positions.png",
+        "ium_masks_path": "ium/ium_masks.png"
+    }
+}
