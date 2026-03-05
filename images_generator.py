@@ -10,8 +10,8 @@ non supporta dati raw (float), normalizza automaticamente i valori in [0,1].
 from __future__ import annotations
 
 import json
-import math
 import os
+import shutil
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
@@ -216,7 +216,16 @@ def _save_layer(
 
 
 def _build_output_path(base_dir: str, stem: str, layer_name: str, fmt: ImageFormat) -> str:
-    return str(Path(base_dir) / layer_name / f"{stem}_{layer_name}{fmt.extension}")
+    return (Path(base_dir) / layer_name / f"{stem}_{layer_name}{fmt.extension}").resolve().as_posix()
+
+
+def _as_relative_to(abs_path: str, base_dir: str) -> str:
+    """Restituisce abs_path come path relativo rispetto a base_dir in formato posix.
+    Se non è sotto base_dir, ritorna il path posix invariato."""
+    try:
+        return Path(abs_path).relative_to(Path(base_dir)).as_posix()
+    except ValueError:
+        return Path(abs_path).as_posix()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -237,7 +246,8 @@ class CameraIntrinsics:
 
 @dataclass
 class FrameInfo:
-    file_path: str
+    file_path: str          # path assoluto risolto (per accedere al file su disco)
+    file_path_original: str # path così com'è nel JSON originale
     transform_matrix: list[list[float]]
     sharpness: float = 1.0
 
@@ -250,12 +260,15 @@ class FrameInfo:
 class TransformsFile:
     intrinsics: CameraIntrinsics
     frames: list[FrameInfo]
+    transforms_dir: str     # cartella del transforms.json originale
     scale: float = 1.0
     aabb_scale: int = 16
     raw: dict = field(default_factory=dict)
 
 
 def load_transforms(path: str) -> TransformsFile:
+    transforms_dir = Path(path).parent.resolve()
+
     with open(path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
 
@@ -269,9 +282,17 @@ def load_transforms(path: str) -> TransformsFile:
         camera_angle_x=data["camera_angle_x"],
         camera_angle_y=data["camera_angle_y"],
     )
+
+    def _resolve_path(file_path: str) -> str:
+        p = Path(file_path)
+        if p.is_absolute():
+            return p.as_posix()
+        return (transforms_dir / p).resolve().as_posix()
+
     frames = [
         FrameInfo(
-            file_path=f["file_path"],
+            file_path=_resolve_path(f["file_path"]),
+            file_path_original=f["file_path"],
             transform_matrix=f["transform_matrix"],
             sharpness=f.get("sharpness", 1.0),
         )
@@ -280,6 +301,7 @@ def load_transforms(path: str) -> TransformsFile:
     return TransformsFile(
         intrinsics=intr,
         frames=frames,
+        transforms_dir=transforms_dir.as_posix(),
         scale=data.get("scale", 1.0),
         aabb_scale=data.get("aabb_scale", 16),
         raw=data,
@@ -355,6 +377,12 @@ def run_pipeline(cfg: RenderConfig) -> dict:
     intr = tf.intrinsics
     print(f"✓ Trasformazioni caricate: {len(tf.frames)} frame  [{intr.w}×{intr.h}]")
 
+    # json_dir è la cartella del JSON di output — tutti i path nel JSON
+    # saranno relativi a questa cartella, garantendo portabilità
+    json_dir = Path(cfg.output_dir).resolve()
+    json_dir_str = json_dir.as_posix()
+    os.makedirs(json_dir, exist_ok=True)
+
     # ── Carica modello ─────────────────────────────────────────────────────
     model = optix.TriangleMesh()
     model.add_from_obj_file(cfg.model_path)
@@ -381,7 +409,7 @@ def run_pipeline(cfg: RenderConfig) -> dict:
         ium_res = ium_gen.get_result()   # teniamo il riferimento vivo
         print("✓ IUM rendering completato")
 
-        ium_out_dir = str(Path(cfg.output_dir) / "ium")
+        ium_out_dir = json_dir / "ium"
         os.makedirs(ium_out_dir, exist_ok=True)
 
         # positions_np → (N, 3)  con N = ium_w * ium_h
@@ -389,16 +417,20 @@ def run_pipeline(cfg: RenderConfig) -> dict:
             pos_arr = _reshape_flat(
                 ium_res.positions_np.astype(np.float32), ium_w, ium_h
             )
-            ium_pos_path = str(Path(ium_out_dir) / f"ium_positions{cfg.ium_format.extension}")
+            ium_pos_path = (ium_out_dir / f"ium_positions{cfg.ium_format.extension}").resolve().as_posix()
             _save_layer(pos_arr, ium_pos_path, cfg.ium_format, DataLayer.POSITION)
-            ium_result_data["ium_positions_path"] = ium_pos_path
+            ium_result_data["ium_positions_path"] = _as_relative_to(ium_pos_path, json_dir_str)
 
         # masks_np → (N,) uint8 — mappa di validità texel
         if ium_res.has_masks():
             mask_arr = _reshape_flat(ium_res.masks_np, ium_w, ium_h)
-            ium_mask_path = str(Path(ium_out_dir) / f"ium_masks{cfg.ium_format.extension}")
+            ium_mask_path = (ium_out_dir / f"ium_masks{cfg.ium_format.extension}").resolve().as_posix()
             _save_layer(mask_arr, ium_mask_path, cfg.ium_format, DataLayer.MASK)
-            ium_result_data["ium_masks_path"] = ium_mask_path
+            ium_result_data["ium_masks_path"] = _as_relative_to(ium_mask_path, json_dir_str)
+
+    # ── Copia immagini originali in output_dir/images/ ──────────────────────
+    images_out_dir = json_dir / "images"
+    os.makedirs(images_out_dir, exist_ok=True)
 
     # ── Loop sui frame ─────────────────────────────────────────────────────
     output_json = {**tf.raw}
@@ -407,6 +439,15 @@ def run_pipeline(cfg: RenderConfig) -> dict:
 
     for idx, frame in enumerate(tf.frames):
         print(f"\n── Frame {idx + 1}/{len(tf.frames)}: {frame.stem}")
+
+        # Copia l'immagine originale nella sottocartella images/
+        src_image = Path(frame.file_path)
+        dst_image = images_out_dir / src_image.name
+        if src_image.exists():
+            shutil.copy2(src_image, dst_image)
+            print(f"    ✓ Immagine copiata: {dst_image.name}")
+        else:
+            print(f"    ⚠  Immagine non trovata, skip copia: {src_image}")
 
         camera = _camera_from_matrix(frame.transform_matrix, optix)
         depth_gen.set_camera(
@@ -418,7 +459,7 @@ def run_pipeline(cfg: RenderConfig) -> dict:
         result = depth_gen.get_result()  # teniamo il riferimento vivo per tutto il frame
 
         frame_entry: dict = {
-            "file_path":        frame.file_path,
+            "file_path":        _as_relative_to(dst_image.as_posix(), json_dir_str),
             "sharpness":        frame.sharpness,
             "transform_matrix": frame.transform_matrix,
         }
@@ -432,28 +473,28 @@ def run_pipeline(cfg: RenderConfig) -> dict:
                 depth_arr = depth_arr * scale
             out_path = _build_output_path(cfg.output_dir, stem, "depth", cfg.depth_format)
             _save_layer(depth_arr, out_path, cfg.depth_format, DataLayer.DEPTH)
-            frame_entry["depth_path"] = out_path
+            frame_entry["depth_path"] = _as_relative_to(out_path, json_dir_str)
 
         # Position — (N, 3) float32 → reshape (H, W, 3) ------------------------
         if cfg.render_position and result.has_positional_data():
             pos_arr = _reshape_flat(result.positions_np.astype(np.float32), W, H)
             out_path = _build_output_path(cfg.output_dir, stem, "position", cfg.position_format)
             _save_layer(pos_arr, out_path, cfg.position_format, DataLayer.POSITION)
-            frame_entry["position_path"] = out_path
+            frame_entry["position_path"] = _as_relative_to(out_path, json_dir_str)
 
         # Normal — (N, 3) float32 → reshape (H, W, 3) --------------------------
         if cfg.render_normal and result.has_normal_data():
             norm_arr = _reshape_flat(result.normals_np.astype(np.float32), W, H)
             out_path = _build_output_path(cfg.output_dir, stem, "normal", cfg.normal_format)
             _save_layer(norm_arr, out_path, cfg.normal_format, DataLayer.NORMAL)
-            frame_entry["normal_path"] = out_path
+            frame_entry["normal_path"] = _as_relative_to(out_path, json_dir_str)
 
         # Mask — (N,) uint8 → reshape (H, W) -----------------------------------
         if cfg.render_mask:
             mask_arr = _reshape_flat(result.masks_np, W, H)
             out_path = _build_output_path(cfg.output_dir, stem, "mask", cfg.mask_format)
             _save_layer(mask_arr, out_path, cfg.mask_format, DataLayer.MASK)
-            frame_entry["mask_path"] = out_path
+            frame_entry["mask_path"] = _as_relative_to(out_path, json_dir_str)
 
         output_frames.append(frame_entry)
         # result può uscire di scope in sicurezza solo dopo questo punto
@@ -463,8 +504,7 @@ def run_pipeline(cfg: RenderConfig) -> dict:
     if ium_result_data:
         output_json["ium"] = ium_result_data
 
-    out_json_path = str(Path(cfg.output_dir) / "transforms_extended.json")
-    os.makedirs(cfg.output_dir, exist_ok=True)
+    out_json_path = (json_dir / "transforms_extended.json").as_posix()
     with open(out_json_path, "w", encoding="utf-8") as fh:
         json.dump(output_json, fh, indent=4)
     print(f"\n✓ JSON arricchito salvato in: {out_json_path}")
@@ -480,7 +520,7 @@ if __name__ == "__main__":
     REPO = "C:/Users/adria/Documents/GitHub/OptixProjectCMake"
 
     cfg = RenderConfig(
-        transforms_path = f"{REPO}/Scenes/SwordShield/Nerf/transforms.json",
+        transforms_path = f"{REPO}/Scenes/SwordShield/NerfRelative/transforms.json",
         model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
         output_dir      = "output/sworshield_render",
 
