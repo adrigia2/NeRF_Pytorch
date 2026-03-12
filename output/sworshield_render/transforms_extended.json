@@ -39,10 +39,10 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Back_1_depth.exr",
-            "position_path": "position/render_Camera_Back_1_position.exr",
-            "normal_path": "normal/render_Camera_Back_1_normal.exr",
-            "mask_path": "mask/render_Camera_Back_1_mask.exr"
+            "depth_path": "depth/render_Camera_Back_1_depth.png",
+            "position_path": "position/render_Camera_Back_1_position.png",
+            "normal_path": "normal/render_Camera_Back_1_normal.png",
+            "mask_path": "mask/render_Camera_Back_1_mask.png"
         },
         {
             "file_path": "images/render_Camera_Back Right_2.png",
@@ -73,10 +73,10 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Back Right_2_depth.exr",
-            "position_path": "position/render_Camera_Back Right_2_position.exr",
-            "normal_path": "normal/render_Camera_Back Right_2_normal.exr",
-            "mask_path": "mask/render_Camera_Back Right_2_mask.exr"
+            "depth_path": "depth/render_Camera_Back Right_2_depth.png",
+            "position_path": "position/render_Camera_Back Right_2_position.png",
+            "normal_path": "normal/render_Camera_Back Right_2_normal.png",
+            "mask_path": "mask/render_Camera_Back Right_2_mask.png"
         },
         {
             "file_path": "images/render_Camera_Right_3.png",
@@ -107,10 +107,10 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Right_3_depth.exr",
-            "position_path": "position/render_Camera_Right_3_position.exr",
-            "normal_path": "normal/render_Camera_Right_3_normal.exr",
-            "mask_path": "mask/render_Camera_Right_3_mask.exr"
+            "depth_path": "depth/render_Camera_Right_3_depth.png",
+            "position_path": "position/render_Camera_Right_3_position.png",
+            "normal_path": "normal/render_Camera_Right_3_normal.png",
+            "mask_path": "mask/render_Camera_Right_3_mask.png"
         },
         {
             "file_path": "images/render_Camera_Front Right_4.png",
@@ -141,10 +141,10 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Front Right_4_depth.exr",
-            "position_path": "position/render_Camera_Front Right_4_position.exr",
-            "normal_path": "normal/render_Camera_Front Right_4_normal.exr",
-            "mask_path": "mask/render_Camera_Front Right_4_mask.exr"
+            "depth_path": "depth/render_Camera_Front Right_4_depth.png",
+            "position_path": "position/render_Camera_Front Right_4_position.png",
+            "normal_path": "normal/render_Camera_Front Right_4_normal.png",
+            "mask_path": "mask/render_Camera_Front Right_4_mask.png"
         },
         {
             "file_path": "images/render_Camera_Front_5.png",
@@ -175,10 +175,10 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Front_5_depth.exr",
-            "position_path": "position/render_Camera_Front_5_position.exr",
-            "normal_path": "normal/render_Camera_Front_5_normal.exr",
-            "mask_path": "mask/render_Camera_Front_5_mask.exr"
+            "depth_path": "depth/render_Camera_Front_5_depth.png",
+            "position_path": "position/render_Camera_Front_5_position.png",
+            "normal_path": "normal/render_Camera_Front_5_normal.png",
+            "mask_path": "mask/render_Camera_Front_5_mask.png"
         },
         {
             "file_path": "images/render_Camera_Front Left_6.png",
@@ -209,10 +209,10 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Front Left_6_depth.exr",
-            "position_path": "position/render_Camera_Front Left_6_position.exr",
-            "normal_path": "normal/render_Camera_Front Left_6_normal.exr",
-            "mask_path": "mask/render_Camera_Front Left_6_mask.exr"
+            "depth_path": "depth/render_Camera_Front Left_6_depth.png",
+            "position_path": "position/render_Camera_Front Left_6_position.png",
+            "normal_path": "normal/render_Camera_Front Left_6_normal.png",
+            "mask_path": "mask/render_Camera_Front Left_6_mask.png"
         },
         {
             "file_path": "images/render_Camera_Left_7.png",
@@ -243,10 +243,10 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Left_7_depth.exr",
-            "position_path": "position/render_Camera_Left_7_position.exr",
-            "normal_path": "normal/render_Camera_Left_7_normal.exr",
-            "mask_path": "mask/render_Camera_Left_7_mask.exr"
+            "depth_path": "depth/render_Camera_Left_7_depth.png",
+            "position_path": "position/render_Camera_Left_7_position.png",
+            "normal_path": "normal/render_Camera_Left_7_normal.png",
+            "mask_path": "mask/render_Camera_Left_7_mask.png"
         },
         {
             "file_path": "images/render_Camera_Back Left_8.png",
@@ -277,10 +277,10 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Back Left_8_depth.exr",
-            "position_path": "position/render_Camera_Back Left_8_position.exr",
-            "normal_path": "normal/render_Camera_Back Left_8_normal.exr",
-            "mask_path": "mask/render_Camera_Back Left_8_mask.exr"
+            "depth_path": "depth/render_Camera_Back Left_8_depth.png",
+            "position_path": "position/render_Camera_Back Left_8_position.png",
+            "normal_path": "normal/render_Camera_Back Left_8_normal.png",
+            "mask_path": "mask/render_Camera_Back Left_8_mask.png"
         },
         {
             "file_path": "images/render_Camera_Top Back_9.png",
@@ -311,10 +311,10 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Top Back_9_depth.exr",
-            "position_path": "position/render_Camera_Top Back_9_position.exr",
-            "normal_path": "normal/render_Camera_Top Back_9_normal.exr",
-            "mask_path": "mask/render_Camera_Top Back_9_mask.exr"
+            "depth_path": "depth/render_Camera_Top Back_9_depth.png",
+            "position_path": "position/render_Camera_Top Back_9_position.png",
+            "normal_path": "normal/render_Camera_Top Back_9_normal.png",
+            "mask_path": "mask/render_Camera_Top Back_9_mask.png"
         },
         {
             "file_path": "images/render_Camera_Top Back Right_10.png",
@@ -345,10 +345,10 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Top Back Right_10_depth.exr",
-            "position_path": "position/render_Camera_Top Back Right_10_position.exr",
-            "normal_path": "normal/render_Camera_Top Back Right_10_normal.exr",
-            "mask_path": "mask/render_Camera_Top Back Right_10_mask.exr"
+            "depth_path": "depth/render_Camera_Top Back Right_10_depth.png",
+            "position_path": "position/render_Camera_Top Back Right_10_position.png",
+            "normal_path": "normal/render_Camera_Top Back Right_10_normal.png",
+            "mask_path": "mask/render_Camera_Top Back Right_10_mask.png"
         },
         {
             "file_path": "images/render_Camera_Top Right_11.png",
@@ -379,10 +379,10 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Top Right_11_depth.exr",
-            "position_path": "position/render_Camera_Top Right_11_position.exr",
-            "normal_path": "normal/render_Camera_Top Right_11_normal.exr",
-            "mask_path": "mask/render_Camera_Top Right_11_mask.exr"
+            "depth_path": "depth/render_Camera_Top Right_11_depth.png",
+            "position_path": "position/render_Camera_Top Right_11_position.png",
+            "normal_path": "normal/render_Camera_Top Right_11_normal.png",
+            "mask_path": "mask/render_Camera_Top Right_11_mask.png"
         },
         {
             "file_path": "images/render_Camera_Top Front Right_12.png",
@@ -413,10 +413,10 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Top Front Right_12_depth.exr",
-            "position_path": "position/render_Camera_Top Front Right_12_position.exr",
-            "normal_path": "normal/render_Camera_Top Front Right_12_normal.exr",
-            "mask_path": "mask/render_Camera_Top Front Right_12_mask.exr"
+            "depth_path": "depth/render_Camera_Top Front Right_12_depth.png",
+            "position_path": "position/render_Camera_Top Front Right_12_position.png",
+            "normal_path": "normal/render_Camera_Top Front Right_12_normal.png",
+            "mask_path": "mask/render_Camera_Top Front Right_12_mask.png"
         },
         {
             "file_path": "images/render_Camera_Top Front_13.png",
@@ -447,10 +447,10 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Top Front_13_depth.exr",
-            "position_path": "position/render_Camera_Top Front_13_position.exr",
-            "normal_path": "normal/render_Camera_Top Front_13_normal.exr",
-            "mask_path": "mask/render_Camera_Top Front_13_mask.exr"
+            "depth_path": "depth/render_Camera_Top Front_13_depth.png",
+            "position_path": "position/render_Camera_Top Front_13_position.png",
+            "normal_path": "normal/render_Camera_Top Front_13_normal.png",
+            "mask_path": "mask/render_Camera_Top Front_13_mask.png"
         },
         {
             "file_path": "images/render_Camera_Top Front Left_14.png",
@@ -481,10 +481,10 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Top Front Left_14_depth.exr",
-            "position_path": "position/render_Camera_Top Front Left_14_position.exr",
-            "normal_path": "normal/render_Camera_Top Front Left_14_normal.exr",
-            "mask_path": "mask/render_Camera_Top Front Left_14_mask.exr"
+            "depth_path": "depth/render_Camera_Top Front Left_14_depth.png",
+            "position_path": "position/render_Camera_Top Front Left_14_position.png",
+            "normal_path": "normal/render_Camera_Top Front Left_14_normal.png",
+            "mask_path": "mask/render_Camera_Top Front Left_14_mask.png"
         },
         {
             "file_path": "images/render_Camera_Top Left_15.png",
@@ -515,10 +515,10 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Top Left_15_depth.exr",
-            "position_path": "position/render_Camera_Top Left_15_position.exr",
-            "normal_path": "normal/render_Camera_Top Left_15_normal.exr",
-            "mask_path": "mask/render_Camera_Top Left_15_mask.exr"
+            "depth_path": "depth/render_Camera_Top Left_15_depth.png",
+            "position_path": "position/render_Camera_Top Left_15_position.png",
+            "normal_path": "normal/render_Camera_Top Left_15_normal.png",
+            "mask_path": "mask/render_Camera_Top Left_15_mask.png"
         },
         {
             "file_path": "images/render_Camera_Top Back Left_16.png",
@@ -549,10 +549,10 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Top Back Left_16_depth.exr",
-            "position_path": "position/render_Camera_Top Back Left_16_position.exr",
-            "normal_path": "normal/render_Camera_Top Back Left_16_normal.exr",
-            "mask_path": "mask/render_Camera_Top Back Left_16_mask.exr"
+            "depth_path": "depth/render_Camera_Top Back Left_16_depth.png",
+            "position_path": "position/render_Camera_Top Back Left_16_position.png",
+            "normal_path": "normal/render_Camera_Top Back Left_16_normal.png",
+            "mask_path": "mask/render_Camera_Top Back Left_16_mask.png"
         },
         {
             "file_path": "images/render_Camera_Top_17.png",
@@ -583,14 +583,15 @@
                     1.0
                 ]
             ],
-            "depth_path": "depth/render_Camera_Top_17_depth.exr",
-            "position_path": "position/render_Camera_Top_17_position.exr",
-            "normal_path": "normal/render_Camera_Top_17_normal.exr",
-            "mask_path": "mask/render_Camera_Top_17_mask.exr"
+            "depth_path": "depth/render_Camera_Top_17_depth.png",
+            "position_path": "position/render_Camera_Top_17_position.png",
+            "normal_path": "normal/render_Camera_Top_17_normal.png",
+            "mask_path": "mask/render_Camera_Top_17_mask.png"
         }
     ],
     "ium": {
-        "ium_positions_path": "ium/ium_positions.exr",
-        "ium_masks_path": "ium/ium_masks.exr"
+        "ium_positions_path": "ium/ium_positions.png",
+        "ium_masks_path": "ium/ium_masks.png",
+        "visibility_path": "visibility/visibility.png"
     }
 }
