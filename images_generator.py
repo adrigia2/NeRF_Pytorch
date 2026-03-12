@@ -43,6 +43,7 @@ class DataLayer(Enum):
     POSITION = auto()   # coordinate world-space → raw float
     NORMAL   = auto()   # vettori [-1,1] → NO raw richiesto ma float ok
     MASK     = auto()   # uint8 0/1 → non raw, nessuna normalizzazione float
+    VISIBILITY = auto() # ratio float [0, 1] o bool uint8
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -65,6 +66,7 @@ class ExrWriter:
       (H, W)      → canale singolo  'Z'
       (H, W, 3)   → canali RGB      'R','G','B'
       (H, W, 4)   → canali RGBA     'R','G','B','A'
+      (H, W, C)   → arbitrary       'Cam0', 'Cam1', ...
     """
 
     def write(self, array: np.ndarray, path: str) -> None:
@@ -81,10 +83,15 @@ class ExrWriter:
             f.writePixels({"Z": array.tobytes()})
         elif array.ndim == 3:
             h, w, c = array.shape
-            channel_names = {1: ["Z"], 3: ["R", "G", "B"], 4: ["R", "G", "B", "A"]}
-            names = channel_names.get(c)
-            if names is None:
-                raise ValueError(f"ExrWriter: numero di canali non supportato: {c}")
+            if c == 1:
+                names = ["Z"]
+            elif c == 3:
+                names = ["R", "G", "B"]
+            elif c == 4:
+                names = ["R", "G", "B", "A"]
+            else:
+                names = [f"Cam{i}" for i in range(c)] # N-channel mapping
+                
             header = OpenEXR.Header(w, h)
             header["channels"] = {
                 n: Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)) for n in names
@@ -344,6 +351,7 @@ class RenderConfig:
     render_normal:   bool = True
     render_mask     : bool = True   # mask di validità per ogni frame
     render_ium      : bool = True
+    render_visibility: bool = True
 
     # Formato di salvataggio per ogni layer
     depth_format:    ImageFormat = ImageFormat.OPENEXR
@@ -351,6 +359,7 @@ class RenderConfig:
     normal_format:   ImageFormat = ImageFormat.OPENEXR
     mask_format:     ImageFormat = ImageFormat.PNG      # uint8 → PNG è naturale
     ium_format:      ImageFormat = ImageFormat.PNG
+    visibility_format: ImageFormat = ImageFormat.OPENEXR
 
     # Dimensione texture IUM [width, height]
     ium_texture_size: list[int] = field(default_factory=lambda: [512, 512])
@@ -427,6 +436,41 @@ def run_pipeline(cfg: RenderConfig) -> dict:
             ium_mask_path = (ium_out_dir / f"ium_masks{cfg.ium_format.extension}").resolve().as_posix()
             _save_layer(mask_arr, ium_mask_path, cfg.ium_format, DataLayer.MASK)
             ium_result_data["ium_masks_path"] = _as_relative_to(ium_mask_path, json_dir_str)
+
+        # ── Pipeline Visibility ──────────────────────────────────────────────
+        if cfg.render_visibility and ium_res.has_positions() and ium_res.has_masks():
+            print("✓ Avvio calcolo Visibilità telecamere...")
+            vis_gen = optix.VisibilityGenerator()
+            vis_gen.set_traversable(model)
+
+            # Raccogliamo tutte le telecamere per il test di visibilità
+            all_cameras = []
+            for frame in tf.frames:
+                cam = _camera_from_matrix(frame.transform_matrix, intr.camera_angle_y, [intr.w, intr.h], optix)
+                all_cameras.append(cam)
+
+            # visibility_map: (H*W, num_cameras) uint8
+            visibility_map = vis_gen.check_visibility(ium_res, ium_w, ium_h, all_cameras)
+            
+            vis_out_dir = json_dir / "visibility"
+            os.makedirs(vis_out_dir, exist_ok=True)
+            vis_path = (vis_out_dir / f"visibility{cfg.visibility_format.extension}").resolve().as_posix()
+
+            if cfg.visibility_format == ImageFormat.OPENEXR:
+                # Shape EXR: (H, W, num_cameras) float32
+                # Nessuna compressione/aggregazione, salviamo il layer booleano per ogni singola telecamera 
+                vis_arr = visibility_map.reshape((ium_h, ium_w, len(all_cameras))).astype(np.float32)
+                _save_layer(vis_arr, vis_path, cfg.visibility_format, DataLayer.VISIBILITY)
+            else:
+                # Shape PNG/Altro: (H, W) greyscale
+                # Somma lungo l'asse delle telecamere (quante vedono quel pixel), mappa in [0, 255]
+                visible_count = np.sum(visibility_map, axis=1) # (N,)
+                ratio = visible_count.astype(np.float32) / float(len(all_cameras))
+                vis_arr = _reshape_flat(ratio, ium_w, ium_h)
+                _save_layer(vis_arr, vis_path, cfg.visibility_format, DataLayer.VISIBILITY)
+            
+            ium_result_data["visibility_path"] = _as_relative_to(vis_path, json_dir_str)
+
 
     # ── Copia immagini originali in output_dir/images/ ──────────────────────
     images_out_dir = json_dir / "images"
@@ -534,6 +578,7 @@ if __name__ == "__main__":
         normal_format   = ImageFormat.OPENEXR,
         mask_format     = ImageFormat.OPENEXR,
         ium_format      = ImageFormat.OPENEXR,
+        visibility_format = ImageFormat.OPENEXR,
 
         ium_texture_size = [512, 512],
         apply_scale      = True,
