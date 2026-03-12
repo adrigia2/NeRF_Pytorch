@@ -312,7 +312,7 @@ def load_transforms(path: str) -> TransformsFile:
 # Estrazione camera da transform_matrix (convenzione NeRF / OpenCV)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _camera_from_matrix(matrix: list[list[float]], optix_mod) -> object:
+def _camera_from_matrix(matrix: list[list[float]], fovy: float, frame_size: list[int], optix_mod) -> object:
     """Ricava posizione, forward e up dalla transform_matrix NeRF 4×4.
 
     Convenzione colonne della matrice c2w:
@@ -325,7 +325,7 @@ def _camera_from_matrix(matrix: list[list[float]], optix_mod) -> object:
     pos     = [m[0][3], m[1][3], m[2][3]]
     forward = [-m[0][2], -m[1][2], -m[2][2]]
     up      = [m[0][1],  m[1][1],  m[2][1]]
-    return optix_mod.Camera(pos, forward, up)
+    return optix_mod.Camera(pos, forward, up, fovy, frame_size)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -449,11 +449,9 @@ def run_pipeline(cfg: RenderConfig) -> dict:
         else:
             print(f"    ⚠  Immagine non trovata, skip copia: {src_image}")
 
-        camera = _camera_from_matrix(frame.transform_matrix, optix)
+        camera = _camera_from_matrix(frame.transform_matrix, intr.camera_angle_y, [intr.w, intr.h], optix)
         depth_gen.set_camera(
-            camera,
-            fovY=intr.camera_angle_y,
-            frameSize=[intr.w, intr.h],
+            camera
         )
         depth_gen.render()
         result = depth_gen.get_result()  # teniamo il riferimento vivo per tutto il frame
@@ -531,11 +529,11 @@ if __name__ == "__main__":
         render_ium      = True,
 
         # Cambia OPENEXR → PNG per normalizzare automaticamente in uint8
-        depth_format    = ImageFormat.PNG,
-        position_format = ImageFormat.PNG,
-        normal_format   = ImageFormat.PNG,
-        mask_format     = ImageFormat.PNG,
-        ium_format      = ImageFormat.PNG,
+        depth_format    = ImageFormat.OPENEXR,
+        position_format = ImageFormat.OPENEXR,
+        normal_format   = ImageFormat.OPENEXR,
+        mask_format     = ImageFormat.OPENEXR,
+        ium_format      = ImageFormat.OPENEXR,
 
         ium_texture_size = [512, 512],
         apply_scale      = True,
