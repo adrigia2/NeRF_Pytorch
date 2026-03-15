@@ -235,6 +235,20 @@ def _as_relative_to(abs_path: str, base_dir: str) -> str:
         return Path(abs_path).as_posix()
 
 
+def _compute_peak(image_np: np.ndarray, percentile: float) -> float:
+    """Calcola il peak dell'immagine come percentile della luminanza massima per pixel."""
+    max_per_pixel = image_np.astype(np.float32).max(axis=-1)  # (H, W)
+    return float(np.percentile(max_per_pixel, percentile))
+
+
+def _load_image_as_vec3(path: str, w: int, h: int) -> np.ndarray:
+    """Carica immagine PIL, ridimensiona a (w, h), ritorna float32 (H*W, 3) normalizzata in [0,1]."""
+    from PIL import Image
+    img = Image.open(path).convert("RGB").resize((w, h), Image.LANCZOS)
+    arr = np.array(img, dtype=np.float32) / 255.0  # (h, w, 3)
+    return arr.reshape(-1, 3)  # (h*w, 3)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Parsing transforms.json
 # ──────────────────────────────────────────────────────────────────────────────
@@ -367,6 +381,12 @@ class RenderConfig:
     # Scala applicata ai depth (coerente con "scale" in transforms.json)
     apply_scale: bool = True
 
+    # Color texture
+    render_color_texture: bool = False
+    color_texture_format: ImageFormat = ImageFormat.OPENEXR
+    # Percentile usato per calcolare il peak (default 95° = scarta il top 5% più luminoso)
+    color_texture_peak_percentile: float = 95.0
+
 
 def run_pipeline(cfg: RenderConfig) -> dict:
     """Esegue l'intera pipeline e restituisce il JSON arricchito.
@@ -437,39 +457,75 @@ def run_pipeline(cfg: RenderConfig) -> dict:
             _save_layer(mask_arr, ium_mask_path, cfg.ium_format, DataLayer.MASK)
             ium_result_data["ium_masks_path"] = _as_relative_to(ium_mask_path, json_dir_str)
 
+        # ── Costruiamo tutte le telecamere (usate sia per visibility che per color texture)
+        all_cameras = []
+        for frame in tf.frames:
+            cam = _camera_from_matrix(frame.transform_matrix, intr.camera_angle_y, [intr.w, intr.h], optix)
+            all_cameras.append(cam)
+
         # ── Pipeline Visibility ──────────────────────────────────────────────
+        visibility_map = None
         if cfg.render_visibility and ium_res.has_positions() and ium_res.has_masks():
             print("✓ Avvio calcolo Visibilità telecamere...")
             vis_gen = optix.VisibilityGenerator()
             vis_gen.set_traversable(model)
 
-            # Raccogliamo tutte le telecamere per il test di visibilità
-            all_cameras = []
-            for frame in tf.frames:
-                cam = _camera_from_matrix(frame.transform_matrix, intr.camera_angle_y, [intr.w, intr.h], optix)
-                all_cameras.append(cam)
-
             # visibility_map: (H*W, num_cameras) uint8
             visibility_map = vis_gen.check_visibility(ium_res, ium_w, ium_h, all_cameras)
-            
+
             vis_out_dir = json_dir / "visibility"
             os.makedirs(vis_out_dir, exist_ok=True)
             vis_path = (vis_out_dir / f"visibility{cfg.visibility_format.extension}").resolve().as_posix()
 
             if cfg.visibility_format == ImageFormat.OPENEXR:
                 # Shape EXR: (H, W, num_cameras) float32
-                # Nessuna compressione/aggregazione, salviamo il layer booleano per ogni singola telecamera 
+                # Nessuna compressione/aggregazione, salviamo il layer booleano per ogni singola telecamera
                 vis_arr = visibility_map.reshape((ium_h, ium_w, len(all_cameras))).astype(np.float32)
                 _save_layer(vis_arr, vis_path, cfg.visibility_format, DataLayer.VISIBILITY)
             else:
                 # Shape PNG/Altro: (H, W) greyscale
                 # Somma lungo l'asse delle telecamere (quante vedono quel pixel), mappa in [0, 255]
-                visible_count = np.sum(visibility_map, axis=1) # (N,)
+                visible_count = np.sum(visibility_map, axis=1)  # (N,)
                 ratio = visible_count.astype(np.float32) / float(len(all_cameras))
                 vis_arr = _reshape_flat(ratio, ium_w, ium_h)
                 _save_layer(vis_arr, vis_path, cfg.visibility_format, DataLayer.VISIBILITY)
-            
+
             ium_result_data["visibility_path"] = _as_relative_to(vis_path, json_dir_str)
+
+        # ── Pipeline Color Texture ───────────────────────────────────────────
+        if (cfg.render_color_texture and cfg.render_ium and cfg.render_visibility
+                and visibility_map is not None):
+            print("✓ Avvio calcolo Color Texture...")
+
+            # Copia le immagini sorgente in images/ prima di caricarle
+            images_out_dir_ct = json_dir / "images"
+            os.makedirs(images_out_dir_ct, exist_ok=True)
+            for frame in tf.frames:
+                src = Path(frame.file_path)
+                if src.exists():
+                    shutil.copy2(src, images_out_dir_ct / src.name)
+
+            optix_frames = []
+            for i, frame in enumerate(tf.frames):
+                cam = all_cameras[i]
+                img_path = (images_out_dir_ct / Path(frame.file_path).name).as_posix()
+                img_flat = _load_image_as_vec3(img_path, intr.w, intr.h)  # (H*W, 3) float32
+                peak = _compute_peak(img_flat.reshape(intr.h, intr.w, 3),
+                                     cfg.color_texture_peak_percentile)
+                optix_frames.append(optix.Frame(cam, peak, img_flat))
+
+            ct_gen = optix.ColorTexGenerator()
+            ct_gen.set_inputs(ium_res, visibility_map, optix_frames)
+            ct_gen.render()
+            ct_result = ct_gen.get_result()
+
+            ct_out_dir = json_dir / "color_texture"
+            os.makedirs(ct_out_dir, exist_ok=True)
+            ct_path = (ct_out_dir / f"color_texture{cfg.color_texture_format.extension}").resolve().as_posix()
+
+            ct_arr = _reshape_flat(ct_result.colors_np.astype(np.float32), ium_w, ium_h)
+            _save_layer(ct_arr, ct_path, cfg.color_texture_format, DataLayer.POSITION)
+            ium_result_data["color_texture_path"] = _as_relative_to(ct_path, json_dir_str)
 
 
     # ── Copia immagini originali in output_dir/images/ ──────────────────────
@@ -571,6 +627,7 @@ if __name__ == "__main__":
         render_normal   = True,
         render_mask     = True,
         render_ium      = True,
+        render_color_texture=True,
 
         # Cambia OPENEXR → PNG per normalizzare automaticamente in uint8
         depth_format    = ImageFormat.OPENEXR,
@@ -579,6 +636,7 @@ if __name__ == "__main__":
         mask_format     = ImageFormat.OPENEXR,
         ium_format      = ImageFormat.OPENEXR,
         visibility_format = ImageFormat.OPENEXR,
+        color_texture_format=ImageFormat.PNG,
 
         ium_texture_size = [512, 512],
         apply_scale      = True,
