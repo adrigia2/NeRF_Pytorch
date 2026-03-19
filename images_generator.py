@@ -385,7 +385,7 @@ class RenderConfig:
     render_color_texture: bool = False
     color_texture_format: ImageFormat = ImageFormat.OPENEXR
     # Percentile usato per calcolare il peak (default 95° = scarta il top 5% più luminoso)
-    color_texture_peak_percentile: float = 95.0
+    color_texture_peak_percentile: float = 100.0
 
 
 def run_pipeline(cfg: RenderConfig) -> dict:
@@ -618,9 +618,9 @@ if __name__ == "__main__":
     REPO = "C:/Users/adria/Documents/GitHub/OptixProjectCMake"
 
     cfg = RenderConfig(
-        transforms_path = f"{REPO}/Scenes/SwordShield/NerfRelative/transforms.json",
+        transforms_path = f"{REPO}/Scenes/SwordShield/NerfRelative2/transforms.json",
         model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-        output_dir      = "output/sworshield_render",
+        output_dir      = "output/sworshield2_render",
 
         render_depth    = True,
         render_position = True,
