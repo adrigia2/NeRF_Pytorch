@@ -630,7 +630,7 @@ if __name__ == "__main__":
     cfg = RenderConfig(
         transforms_path = f"{REPO}/Scenes/SwordShield/NerfRelative2/transforms.json",
         model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-        output_dir      = "output/sworshield3_render",
+        output_dir      = "output/sworshield4_render",
 
         render_depth    = True,
         render_position = True,
