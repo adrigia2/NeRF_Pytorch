@@ -235,6 +235,34 @@ def _as_relative_to(abs_path: str, base_dir: str) -> str:
         return Path(abs_path).as_posix()
 
 
+def _save_debug_comparison(
+    src_img_path,
+    cam_arr: np.ndarray,   # (H, W, 3) float32 in [0,1], camera_texture
+    frame_stem: str,
+    out_dir: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+    from PIL import Image as _PIL
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    src = np.array(_PIL.open(src_img_path).convert("RGB"), dtype=np.float32) / 255.0
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    axes[0].imshow(np.clip(src, 0, 1))
+    axes[0].set_title(f"Camera image\n{frame_stem}")
+    axes[0].axis("off")
+
+    axes[1].imshow(np.clip(cam_arr, 0, 1))
+    axes[1].set_title(f"Camera texture (UV atlas)\n{frame_stem}")
+    axes[1].axis("off")
+
+    fig.tight_layout()
+    out_path = out_dir / f"{frame_stem}.png"
+    fig.savefig(out_path, dpi=100)
+    plt.close(fig)
+
+
 def _compute_peak(image_np: np.ndarray, percentile: float) -> float:
     """Calcola il peak dell'immagine come percentile della luminanza massima per pixel."""
     max_per_pixel = image_np.astype(np.float32).max(axis=-1)  # (H, W)
@@ -387,6 +415,9 @@ class RenderConfig:
     # Percentile usato per calcolare il peak (default 95° = scarta il top 5% più luminoso)
     color_texture_peak_percentile: float = 100.0
 
+    # Debug output
+    debug_camera_texture: bool = False   # salva side-by-side camera image vs camera_texture
+
 
 def run_pipeline(cfg: RenderConfig) -> dict:
     """Esegue l'intera pipeline e restituisce il JSON arricchito.
@@ -536,6 +567,14 @@ def run_pipeline(cfg: RenderConfig) -> dict:
                 cam_arr   = _reshape_flat(cam_slice.astype(np.float32), ium_w, ium_h)
                 cam_path  = (cam_tex_dir / f"{frame.stem}{cfg.color_texture_format.extension}").resolve().as_posix()
                 _save_layer(cam_arr, cam_path, cfg.color_texture_format, DataLayer.POSITION)
+                if cfg.debug_camera_texture:
+                    src_img_path = images_out_dir_ct / Path(frame.file_path).name
+                    _save_debug_comparison(
+                        src_img_path,
+                        cam_arr,
+                        frame.stem,
+                        json_dir / "debug_camera_texture",
+                    )
 
 
     # ── Copia immagini originali in output_dir/images/ ──────────────────────
@@ -630,7 +669,7 @@ if __name__ == "__main__":
     cfg = RenderConfig(
         transforms_path = f"{REPO}/Scenes/SwordShield/NerfRelative2/transforms.json",
         model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-        output_dir      = "output/sworshield4_render",
+        output_dir      = "output/sworshield5_render",
 
         render_depth    = True,
         render_position = True,
@@ -638,6 +677,7 @@ if __name__ == "__main__":
         render_mask     = True,
         render_ium      = True,
         render_color_texture=True,
+        debug_camera_texture=True,
 
         # Cambia OPENEXR → PNG per normalizzare automaticamente in uint8
         depth_format    = ImageFormat.OPENEXR,
