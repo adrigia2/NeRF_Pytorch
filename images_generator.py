@@ -263,6 +263,43 @@ def _save_debug_comparison(
     plt.close(fig)
 
 
+def _save_debug_pixel_change(
+    min_arr: np.ndarray,    # (H, W, 3) float32
+    max_arr: np.ndarray,    # (H, W, 3) float32
+    range_arr: np.ndarray,  # (H, W, 3) float32
+    out_dir: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Normalizza ogni immagine in [0,1] per la visualizzazione
+    def _norm(arr: np.ndarray) -> np.ndarray:
+        mn, mx = arr.min(), arr.max()
+        if mx > mn:
+            return (arr - mn) / (mx - mn)
+        return np.clip(arr, 0.0, 1.0)
+
+    fig, axes = plt.subplots(1, 3, figsize=(21, 7))
+    axes[0].imshow(_norm(min_arr))
+    axes[0].set_title("color_min\n(darkest sample per texel)")
+    axes[0].axis("off")
+
+    axes[1].imshow(_norm(max_arr))
+    axes[1].set_title("color_max\n(brightest sample per texel)")
+    axes[1].axis("off")
+
+    axes[2].imshow(_norm(range_arr))
+    axes[2].set_title("color_range  (max − min)\n(variation map)")
+    axes[2].axis("off")
+
+    fig.tight_layout()
+    out_path = out_dir / "pixel_change_comparison.png"
+    fig.savefig(out_path, dpi=100)
+    plt.close(fig)
+    print(f"    ✓ Debug pixel_change salvato: {out_path}")
+
+
 def _compute_peak(image_np: np.ndarray, percentile: float) -> float:
     """Calcola il peak dell'immagine come percentile della luminanza massima per pixel."""
     max_per_pixel = image_np.astype(np.float32).max(axis=-1)  # (H, W)
@@ -418,6 +455,10 @@ class RenderConfig:
     # Debug output
     debug_camera_texture: bool = False   # salva side-by-side camera image vs camera_texture
 
+    # Pixel change output
+    render_pixel_change: bool = False    # salva min/max/range texture in pixel_change/
+    debug_pixel_change: bool = False     # salva plot comparativo in debug_pixel_change/
+
 
 def run_pipeline(cfg: RenderConfig) -> dict:
     """Esegue l'intera pipeline e restituisce il JSON arricchito.
@@ -558,6 +599,25 @@ def run_pipeline(cfg: RenderConfig) -> dict:
             _save_layer(ct_arr, ct_path, cfg.color_texture_format, DataLayer.POSITION)
             ium_result_data["color_texture_path"] = _as_relative_to(ct_path, json_dir_str)
 
+            if cfg.render_pixel_change:
+                pc_dir = json_dir / "pixel_change"
+                pc_dir.mkdir(parents=True, exist_ok=True)
+
+                min_arr   = _reshape_flat(ct_result.color_min_np.astype(np.float32), ium_w, ium_h)
+                max_arr   = _reshape_flat(ct_result.color_max_np.astype(np.float32), ium_w, ium_h)
+                range_arr = np.clip(max_arr - min_arr, 0.0, None)
+
+                ext = cfg.color_texture_format
+                _save_layer(min_arr,   (pc_dir / f"color_min{ext.extension}").as_posix(),   ext, DataLayer.POSITION)
+                _save_layer(max_arr,   (pc_dir / f"color_max{ext.extension}").as_posix(),   ext, DataLayer.POSITION)
+                _save_layer(range_arr, (pc_dir / f"color_range{ext.extension}").as_posix(), ext, DataLayer.POSITION)
+
+                if cfg.debug_pixel_change:
+                    _save_debug_pixel_change(
+                        min_arr, max_arr, range_arr,
+                        json_dir / "debug_pixel_change",
+                    )
+
             # Per-camera textures
             cam_tex_dir = json_dir / "camera_texture"
             os.makedirs(cam_tex_dir, exist_ok=True)
@@ -669,7 +729,7 @@ if __name__ == "__main__":
     cfg = RenderConfig(
         transforms_path = f"{REPO}/Scenes/SwordShield/NerfRelative2/transforms.json",
         model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-        output_dir      = "output/sworshield5_render",
+        output_dir      = "output/sworshield9_render",
 
         render_depth    = True,
         render_position = True,
@@ -678,6 +738,8 @@ if __name__ == "__main__":
         render_ium      = True,
         render_color_texture=True,
         debug_camera_texture=True,
+        render_pixel_change=True,
+        debug_pixel_change=True,
 
         # Cambia OPENEXR → PNG per normalizzare automaticamente in uint8
         depth_format    = ImageFormat.OPENEXR,
@@ -688,7 +750,7 @@ if __name__ == "__main__":
         visibility_format = ImageFormat.OPENEXR,
         color_texture_format=ImageFormat.PNG,
 
-        ium_texture_size = [512, 512],
+        ium_texture_size = [4096, 4096],
         apply_scale      = True,
     )
 
