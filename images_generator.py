@@ -527,6 +527,16 @@ def run_pipeline(cfg: RenderConfig) -> dict:
             _save_layer(ct_arr, ct_path, cfg.color_texture_format, DataLayer.POSITION)
             ium_result_data["color_texture_path"] = _as_relative_to(ct_path, json_dir_str)
 
+            # Per-camera textures
+            cam_tex_dir = json_dir / "camera_texture"
+            os.makedirs(cam_tex_dir, exist_ok=True)
+            cam_colors = ct_result.camera_colors_np  # (num_pixels, num_cameras, 3)
+            for cam_idx, frame in enumerate(tf.frames):
+                cam_slice = cam_colors[:, cam_idx, :]  # (num_pixels, 3)
+                cam_arr   = _reshape_flat(cam_slice.astype(np.float32), ium_w, ium_h)
+                cam_path  = (cam_tex_dir / f"{frame.stem}{cfg.color_texture_format.extension}").resolve().as_posix()
+                _save_layer(cam_arr, cam_path, cfg.color_texture_format, DataLayer.POSITION)
+
 
     # ── Copia immagini originali in output_dir/images/ ──────────────────────
     images_out_dir = json_dir / "images"
@@ -615,12 +625,12 @@ def run_pipeline(cfg: RenderConfig) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    REPO = "C:/Users/adria/Documents/GitHub/OptixProjectCMake"
+    REPO = "C:/Users/adria/Documents/GitHub/Tesi/OptixProjectCMake"
 
     cfg = RenderConfig(
         transforms_path = f"{REPO}/Scenes/SwordShield/NerfRelative2/transforms.json",
         model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-        output_dir      = "output/sworshield2_render",
+        output_dir      = "output/sworshield3_render",
 
         render_depth    = True,
         render_position = True,
