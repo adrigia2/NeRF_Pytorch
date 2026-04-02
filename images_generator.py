@@ -607,10 +607,13 @@ def run_pipeline(cfg: RenderConfig) -> dict:
                 max_arr   = _reshape_flat(ct_result.color_max_np.astype(np.float32), ium_w, ium_h)
                 range_arr = np.clip(max_arr - min_arr, 0.0, None)
 
+                var_arr   = _reshape_flat(ct_result.color_variance_np.astype(np.float32), ium_w, ium_h)
+
                 ext = cfg.color_texture_format
-                _save_layer(min_arr,   (pc_dir / f"color_min{ext.extension}").as_posix(),   ext, DataLayer.POSITION)
-                _save_layer(max_arr,   (pc_dir / f"color_max{ext.extension}").as_posix(),   ext, DataLayer.POSITION)
-                _save_layer(range_arr, (pc_dir / f"color_range{ext.extension}").as_posix(), ext, DataLayer.POSITION)
+                _save_layer(min_arr,   (pc_dir / f"color_min{ext.extension}").as_posix(),      ext, DataLayer.POSITION)
+                _save_layer(max_arr,   (pc_dir / f"color_max{ext.extension}").as_posix(),      ext, DataLayer.POSITION)
+                _save_layer(range_arr, (pc_dir / f"color_range{ext.extension}").as_posix(),    ext, DataLayer.POSITION)
+                _save_layer(var_arr,   (pc_dir / f"color_variance{ext.extension}").as_posix(), ext, DataLayer.POSITION)
 
                 if cfg.debug_pixel_change:
                     _save_debug_pixel_change(
@@ -729,7 +732,7 @@ if __name__ == "__main__":
     cfg = RenderConfig(
         transforms_path = f"{REPO}/Scenes/SwordShield/NerfRelative2/transforms.json",
         model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-        output_dir      = "output/sworshield9_render",
+        output_dir      = "output/sworshield10_render",
 
         render_depth    = True,
         render_position = True,
@@ -750,7 +753,7 @@ if __name__ == "__main__":
         visibility_format = ImageFormat.OPENEXR,
         color_texture_format=ImageFormat.PNG,
 
-        ium_texture_size = [4096, 4096],
+        ium_texture_size = [512, 512],
         apply_scale      = True,
     )
 
