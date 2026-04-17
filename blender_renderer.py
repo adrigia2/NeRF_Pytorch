@@ -227,11 +227,13 @@ def import_model(model_path: str) -> None:
     ext  = Path(model_path).suffix.lower()
     if ext == ".fbx":
         bpy.ops.import_scene.fbx(filepath=path)
-    elif ext in (".obj", ".OBJ"):
+    elif ext in (".obj", ".obj"):
+        # Pass use_split_objects=False to avoid creating one object per MTL group.
+        # If no .mtl is present alongside the .obj, Blender imports geometry only — no error.
         if bpy.app.version[0] >= 4:
-            bpy.ops.wm.obj_import(filepath=path)
+            bpy.ops.wm.obj_import(filepath=path, forward_axis='Y', up_axis='Z')
         else:
-            bpy.ops.import_scene.obj(filepath=path)
+            bpy.ops.import_scene.obj(filepath=path, axis_forward='Y', axis_up='Z')
     elif ext in (".gltf", ".glb"):
         bpy.ops.import_scene.gltf(filepath=path)
     else:

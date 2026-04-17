@@ -307,11 +307,35 @@ def _compute_peak(image_np: np.ndarray, percentile: float) -> float:
 
 
 def _load_image_as_vec3(path: str, w: int, h: int) -> np.ndarray:
-    """Carica immagine PIL, ridimensiona a (w, h), ritorna float32 (H*W, 3) normalizzata in [0,1]."""
-    from PIL import Image
-    img = Image.open(path).convert("RGB").resize((w, h), Image.LANCZOS)
-    arr = np.array(img, dtype=np.float32) / 255.0  # (h, w, 3)
-    return arr.reshape(-1, 3)  # (h*w, 3)
+    """Carica immagine, ridimensiona a (w, h), ritorna float32 (H*W, 3)."""
+    if path.lower().endswith(".exr"):
+        import OpenEXR, Imath
+        from PIL import Image
+        exr = OpenEXR.InputFile(path)
+        dw = exr.header()["dataWindow"]
+        src_w = dw.max.x - dw.min.x + 1
+        src_h = dw.max.y - dw.min.y + 1
+        pt = Imath.PixelType(Imath.PixelType.FLOAT)
+        chs = exr.header()["channels"]
+        if "R" in chs and "G" in chs and "B" in chs:
+            r = np.frombuffer(exr.channel("R", pt), dtype=np.float32).reshape(src_h, src_w)
+            g = np.frombuffer(exr.channel("G", pt), dtype=np.float32).reshape(src_h, src_w)
+            b = np.frombuffer(exr.channel("B", pt), dtype=np.float32).reshape(src_h, src_w)
+        else:
+            key = next(iter(chs))
+            ch = np.frombuffer(exr.channel(key, pt), dtype=np.float32).reshape(src_h, src_w)
+            r = g = b = ch
+        arr = np.stack([r, g, b], axis=-1)  # (src_h, src_w, 3) float32 HDR
+        if src_w != w or src_h != h:
+            def _resize_ch(c):
+                return np.array(Image.fromarray(c).resize((w, h), Image.LANCZOS))
+            arr = np.stack([_resize_ch(arr[..., i]) for i in range(3)], axis=-1)
+        return arr.reshape(-1, 3)
+    else:
+        from PIL import Image
+        img = Image.open(path).convert("RGB").resize((w, h), Image.LANCZOS)
+        arr = np.array(img, dtype=np.float32) / 255.0
+        return arr.reshape(-1, 3)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -730,9 +754,9 @@ if __name__ == "__main__":
     REPO = "C:/Users/adria/Documents/GitHub/Tesi/OptixProjectCMake"
 
     cfg = RenderConfig(
-        transforms_path = f"{REPO}/Scenes/SwordShield/NerfRelative2/transforms.json",
+        transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
         model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-        output_dir      = "output/sworshield10_render",
+        output_dir      = "output/sworshield_render_OpenEXRNerf",
 
         render_depth    = True,
         render_position = True,
@@ -751,7 +775,7 @@ if __name__ == "__main__":
         mask_format     = ImageFormat.OPENEXR,
         ium_format      = ImageFormat.OPENEXR,
         visibility_format = ImageFormat.OPENEXR,
-        color_texture_format=ImageFormat.PNG,
+        color_texture_format=ImageFormat.OPENEXR,
 
         ium_texture_size = [512, 512],
         apply_scale      = True,
