@@ -242,11 +242,11 @@ def _save_debug_comparison(
     out_dir: Path,
 ) -> None:
     import matplotlib.pyplot as plt
-    from PIL import Image as _PIL
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    src = np.array(_PIL.open(src_img_path).convert("RGB"), dtype=np.float32) / 255.0
+    h, w = cam_arr.shape[:2]
+    src = _load_image_as_vec3(str(src_img_path), w, h).reshape(h, w, 3)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     axes[0].imshow(np.clip(src, 0, 1))
