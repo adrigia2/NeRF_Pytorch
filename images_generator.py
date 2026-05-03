@@ -44,6 +44,7 @@ class DataLayer(Enum):
     NORMAL   = auto()   # vettori [-1,1] → NO raw richiesto ma float ok
     MASK     = auto()   # uint8 0/1 → non raw, nessuna normalizzazione float
     VISIBILITY = auto() # ratio float [0, 1] o bool uint8
+    IRRADIANCE = auto() # energia HDR per texel (RGB float)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -209,7 +210,7 @@ def _save_layer(
       - NORMAL            → vettori in [-1, 1]; stessa regola del raw float.
       - MASK              → già uint8 0/1; nessuna normalizzazione applicata.
     """
-    needs_raw = layer in {DataLayer.DEPTH, DataLayer.POSITION, DataLayer.NORMAL}
+    needs_raw = layer in {DataLayer.DEPTH, DataLayer.POSITION, DataLayer.NORMAL, DataLayer.IRRADIANCE}
 
     if needs_raw and not fmt.supports_raw_float:
         print(f"    ⚠  {fmt.value} non supporta float raw ({layer.name}) → normalizzo in [0,1]")
@@ -483,6 +484,13 @@ class RenderConfig:
     render_pixel_change: bool = False    # salva min/max/range texture in pixel_change/
     debug_pixel_change: bool = False     # salva plot comparativo in debug_pixel_change/
 
+    # Irradiance map (Monte Carlo skybox lighting per-texel)
+    render_irradiance: bool = False
+    irradiance_format: ImageFormat = ImageFormat.OPENEXR
+    skybox_path: str = ""                # path al file EXR equirettangolare
+    skybox_size: list[int] = field(default_factory=lambda: [1024, 512])  # resize target
+    irradiance_sample_side: int = 16     # N → N×N campioni per emisfero (16 = 256, 256 = 65536)
+
 
 def run_pipeline(cfg: RenderConfig) -> dict:
     """Esegue l'intera pipeline e restituisce il JSON arricchito.
@@ -545,6 +553,15 @@ def run_pipeline(cfg: RenderConfig) -> dict:
             ium_pos_path = (ium_out_dir / f"ium_positions{cfg.ium_format.extension}").resolve().as_posix()
             _save_layer(pos_arr, ium_pos_path, cfg.ium_format, DataLayer.POSITION)
             ium_result_data["ium_positions_path"] = _as_relative_to(ium_pos_path, json_dir_str)
+
+        # normals_np → (N, 3)  con N = ium_w * ium_h
+        if ium_res.has_normals():
+            norm_arr = _reshape_flat(
+                ium_res.normals_np.astype(np.float32), ium_w, ium_h
+            )
+            ium_norm_path = (ium_out_dir / f"ium_normals{cfg.ium_format.extension}").resolve().as_posix()
+            _save_layer(norm_arr, ium_norm_path, cfg.ium_format, DataLayer.NORMAL)
+            ium_result_data["ium_normals_path"] = _as_relative_to(ium_norm_path, json_dir_str)
 
         # masks_np → (N,) uint8 — mappa di validità texel
         if ium_res.has_masks():
@@ -663,6 +680,28 @@ def run_pipeline(cfg: RenderConfig) -> dict:
                         json_dir / "debug_camera_texture",
                     )
 
+        # ── Pipeline Irradiance (Monte Carlo skybox lighting) ────────────────
+        if (cfg.render_irradiance and cfg.skybox_path
+                and ium_res.has_positions() and ium_res.has_normals()):
+            print(f"✓ Avvio calcolo Irradiance "
+                  f"({cfg.irradiance_sample_side}×{cfg.irradiance_sample_side} samples per texel)…")
+
+            sky_w, sky_h = cfg.skybox_size[0], cfg.skybox_size[1]
+            skybox_flat = _load_image_as_vec3(cfg.skybox_path, sky_w, sky_h)  # (H*W, 3) float32
+
+            irr_gen = optix.IrradianceGenerator()
+            irr_gen.set_traversable(model)
+            irr_gen.set_inputs(ium_res, skybox_flat, [sky_w, sky_h], cfg.irradiance_sample_side)
+            irr_gen.render()
+            irr_res = irr_gen.get_result()
+
+            irr_out_dir = json_dir / "irradiance"
+            os.makedirs(irr_out_dir, exist_ok=True)
+            irr_path = (irr_out_dir / f"irradiance{cfg.irradiance_format.extension}").resolve().as_posix()
+            irr_arr = _reshape_flat(irr_res.irradiance_np.astype(np.float32), ium_w, ium_h)
+            _save_layer(irr_arr, irr_path, cfg.irradiance_format, DataLayer.IRRADIANCE)
+            ium_result_data["irradiance_path"] = _as_relative_to(irr_path, json_dir_str)
+
 
     # ── Copia immagini originali in output_dir/images/ ──────────────────────
     images_out_dir = json_dir / "images"
@@ -756,7 +795,7 @@ if __name__ == "__main__":
     cfg = RenderConfig(
         transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
         model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-        output_dir      = "output/sworshield_render_OpenEXRNerf",
+        output_dir      = "output/sworshield_render_Irradiance",
 
         render_depth    = True,
         render_position = True,
@@ -767,6 +806,12 @@ if __name__ == "__main__":
         debug_camera_texture=True,
         render_pixel_change=True,
         debug_pixel_change=True,
+
+        render_irradiance      = True,
+        irradiance_format      = ImageFormat.OPENEXR,
+        skybox_path            = f"{REPO}/Scenes/SwordShield/Blender/assets/hdrs/clouds-sunshine_b963efc0-83f3-4957-8725-34f73b8744ff/clouds-sunshine_2K_09c69240-8e00-4b23-896f-fcde6fd514cc.exr",
+        skybox_size            = [1024, 512],
+        irradiance_sample_side = 16,
 
         # Cambia OPENEXR → PNG per normalizzare automaticamente in uint8
         depth_format    = ImageFormat.OPENEXR,
