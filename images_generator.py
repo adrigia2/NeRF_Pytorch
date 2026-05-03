@@ -45,6 +45,7 @@ class DataLayer(Enum):
     MASK     = auto()   # uint8 0/1 → non raw, nessuna normalizzazione float
     VISIBILITY = auto() # ratio float [0, 1] o bool uint8
     IRRADIANCE = auto() # energia HDR per texel (RGB float)
+    ALBEDO     = auto() # riflettanza HDR per texel (RGB float)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -210,7 +211,8 @@ def _save_layer(
       - NORMAL            → vettori in [-1, 1]; stessa regola del raw float.
       - MASK              → già uint8 0/1; nessuna normalizzazione applicata.
     """
-    needs_raw = layer in {DataLayer.DEPTH, DataLayer.POSITION, DataLayer.NORMAL, DataLayer.IRRADIANCE}
+    needs_raw = layer in {DataLayer.DEPTH, DataLayer.POSITION, DataLayer.NORMAL,
+                          DataLayer.IRRADIANCE, DataLayer.ALBEDO}
 
     if needs_raw and not fmt.supports_raw_float:
         print(f"    ⚠  {fmt.value} non supporta float raw ({layer.name}) → normalizzo in [0,1]")
@@ -490,6 +492,12 @@ class RenderConfig:
     skybox_path: str = ""                # path al file EXR equirettangolare
     skybox_size: list[int] = field(default_factory=lambda: [1024, 512])  # resize target
     irradiance_sample_side: int = 16     # N → N×N campioni per emisfero (16 = 256, 256 = 65536)
+    skybox_yaw_degrees: float = 180.0    # rotazione yaw skybox (180° fixa convenzione Blender)
+
+    # Albedo (color_texture / irradiance) — modello Lambertiano ρ = π · L / E
+    render_albedo: bool = False
+    albedo_format: ImageFormat = ImageFormat.OPENEXR
+    albedo_eps: float = 1e-3             # clamp minimo dell'irradiance per evitare /0
 
 
 def run_pipeline(cfg: RenderConfig) -> dict:
@@ -691,7 +699,8 @@ def run_pipeline(cfg: RenderConfig) -> dict:
 
             irr_gen = optix.IrradianceGenerator()
             irr_gen.set_traversable(model)
-            irr_gen.set_inputs(ium_res, skybox_flat, [sky_w, sky_h], cfg.irradiance_sample_side)
+            irr_gen.set_inputs(ium_res, skybox_flat, [sky_w, sky_h],
+                               cfg.irradiance_sample_side, cfg.skybox_yaw_degrees)
             irr_gen.render()
             irr_res = irr_gen.get_result()
 
@@ -701,6 +710,29 @@ def run_pipeline(cfg: RenderConfig) -> dict:
             irr_arr = _reshape_flat(irr_res.irradiance_np.astype(np.float32), ium_w, ium_h)
             _save_layer(irr_arr, irr_path, cfg.irradiance_format, DataLayer.IRRADIANCE)
             ium_result_data["irradiance_path"] = _as_relative_to(irr_path, json_dir_str)
+
+        # ── Albedo (color / irradiance) — modello Lambertiano ρ = π·L/E ──────
+        if (cfg.render_albedo
+                and cfg.render_color_texture and cfg.render_irradiance
+                and 'ct_result' in dir() and 'irr_res' in dir()):
+            print(f"✓ Calcolo Albedo = π · color / max(irradiance, {cfg.albedo_eps})…")
+
+            color_flat = ct_result.colors_np.astype(np.float32)        # (N, 3)
+            irr_flat   = irr_res.irradiance_np.astype(np.float32)      # (N, 3)
+
+            denom = np.maximum(irr_flat, cfg.albedo_eps)
+            albedo_flat = (np.pi * color_flat) / denom                 # (N, 3)
+
+            if ium_res.has_masks():
+                masks_flat = ium_res.masks_np.astype(bool)             # (N,)
+                albedo_flat[~masks_flat] = 0.0
+
+            alb_out_dir = json_dir / "albedo"
+            os.makedirs(alb_out_dir, exist_ok=True)
+            alb_path = (alb_out_dir / f"albedo{cfg.albedo_format.extension}").resolve().as_posix()
+            alb_arr = _reshape_flat(albedo_flat, ium_w, ium_h)
+            _save_layer(alb_arr, alb_path, cfg.albedo_format, DataLayer.ALBEDO)
+            ium_result_data["albedo_path"] = _as_relative_to(alb_path, json_dir_str)
 
 
     # ── Copia immagini originali in output_dir/images/ ──────────────────────
@@ -795,7 +827,7 @@ if __name__ == "__main__":
     cfg = RenderConfig(
         transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
         model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-        output_dir      = "output/sworshield_render_Irradiance",
+        output_dir      = "output/sworshield_render_Albedo_rotated_180",
 
         render_depth    = True,
         render_position = True,
@@ -803,15 +835,19 @@ if __name__ == "__main__":
         render_mask     = True,
         render_ium      = True,
         render_color_texture=True,
-        debug_camera_texture=True,
+        debug_camera_texture=False,
         render_pixel_change=True,
-        debug_pixel_change=True,
+        debug_pixel_change=False,
 
         render_irradiance      = True,
         irradiance_format      = ImageFormat.OPENEXR,
         skybox_path            = f"{REPO}/Scenes/SwordShield/Blender/assets/hdrs/clouds-sunshine_b963efc0-83f3-4957-8725-34f73b8744ff/clouds-sunshine_2K_09c69240-8e00-4b23-896f-fcde6fd514cc.exr",
         skybox_size            = [1024, 512],
-        irradiance_sample_side = 16,
+        irradiance_sample_side = 128,
+
+        render_albedo = True,
+        albedo_format = ImageFormat.OPENEXR,
+        albedo_eps    = 1e-3,
 
         # Cambia OPENEXR → PNG per normalizzare automaticamente in uint8
         depth_format    = ImageFormat.OPENEXR,
