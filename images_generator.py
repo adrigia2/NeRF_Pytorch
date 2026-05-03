@@ -492,7 +492,7 @@ class RenderConfig:
     skybox_path: str = ""                # path al file EXR equirettangolare
     skybox_size: list[int] = field(default_factory=lambda: [1024, 512])  # resize target
     irradiance_sample_side: int = 16     # N → N×N campioni per emisfero (16 = 256, 256 = 65536)
-    skybox_yaw_degrees: float = 180.0    # rotazione yaw skybox (180° fixa convenzione Blender)
+    skybox_yaw_degrees: float = 0.0      # rotazione yaw skybox; 0° = -Y (Blender fwd) al centro
 
     # Albedo (color_texture / irradiance) — modello Lambertiano ρ = π · L / E
     render_albedo: bool = False
@@ -721,12 +721,13 @@ def run_pipeline(cfg: RenderConfig) -> dict:
             irr_flat   = irr_res.irradiance_np.astype(np.float32)      # (N, 3)
 
             denom = np.maximum(irr_flat, cfg.albedo_eps)
-            albedo_flat = (np.pi * color_flat) / denom                 # (N, 3)
+            albedo_flat = (np.float32(np.pi) * color_flat) / denom                 # (N, 3)
 
             if ium_res.has_masks():
                 masks_flat = ium_res.masks_np.astype(bool)             # (N,)
                 albedo_flat[~masks_flat] = 0.0
 
+            albedo_flat = np.clip(albedo_flat, 0.0, 1.0)
             alb_out_dir = json_dir / "albedo"
             os.makedirs(alb_out_dir, exist_ok=True)
             alb_path = (alb_out_dir / f"albedo{cfg.albedo_format.extension}").resolve().as_posix()
@@ -827,7 +828,7 @@ if __name__ == "__main__":
     cfg = RenderConfig(
         transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
         model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-        output_dir      = "output/sworshield_render_Albedo_rotated_180",
+        output_dir      = "output/sworshield_render_Albedo_clamp",
 
         render_depth    = True,
         render_position = True,
@@ -843,7 +844,7 @@ if __name__ == "__main__":
         irradiance_format      = ImageFormat.OPENEXR,
         skybox_path            = f"{REPO}/Scenes/SwordShield/Blender/assets/hdrs/clouds-sunshine_b963efc0-83f3-4957-8725-34f73b8744ff/clouds-sunshine_2K_09c69240-8e00-4b23-896f-fcde6fd514cc.exr",
         skybox_size            = [1024, 512],
-        irradiance_sample_side = 128,
+        irradiance_sample_side = 512,
 
         render_albedo = True,
         albedo_format = ImageFormat.OPENEXR,
