@@ -828,7 +828,7 @@ if __name__ == "__main__":
     cfg = RenderConfig(
         transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
         model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-        output_dir      = "output/sworshield_render_Albedo_clamp",
+        output_dir      = "output/sworshield_render_Albedo_clamp3",
 
         render_depth    = True,
         render_position = True,
