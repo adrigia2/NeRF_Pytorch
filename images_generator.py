@@ -44,8 +44,9 @@ class DataLayer(Enum):
     NORMAL   = auto()   # vettori [-1,1] → NO raw richiesto ma float ok
     MASK     = auto()   # uint8 0/1 → non raw, nessuna normalizzazione float
     VISIBILITY = auto() # ratio float [0, 1] o bool uint8
-    IRRADIANCE = auto() # energia HDR per texel (RGB float)
-    ALBEDO     = auto() # riflettanza HDR per texel (RGB float)
+    IRRADIANCE          = auto() # energia HDR per texel (RGB float)
+    IRRADIANCE_INDIRECT = auto() # contributo indiretto NeRF per texel (RGB float)
+    ALBEDO              = auto() # riflettanza HDR per texel (RGB float)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -212,7 +213,7 @@ def _save_layer(
       - MASK              → già uint8 0/1; nessuna normalizzazione applicata.
     """
     needs_raw = layer in {DataLayer.DEPTH, DataLayer.POSITION, DataLayer.NORMAL,
-                          DataLayer.IRRADIANCE, DataLayer.ALBEDO}
+                          DataLayer.IRRADIANCE, DataLayer.IRRADIANCE_INDIRECT, DataLayer.ALBEDO}
 
     if needs_raw and not fmt.supports_raw_float:
         print(f"    ⚠  {fmt.value} non supporta float raw ({layer.name}) → normalizzo in [0,1]")
@@ -339,6 +340,24 @@ def _load_image_as_vec3(path: str, w: int, h: int) -> np.ndarray:
         img = Image.open(path).convert("RGB").resize((w, h), Image.LANCZOS)
         arr = np.array(img, dtype=np.float32) / 255.0
         return arr.reshape(-1, 3)
+
+
+def _load_exr_as_flat(path: str) -> np.ndarray | None:
+    """Carica un EXR RGB a dimensione nativa e restituisce (H*W, 3) float32."""
+    try:
+        import OpenEXR, Imath
+        exr = OpenEXR.InputFile(path)
+        dw = exr.header()["dataWindow"]
+        w = dw.max.x - dw.min.x + 1
+        h = dw.max.y - dw.min.y + 1
+        pt = Imath.PixelType(Imath.PixelType.FLOAT)
+        r = np.frombuffer(exr.channel("R", pt), dtype=np.float32).reshape(h, w)
+        g = np.frombuffer(exr.channel("G", pt), dtype=np.float32).reshape(h, w)
+        b = np.frombuffer(exr.channel("B", pt), dtype=np.float32).reshape(h, w)
+        return np.stack([r, g, b], axis=-1).reshape(-1, 3)
+    except Exception as e:
+        print(f"    ⚠  Impossibile caricare {path}: {e}")
+        return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -494,10 +513,188 @@ class RenderConfig:
     irradiance_sample_side: int = 16     # N → N×N campioni per emisfero (16 = 256, 256 = 65536)
     skybox_yaw_degrees: float = 0.0      # rotazione yaw skybox; 0° = -Y (Blender fwd) al centro
 
+    # Indirect irradiance via NeRF (precompute once, cache on disk)
+    precompute_indirect: bool = False
+    indirect_sample_side: int = 64       # N → N×N campioni per texel (separato da irradiance)
+    indirect_tile_size: int = 1024       # texel per tile GPU (bilancia memoria/VRAM)
+    indirect_nerf_cache_path: str = ""   # path al .pkl del modello NeRF (default: auto-detect)
+    indirect_nerf_num_encoding_functions: int = 6
+    indirect_nerf_filter_size: int = 128
+    indirect_nerf_depth_samples: int = 8 # campioni volumetrici lungo ogni raggio occluso
+    indirect_nerf_depth_window: float = 0.15
+    indirect_format: ImageFormat = ImageFormat.OPENEXR
+
     # Albedo (color_texture / irradiance) — modello Lambertiano ρ = π · L / E
     render_albedo: bool = False
     albedo_format: ImageFormat = ImageFormat.OPENEXR
     albedo_eps: float = 1e-3             # clamp minimo dell'irradiance per evitare /0
+
+
+def _precompute_indirect_irradiance(
+    cfg: RenderConfig,
+    ium_res,        # IUM_Generator.Result
+    model,          # OptixProgrammablePasses.TriangleMesh
+    ium_w: int,
+    ium_h: int,
+    indirect_path: str,
+) -> None:
+    """Esegue il pass OptiX tile-by-tile, interroga NeRF per ogni raggio occluso e
+    salva irradiance_indirect.exr su disco.  Chiamato solo se precompute_indirect=True.
+    """
+    import torch
+    import pickle
+    import OptixProgrammablePasses as optix
+
+    # ── Carica il modello NeRF dal cache ──────────────────────────────────────
+    cache_path = cfg.indirect_nerf_cache_path
+    if not cache_path:
+        # Auto-detect: cerca MODEL_CACHE_PATH di default accanto al JSON
+        cache_path = os.path.join(os.path.dirname(cfg.output_dir),
+                                  "output", "model", "tinynerf_model_cache.pkl")
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(
+            f"NeRF model cache non trovato: {cache_path}\n"
+            "Imposta indirect_nerf_cache_path oppure allenare prima NeRF."
+        )
+
+    # Ricrea l'architettura del modello
+    num_enc = cfg.indirect_nerf_num_encoding_functions
+    filter_size = cfg.indirect_nerf_filter_size
+
+    import sys, importlib
+    sys.path.insert(0, str(Path(__file__).parent))
+
+    class _TinyNerf(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            in_dim = 3 + 3 * 2 * num_enc
+            self.layer1 = torch.nn.Linear(in_dim, filter_size)
+            self.layer2 = torch.nn.Linear(filter_size, filter_size)
+            self.layer3 = torch.nn.Linear(filter_size, 4)
+        def forward(self, x):
+            x = torch.nn.functional.relu(self.layer1(x))
+            x = torch.nn.functional.relu(self.layer2(x))
+            return self.layer3(x)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    nerf_model = _TinyNerf().to(device)
+
+    with open(cache_path, "rb") as f:
+        payload = pickle.load(f)
+    nerf_model.load_state_dict(payload["model_state_dict"])
+    nerf_model.eval()
+    print(f"✓ NeRF model caricato da: {cache_path}")
+
+    def _positional_encoding(t: torch.Tensor) -> torch.Tensor:
+        enc = [t]
+        for i in range(num_enc):
+            freq = 2.0 ** i
+            enc += [torch.sin(freq * t), torch.cos(freq * t)]
+        return torch.cat(enc, dim=-1)
+
+    def _nerf_color_from_rays(origins_np: np.ndarray,
+                               dirs_np: np.ndarray,
+                               t_hits_np: np.ndarray) -> np.ndarray:
+        """Restituisce colori RGB (M,3) per M raggi via volume rendering."""
+        M = origins_np.shape[0]
+        if M == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        origins = torch.from_numpy(origins_np).float().to(device)   # (M,3)
+        dirs    = torch.from_numpy(dirs_np).float().to(device)       # (M,3)
+        t_hits  = torch.from_numpy(t_hits_np).float().to(device)     # (M,)
+
+        depth_window = cfg.indirect_nerf_depth_window
+        n_samp = cfg.indirect_nerf_depth_samples
+
+        # Campionamento stratificato intorno a t_hit
+        offsets = torch.linspace(-depth_window, depth_window, n_samp,
+                                 device=device, dtype=torch.float32)
+        # depth_values: (M, n_samp)
+        depth_values = t_hits[:, None] + offsets[None, :]
+        depth_values = depth_values.clamp(min=1e-4)
+
+        # query_points: (M, n_samp, 3)
+        query_points = origins[:, None, :] + dirs[:, None, :] * depth_values[:, :, None]
+
+        flat_pts = query_points.reshape(-1, 3)   # (M*n_samp, 3)
+        chunksize = 16384
+        preds = []
+        with torch.no_grad():
+            encoded = _positional_encoding(flat_pts)
+            for i in range(0, encoded.shape[0], chunksize):
+                preds.append(nerf_model(encoded[i:i + chunksize]))
+        radiance_flat = torch.cat(preds, dim=0)        # (M*n_samp, 4)
+        radiance = radiance_flat.reshape(M, n_samp, 4) # (M, n_samp, 4)
+
+        # Volume rendering (identico a render_volume_density del notebook)
+        sigma = torch.nn.functional.relu(radiance[..., 3])
+        rgb   = torch.sigmoid(radiance[..., :3])
+        one_e10 = torch.tensor([1e10], dtype=torch.float32, device=device)
+        dists = torch.cat([depth_values[:, 1:] - depth_values[:, :-1],
+                           one_e10.expand(M, 1)], dim=-1)
+        alpha   = 1.0 - torch.exp(-sigma * dists)
+        weights_cumprod = torch.cumprod(
+            torch.cat([torch.ones((M, 1), device=device), 1.0 - alpha[:, :-1] + 1e-10], dim=-1),
+            dim=-1)
+        weights = alpha * weights_cumprod
+        rgb_map = (weights[:, :, None] * rgb).sum(dim=1)  # (M,3)
+        return rgb_map.detach().cpu().numpy().astype(np.float32)
+
+    # ── Pass OptiX tile-by-tile ───────────────────────────────────────────────
+    ind_gen = optix.IndirectGenerator()
+    ind_gen.set_traversable(model)
+    ind_gen.set_inputs(ium_res, cfg.indirect_sample_side, cfg.indirect_tile_size)
+
+    n_tiles = ind_gen.num_tiles()
+    num_pix = ind_gen.num_pixels()
+    scale   = (2.0 * np.pi) / (cfg.indirect_sample_side ** 2)
+
+    # Buffer di accumulo (flat, per texel)
+    irr_indirect = np.zeros((num_pix, 3), dtype=np.float64)
+
+    ium_positions_np = ium_res.positions_np.astype(np.float32)   # (num_pix, 3)
+    ium_normals_np   = ium_res.normals_np.astype(np.float32)     # (num_pix, 3)
+    eps              = 1e-4
+
+    print(f"  Indirect precompute: {n_tiles} tile × {cfg.indirect_tile_size} texel, "
+          f"N={cfg.indirect_sample_side}")
+
+    for tile_idx in range(n_tiles):
+        tile_res = ind_gen.render_tile(tile_idx)
+        count = tile_res.count
+        if count == 0:
+            continue
+
+        local_idx = tile_res.local_idx_np.copy()       # (count,) int
+        dirs_np   = tile_res.directions_np.copy()       # (count,3) float32
+        cos_np    = tile_res.cos_np.copy()              # (count,) float32
+        t_hit_np  = tile_res.t_hit_np.copy()            # (count,) float32
+
+        tile_offset = tile_idx * cfg.indirect_tile_size
+        global_idx  = tile_offset + local_idx           # (count,) int
+
+        origins_np = (ium_positions_np[global_idx]
+                      + ium_normals_np[global_idx] * eps)  # (count,3)
+
+        colors = _nerf_color_from_rays(origins_np, dirs_np, t_hit_np)  # (count,3)
+
+        # Accumula contributo per texel: Σ L·cosθ
+        np.add.at(irr_indirect, global_idx,
+                  colors * cos_np[:, None].astype(np.float64))
+
+        if (tile_idx + 1) % max(1, n_tiles // 10) == 0:
+            print(f"    tile {tile_idx+1}/{n_tiles}, raggi occlusi: {count}")
+
+    # Scala Monte Carlo: 2π / N²
+    irr_indirect = (irr_indirect * scale).astype(np.float32)
+
+    # Salva
+    os.makedirs(os.path.dirname(indirect_path), exist_ok=True)
+    irr_indirect_arr = _reshape_flat(irr_indirect, ium_w, ium_h)
+    _save_layer(irr_indirect_arr, indirect_path, cfg.indirect_format,
+                DataLayer.IRRADIANCE_INDIRECT)
+    print(f"✓ irradiance_indirect salvato: {indirect_path}")
 
 
 def run_pipeline(cfg: RenderConfig) -> dict:
@@ -711,7 +908,28 @@ def run_pipeline(cfg: RenderConfig) -> dict:
             _save_layer(irr_arr, irr_path, cfg.irradiance_format, DataLayer.IRRADIANCE)
             ium_result_data["irradiance_path"] = _as_relative_to(irr_path, json_dir_str)
 
-        # ── Albedo (color / irradiance) — modello Lambertiano ρ = π·L/E ──────
+        # ── Indirect Irradiance via NeRF (precompute one-shot, cached) ────────
+        irr_indirect_flat = None
+        if cfg.precompute_indirect and ium_res.has_positions() and ium_res.has_normals():
+            ind_out_dir = json_dir / "irradiance"
+            os.makedirs(ind_out_dir, exist_ok=True)
+            ind_path = (ind_out_dir / f"irradiance_indirect{cfg.indirect_format.extension}").resolve().as_posix()
+
+            if not os.path.exists(ind_path):
+                print(f"✓ Avvio precompute Indirect Irradiance "
+                      f"(N={cfg.indirect_sample_side}, tile={cfg.indirect_tile_size})…")
+                _precompute_indirect_irradiance(
+                    cfg, ium_res, model, ium_w, ium_h, ind_path)
+            else:
+                print(f"✓ Indirect irradiance trovata su disco: {ind_path}")
+
+            # Carica il layer per usarlo nell'albedo
+            ind_arr = _load_exr_as_flat(ind_path)
+            if ind_arr is not None:
+                irr_indirect_flat = ind_arr
+                ium_result_data["irradiance_indirect_path"] = _as_relative_to(ind_path, json_dir_str)
+
+        # ── Albedo (color / irradiance_total) — modello Lambertiano ρ = π·L/E ─
         if (cfg.render_albedo
                 and cfg.render_color_texture and cfg.render_irradiance
                 and 'ct_result' in dir() and 'irr_res' in dir()):
@@ -719,6 +937,10 @@ def run_pipeline(cfg: RenderConfig) -> dict:
 
             color_flat = ct_result.colors_np.astype(np.float32)        # (N, 3)
             irr_flat   = irr_res.irradiance_np.astype(np.float32)      # (N, 3)
+
+            # Somma il contributo indiretto se disponibile
+            if irr_indirect_flat is not None:
+                irr_flat = irr_flat + irr_indirect_flat
 
             denom = np.maximum(irr_flat, cfg.albedo_eps)
             albedo_flat = (np.float32(np.pi) * color_flat) / denom                 # (N, 3)
