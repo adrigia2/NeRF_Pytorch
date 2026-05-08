@@ -489,8 +489,10 @@ class RenderConfig:
     # Dimensione texture IUM [width, height]
     ium_texture_size: list[int] = field(default_factory=lambda: [512, 512])
 
-    # Scala applicata ai depth (coerente con "scale" in transforms.json)
-    apply_scale: bool = True
+    # Scala applicata ai depth — deve essere False: scale nei transforms.json
+    # è da applicare ANCHE alle traslazioni della camera, e non farlo crea un
+    # mismatch (query points NeRF ≠ superficie mesh).  Lasciare False.
+    apply_scale: bool = False
 
     # Color texture
     render_color_texture: bool = False
@@ -530,6 +532,31 @@ class RenderConfig:
     albedo_eps: float = 1e-3             # clamp minimo dell'irradiance per evitare /0
 
 
+@dataclass
+class PipelineConfig:
+    """Orchestratore a tre step toggle-abili.
+
+    Step 1: genera depth+mask+immagini+transforms_extended.json (minimo per NeRF).
+    Step 2: allena il NeRF (nerf_module.train) e salva il checkpoint.
+    Step 3: esegue IUM/visibility/color_texture/irradiance/indirect/albedo.
+    """
+    run_step1: bool = True
+    run_step2: bool = True
+    run_step3: bool = True
+
+    render: RenderConfig = field(default_factory=RenderConfig)
+
+    # Parametri di nerf_module.train (Step 2)
+    nerf_num_iters:        int   = 10000
+    nerf_batch_size:       int   = 4096
+    nerf_mask_bias:        float = 0.9
+    nerf_lr:               float = 5e-3
+    nerf_display_every:    int   = 100
+    nerf_seed:             int   = 9458
+    nerf_ckpt_path:        str   = ""  # default: <output_dir>/model/tinynerf_model_cache.pkl
+    nerf_train_output_dir: str   = ""  # default: <output_dir>/nerf_train
+
+
 def _precompute_indirect_irradiance(
     cfg: RenderConfig,
     ium_res,        # IUM_Generator.Result
@@ -541,14 +568,14 @@ def _precompute_indirect_irradiance(
     """Esegue il pass OptiX tile-by-tile, interroga NeRF per ogni raggio occluso e
     salva irradiance_indirect.exr su disco.  Chiamato solo se precompute_indirect=True.
     """
-    import torch
-    import pickle
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from nerf_module import load_checkpoint, query_radiance, NerfConfig as _NerfCfg
     import OptixProgrammablePasses as optix
 
     # ── Carica il modello NeRF dal cache ──────────────────────────────────────
     cache_path = cfg.indirect_nerf_cache_path
     if not cache_path:
-        # Auto-detect: cerca MODEL_CACHE_PATH di default accanto al JSON
         cache_path = os.path.join(os.path.dirname(cfg.output_dir),
                                   "output", "model", "tinynerf_model_cache.pkl")
     if not os.path.exists(cache_path):
@@ -557,89 +584,17 @@ def _precompute_indirect_irradiance(
             "Imposta indirect_nerf_cache_path oppure allenare prima NeRF."
         )
 
-    # Ricrea l'architettura del modello
-    num_enc = cfg.indirect_nerf_num_encoding_functions
-    filter_size = cfg.indirect_nerf_filter_size
-
-    import sys, importlib
-    sys.path.insert(0, str(Path(__file__).parent))
-
-    class _TinyNerf(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            in_dim = 3 + 3 * 2 * num_enc
-            self.layer1 = torch.nn.Linear(in_dim, filter_size)
-            self.layer2 = torch.nn.Linear(filter_size, filter_size)
-            self.layer3 = torch.nn.Linear(filter_size, 4)
-        def forward(self, x):
-            x = torch.nn.functional.relu(self.layer1(x))
-            x = torch.nn.functional.relu(self.layer2(x))
-            return self.layer3(x)
-
+    import torch
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    nerf_model = _TinyNerf().to(device)
-
-    with open(cache_path, "rb") as f:
-        payload = pickle.load(f)
-    nerf_model.load_state_dict(payload["model_state_dict"])
-    nerf_model.eval()
+    nerf_model, _, _, loaded_cfg = load_checkpoint(cache_path, device)
+    # Override depth sampling params from RenderConfig
+    nerf_cfg = _NerfCfg(
+        num_encoding_functions=cfg.indirect_nerf_num_encoding_functions,
+        filter_size=cfg.indirect_nerf_filter_size,
+        depth_window=cfg.indirect_nerf_depth_window,
+        depth_samples_per_ray=cfg.indirect_nerf_depth_samples,
+    )
     print(f"✓ NeRF model caricato da: {cache_path}")
-
-    def _positional_encoding(t: torch.Tensor) -> torch.Tensor:
-        enc = [t]
-        for i in range(num_enc):
-            freq = 2.0 ** i
-            enc += [torch.sin(freq * t), torch.cos(freq * t)]
-        return torch.cat(enc, dim=-1)
-
-    def _nerf_color_from_rays(origins_np: np.ndarray,
-                               dirs_np: np.ndarray,
-                               t_hits_np: np.ndarray) -> np.ndarray:
-        """Restituisce colori RGB (M,3) per M raggi via volume rendering."""
-        M = origins_np.shape[0]
-        if M == 0:
-            return np.zeros((0, 3), dtype=np.float32)
-
-        origins = torch.from_numpy(origins_np).float().to(device)   # (M,3)
-        dirs    = torch.from_numpy(dirs_np).float().to(device)       # (M,3)
-        t_hits  = torch.from_numpy(t_hits_np).float().to(device)     # (M,)
-
-        depth_window = cfg.indirect_nerf_depth_window
-        n_samp = cfg.indirect_nerf_depth_samples
-
-        # Campionamento stratificato intorno a t_hit
-        offsets = torch.linspace(-depth_window, depth_window, n_samp,
-                                 device=device, dtype=torch.float32)
-        # depth_values: (M, n_samp)
-        depth_values = t_hits[:, None] + offsets[None, :]
-        depth_values = depth_values.clamp(min=1e-4)
-
-        # query_points: (M, n_samp, 3)
-        query_points = origins[:, None, :] + dirs[:, None, :] * depth_values[:, :, None]
-
-        flat_pts = query_points.reshape(-1, 3)   # (M*n_samp, 3)
-        chunksize = 16384
-        preds = []
-        with torch.no_grad():
-            encoded = _positional_encoding(flat_pts)
-            for i in range(0, encoded.shape[0], chunksize):
-                preds.append(nerf_model(encoded[i:i + chunksize]))
-        radiance_flat = torch.cat(preds, dim=0)        # (M*n_samp, 4)
-        radiance = radiance_flat.reshape(M, n_samp, 4) # (M, n_samp, 4)
-
-        # Volume rendering (identico a render_volume_density del notebook)
-        sigma = torch.nn.functional.relu(radiance[..., 3])
-        rgb   = torch.sigmoid(radiance[..., :3])
-        one_e10 = torch.tensor([1e10], dtype=torch.float32, device=device)
-        dists = torch.cat([depth_values[:, 1:] - depth_values[:, :-1],
-                           one_e10.expand(M, 1)], dim=-1)
-        alpha   = 1.0 - torch.exp(-sigma * dists)
-        weights_cumprod = torch.cumprod(
-            torch.cat([torch.ones((M, 1), device=device), 1.0 - alpha[:, :-1] + 1e-10], dim=-1),
-            dim=-1)
-        weights = alpha * weights_cumprod
-        rgb_map = (weights[:, :, None] * rgb).sum(dim=1)  # (M,3)
-        return rgb_map.detach().cpu().numpy().astype(np.float32)
 
     # ── Pass OptiX tile-by-tile ───────────────────────────────────────────────
     ind_gen = optix.IndirectGenerator()
@@ -650,11 +605,9 @@ def _precompute_indirect_irradiance(
     num_pix = ind_gen.num_pixels()
     scale   = (2.0 * np.pi) / (cfg.indirect_sample_side ** 2)
 
-    # Buffer di accumulo (flat, per texel)
-    irr_indirect = np.zeros((num_pix, 3), dtype=np.float64)
-
-    ium_positions_np = ium_res.positions_np.astype(np.float32)   # (num_pix, 3)
-    ium_normals_np   = ium_res.normals_np.astype(np.float32)     # (num_pix, 3)
+    irr_indirect     = np.zeros((num_pix, 3), dtype=np.float64)
+    ium_positions_np = ium_res.positions_np.astype(np.float32)
+    ium_normals_np   = ium_res.normals_np.astype(np.float32)
     eps              = 1e-4
 
     print(f"  Indirect precompute: {n_tiles} tile × {cfg.indirect_tile_size} texel, "
@@ -662,34 +615,31 @@ def _precompute_indirect_irradiance(
 
     for tile_idx in range(n_tiles):
         tile_res = ind_gen.render_tile(tile_idx)
-        count = tile_res.count
+        count    = tile_res.count
         if count == 0:
             continue
 
-        local_idx = tile_res.local_idx_np.copy()       # (count,) int
-        dirs_np   = tile_res.directions_np.copy()       # (count,3) float32
-        cos_np    = tile_res.cos_np.copy()              # (count,) float32
-        t_hit_np  = tile_res.t_hit_np.copy()            # (count,) float32
+        local_idx = tile_res.local_idx_np.copy()
+        dirs_np   = tile_res.directions_np.copy()
+        cos_np    = tile_res.cos_np.copy()
+        t_hit_np  = tile_res.t_hit_np.copy()
 
         tile_offset = tile_idx * cfg.indirect_tile_size
-        global_idx  = tile_offset + local_idx           # (count,) int
+        global_idx  = tile_offset + local_idx
 
         origins_np = (ium_positions_np[global_idx]
-                      + ium_normals_np[global_idx] * eps)  # (count,3)
+                      + ium_normals_np[global_idx] * eps)
 
-        colors = _nerf_color_from_rays(origins_np, dirs_np, t_hit_np)  # (count,3)
+        colors = query_radiance(nerf_model, origins_np, dirs_np, t_hit_np, nerf_cfg)
 
-        # Accumula contributo per texel: Σ L·cosθ
         np.add.at(irr_indirect, global_idx,
                   colors * cos_np[:, None].astype(np.float64))
 
         if (tile_idx + 1) % max(1, n_tiles // 10) == 0:
             print(f"    tile {tile_idx+1}/{n_tiles}, raggi occlusi: {count}")
 
-    # Scala Monte Carlo: 2π / N²
     irr_indirect = (irr_indirect * scale).astype(np.float32)
 
-    # Salva
     os.makedirs(os.path.dirname(indirect_path), exist_ok=True)
     irr_indirect_arr = _reshape_flat(irr_indirect, ium_w, ium_h)
     _save_layer(irr_indirect_arr, indirect_path, cfg.indirect_format,
@@ -697,347 +647,389 @@ def _precompute_indirect_irradiance(
     print(f"✓ irradiance_indirect salvato: {indirect_path}")
 
 
-def run_pipeline(cfg: RenderConfig) -> dict:
-    """Esegue l'intera pipeline e restituisce il JSON arricchito.
-
-    Returns:
-        Dizionario JSON con le stesse chiavi di transforms.json più i path
-        dei layer renderizzati per ogni frame e la sezione "ium".
+def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
+    """Renderizza depth + mask per ogni frame, copia le immagini RGB e scrive
+    transforms_extended.json con i campi minimi richiesti da NerfDataset.
     """
-    import OptixProgrammablePasses as optix  # importato una volta sola
-
-    # Configura il logging
-    optix.LogManager.set_min_level(optix.LogLevel.Error)
-    optix.OptixManager.instance().set_log_level(optix.LogLevel.Disabled)
-
-    # ── Carica dati di trasformazione ──────────────────────────────────────
-    tf = load_transforms(cfg.transforms_path)
+    rc = cfg.render
+    tf = load_transforms(rc.transforms_path)
     intr = tf.intrinsics
-    print(f"✓ Trasformazioni caricate: {len(tf.frames)} frame  [{intr.w}×{intr.h}]")
+    print(f"[Step 1] Trasformazioni caricate: {len(tf.frames)} frame  [{intr.w}×{intr.h}]")
 
-    # json_dir è la cartella del JSON di output — tutti i path nel JSON
-    # saranno relativi a questa cartella, garantendo portabilità
-    json_dir = Path(cfg.output_dir).resolve()
+    json_dir = Path(rc.output_dir).resolve()
     json_dir_str = json_dir.as_posix()
     os.makedirs(json_dir, exist_ok=True)
 
-    # ── Carica modello ─────────────────────────────────────────────────────
-    model = optix.TriangleMesh()
-    model.add_from_obj_file(cfg.model_path)
-    print(f"✓ Modello caricato: {cfg.model_path}")
+    model = optix_mod.TriangleMesh()
+    model.add_from_obj_file(rc.model_path)
+    print(f"[Step 1] Modello caricato: {rc.model_path}")
 
-    # ── DepthGenerator — configurato una volta, riusato per tutti i frame ──
-    depth_gen = optix.DepthGenerator()
+    depth_gen = optix_mod.DepthGenerator()
     depth_gen.set_traversable(model)
-    depth_gen.need_render_depth(cfg.render_depth)
-    depth_gen.need_render_position(cfg.render_position)
-    depth_gen.need_render_normal(cfg.render_normal)
-    # La mask di validità viene sempre prodotta dalla libreria; la richiediamo
-    # esplicitamente se l'utente la vuole salvare (non costa nulla aggiuntivo).
+    depth_gen.need_render_depth(True)
+    depth_gen.need_render_position(False)
+    depth_gen.need_render_normal(False)
 
-    # ── IUMGenerator — indipendente dai frame, eseguito una volta sola ─────
-    ium_result_data: dict = {}
-    if cfg.render_ium:
-        ium_w, ium_h = cfg.ium_texture_size[0], cfg.ium_texture_size[1]
-
-        ium_gen = optix.IUMGenerator()
-        ium_gen.set_traversable(model)
-        ium_gen.set_texture_size([ium_w, ium_h])
-        ium_gen.render()
-        ium_res = ium_gen.get_result()   # teniamo il riferimento vivo
-        print("✓ IUM rendering completato")
-
-        ium_out_dir = json_dir / "ium"
-        os.makedirs(ium_out_dir, exist_ok=True)
-
-        # positions_np → (N, 3)  con N = ium_w * ium_h
-        if ium_res.has_positions():
-            pos_arr = _reshape_flat(
-                ium_res.positions_np.astype(np.float32), ium_w, ium_h
-            )
-            ium_pos_path = (ium_out_dir / f"ium_positions{cfg.ium_format.extension}").resolve().as_posix()
-            _save_layer(pos_arr, ium_pos_path, cfg.ium_format, DataLayer.POSITION)
-            ium_result_data["ium_positions_path"] = _as_relative_to(ium_pos_path, json_dir_str)
-
-        # normals_np → (N, 3)  con N = ium_w * ium_h
-        if ium_res.has_normals():
-            norm_arr = _reshape_flat(
-                ium_res.normals_np.astype(np.float32), ium_w, ium_h
-            )
-            ium_norm_path = (ium_out_dir / f"ium_normals{cfg.ium_format.extension}").resolve().as_posix()
-            _save_layer(norm_arr, ium_norm_path, cfg.ium_format, DataLayer.NORMAL)
-            ium_result_data["ium_normals_path"] = _as_relative_to(ium_norm_path, json_dir_str)
-
-        # masks_np → (N,) uint8 — mappa di validità texel
-        if ium_res.has_masks():
-            mask_arr = _reshape_flat(ium_res.masks_np, ium_w, ium_h)
-            ium_mask_path = (ium_out_dir / f"ium_masks{cfg.ium_format.extension}").resolve().as_posix()
-            _save_layer(mask_arr, ium_mask_path, cfg.ium_format, DataLayer.MASK)
-            ium_result_data["ium_masks_path"] = _as_relative_to(ium_mask_path, json_dir_str)
-
-        # ── Costruiamo tutte le telecamere (usate sia per visibility che per color texture)
-        all_cameras = []
-        for frame in tf.frames:
-            cam = _camera_from_matrix(frame.transform_matrix, intr.camera_angle_y, [intr.w, intr.h], optix)
-            all_cameras.append(cam)
-
-        # ── Pipeline Visibility ──────────────────────────────────────────────
-        visibility_map = None
-        if cfg.render_visibility and ium_res.has_positions() and ium_res.has_masks():
-            print("✓ Avvio calcolo Visibilità telecamere...")
-            vis_gen = optix.VisibilityGenerator()
-            vis_gen.set_traversable(model)
-
-            # visibility_map: (H*W, num_cameras) uint8
-            visibility_map = vis_gen.check_visibility(ium_res, ium_w, ium_h, all_cameras)
-
-            vis_out_dir = json_dir / "visibility"
-            os.makedirs(vis_out_dir, exist_ok=True)
-            vis_path = (vis_out_dir / f"visibility{cfg.visibility_format.extension}").resolve().as_posix()
-
-            if cfg.visibility_format == ImageFormat.OPENEXR:
-                # Shape EXR: (H, W, num_cameras) float32
-                # Nessuna compressione/aggregazione, salviamo il layer booleano per ogni singola telecamera
-                vis_arr = visibility_map.reshape((ium_h, ium_w, len(all_cameras))).astype(np.float32)
-                _save_layer(vis_arr, vis_path, cfg.visibility_format, DataLayer.VISIBILITY)
-            else:
-                # Shape PNG/Altro: (H, W) greyscale
-                # Somma lungo l'asse delle telecamere (quante vedono quel pixel), mappa in [0, 255]
-                visible_count = np.sum(visibility_map, axis=1)  # (N,)
-                ratio = visible_count.astype(np.float32) / float(len(all_cameras))
-                vis_arr = _reshape_flat(ratio, ium_w, ium_h)
-                _save_layer(vis_arr, vis_path, cfg.visibility_format, DataLayer.VISIBILITY)
-
-            ium_result_data["visibility_path"] = _as_relative_to(vis_path, json_dir_str)
-
-        # ── Pipeline Color Texture ───────────────────────────────────────────
-        if (cfg.render_color_texture and cfg.render_ium and cfg.render_visibility
-                and visibility_map is not None):
-            print("✓ Avvio calcolo Color Texture...")
-
-            # Copia le immagini sorgente in images/ prima di caricarle
-            images_out_dir_ct = json_dir / "images"
-            os.makedirs(images_out_dir_ct, exist_ok=True)
-            for frame in tf.frames:
-                src = Path(frame.file_path)
-                if src.exists():
-                    shutil.copy2(src, images_out_dir_ct / src.name)
-
-            optix_frames = []
-            for i, frame in enumerate(tf.frames):
-                cam = all_cameras[i]
-                img_path = (images_out_dir_ct / Path(frame.file_path).name).as_posix()
-                img_flat = _load_image_as_vec3(img_path, intr.w, intr.h)  # (H*W, 3) float32
-                peak = _compute_peak(img_flat.reshape(intr.h, intr.w, 3),
-                                     cfg.color_texture_peak_percentile)
-                optix_frames.append(optix.Frame(cam, peak, img_flat))
-
-            ct_gen = optix.ColorTexGenerator()
-            ct_gen.set_inputs(ium_res, visibility_map, optix_frames)
-            ct_gen.render()
-            ct_result = ct_gen.get_result()
-
-            ct_out_dir = json_dir / "color_texture"
-            os.makedirs(ct_out_dir, exist_ok=True)
-            ct_path = (ct_out_dir / f"color_texture{cfg.color_texture_format.extension}").resolve().as_posix()
-
-            ct_arr = _reshape_flat(ct_result.colors_np.astype(np.float32), ium_w, ium_h)
-            _save_layer(ct_arr, ct_path, cfg.color_texture_format, DataLayer.POSITION)
-            ium_result_data["color_texture_path"] = _as_relative_to(ct_path, json_dir_str)
-
-            if cfg.render_pixel_change:
-                pc_dir = json_dir / "pixel_change"
-                pc_dir.mkdir(parents=True, exist_ok=True)
-
-                min_arr   = _reshape_flat(ct_result.color_min_np.astype(np.float32), ium_w, ium_h)
-                max_arr   = _reshape_flat(ct_result.color_max_np.astype(np.float32), ium_w, ium_h)
-                range_arr = np.clip(max_arr - min_arr, 0.0, None)
-
-                var_arr   = _reshape_flat(ct_result.color_variance_np.astype(np.float32), ium_w, ium_h)
-
-                ext = cfg.color_texture_format
-                _save_layer(min_arr,   (pc_dir / f"color_min{ext.extension}").as_posix(),      ext, DataLayer.POSITION)
-                _save_layer(max_arr,   (pc_dir / f"color_max{ext.extension}").as_posix(),      ext, DataLayer.POSITION)
-                _save_layer(range_arr, (pc_dir / f"color_range{ext.extension}").as_posix(),    ext, DataLayer.POSITION)
-                _save_layer(var_arr,   (pc_dir / f"color_variance{ext.extension}").as_posix(), ext, DataLayer.POSITION)
-
-                if cfg.debug_pixel_change:
-                    _save_debug_pixel_change(
-                        min_arr, max_arr, range_arr,
-                        json_dir / "debug_pixel_change",
-                    )
-
-            # Per-camera textures
-            cam_tex_dir = json_dir / "camera_texture"
-            os.makedirs(cam_tex_dir, exist_ok=True)
-            cam_colors = ct_result.camera_colors_np  # (num_pixels, num_cameras, 3)
-            for cam_idx, frame in enumerate(tf.frames):
-                cam_slice = cam_colors[:, cam_idx, :]  # (num_pixels, 3)
-                cam_arr   = _reshape_flat(cam_slice.astype(np.float32), ium_w, ium_h)
-                cam_path  = (cam_tex_dir / f"{frame.stem}{cfg.color_texture_format.extension}").resolve().as_posix()
-                _save_layer(cam_arr, cam_path, cfg.color_texture_format, DataLayer.POSITION)
-                if cfg.debug_camera_texture:
-                    src_img_path = images_out_dir_ct / Path(frame.file_path).name
-                    _save_debug_comparison(
-                        src_img_path,
-                        cam_arr,
-                        frame.stem,
-                        json_dir / "debug_camera_texture",
-                    )
-
-        # ── Pipeline Irradiance (Monte Carlo skybox lighting) ────────────────
-        if (cfg.render_irradiance and cfg.skybox_path
-                and ium_res.has_positions() and ium_res.has_normals()):
-            print(f"✓ Avvio calcolo Irradiance "
-                  f"({cfg.irradiance_sample_side}×{cfg.irradiance_sample_side} samples per texel)…")
-
-            sky_w, sky_h = cfg.skybox_size[0], cfg.skybox_size[1]
-            skybox_flat = _load_image_as_vec3(cfg.skybox_path, sky_w, sky_h)  # (H*W, 3) float32
-
-            irr_gen = optix.IrradianceGenerator()
-            irr_gen.set_traversable(model)
-            irr_gen.set_inputs(ium_res, skybox_flat, [sky_w, sky_h],
-                               cfg.irradiance_sample_side, cfg.skybox_yaw_degrees)
-            irr_gen.render()
-            irr_res = irr_gen.get_result()
-
-            irr_out_dir = json_dir / "irradiance"
-            os.makedirs(irr_out_dir, exist_ok=True)
-            irr_path = (irr_out_dir / f"irradiance{cfg.irradiance_format.extension}").resolve().as_posix()
-            irr_arr = _reshape_flat(irr_res.irradiance_np.astype(np.float32), ium_w, ium_h)
-            _save_layer(irr_arr, irr_path, cfg.irradiance_format, DataLayer.IRRADIANCE)
-            ium_result_data["irradiance_path"] = _as_relative_to(irr_path, json_dir_str)
-
-        # ── Indirect Irradiance via NeRF (precompute one-shot, cached) ────────
-        irr_indirect_flat = None
-        if cfg.precompute_indirect and ium_res.has_positions() and ium_res.has_normals():
-            ind_out_dir = json_dir / "irradiance"
-            os.makedirs(ind_out_dir, exist_ok=True)
-            ind_path = (ind_out_dir / f"irradiance_indirect{cfg.indirect_format.extension}").resolve().as_posix()
-
-            if not os.path.exists(ind_path):
-                print(f"✓ Avvio precompute Indirect Irradiance "
-                      f"(N={cfg.indirect_sample_side}, tile={cfg.indirect_tile_size})…")
-                _precompute_indirect_irradiance(
-                    cfg, ium_res, model, ium_w, ium_h, ind_path)
-            else:
-                print(f"✓ Indirect irradiance trovata su disco: {ind_path}")
-
-            # Carica il layer per usarlo nell'albedo
-            ind_arr = _load_exr_as_flat(ind_path)
-            if ind_arr is not None:
-                irr_indirect_flat = ind_arr
-                ium_result_data["irradiance_indirect_path"] = _as_relative_to(ind_path, json_dir_str)
-
-        # ── Albedo (color / irradiance_total) — modello Lambertiano ρ = π·L/E ─
-        if (cfg.render_albedo
-                and cfg.render_color_texture and cfg.render_irradiance
-                and 'ct_result' in dir() and 'irr_res' in dir()):
-            print(f"✓ Calcolo Albedo = π · color / max(irradiance, {cfg.albedo_eps})…")
-
-            color_flat = ct_result.colors_np.astype(np.float32)        # (N, 3)
-            irr_flat   = irr_res.irradiance_np.astype(np.float32)      # (N, 3)
-
-            # Somma il contributo indiretto se disponibile
-            if irr_indirect_flat is not None:
-                irr_flat = irr_flat + irr_indirect_flat
-
-            denom = np.maximum(irr_flat, cfg.albedo_eps)
-            albedo_flat = (np.float32(np.pi) * color_flat) / denom                 # (N, 3)
-
-            if ium_res.has_masks():
-                masks_flat = ium_res.masks_np.astype(bool)             # (N,)
-                albedo_flat[~masks_flat] = 0.0
-
-            albedo_flat = np.clip(albedo_flat, 0.0, 1.0)
-            alb_out_dir = json_dir / "albedo"
-            os.makedirs(alb_out_dir, exist_ok=True)
-            alb_path = (alb_out_dir / f"albedo{cfg.albedo_format.extension}").resolve().as_posix()
-            alb_arr = _reshape_flat(albedo_flat, ium_w, ium_h)
-            _save_layer(alb_arr, alb_path, cfg.albedo_format, DataLayer.ALBEDO)
-            ium_result_data["albedo_path"] = _as_relative_to(alb_path, json_dir_str)
-
-
-    # ── Copia immagini originali in output_dir/images/ ──────────────────────
     images_out_dir = json_dir / "images"
     os.makedirs(images_out_dir, exist_ok=True)
 
-    # ── Loop sui frame ─────────────────────────────────────────────────────
-    output_json = {**tf.raw}
     output_frames = []
-    scale = tf.scale if cfg.apply_scale else 1.0
+    scale = tf.scale if rc.apply_scale else 1.0
+    W, H = intr.w, intr.h
 
     for idx, frame in enumerate(tf.frames):
-        print(f"\n── Frame {idx + 1}/{len(tf.frames)}: {frame.stem}")
+        print(f"\n[Step 1] Frame {idx + 1}/{len(tf.frames)}: {frame.stem}")
 
-        # Copia l'immagine originale nella sottocartella images/
         src_image = Path(frame.file_path)
         dst_image = images_out_dir / src_image.name
         if src_image.exists():
             shutil.copy2(src_image, dst_image)
-            print(f"    ✓ Immagine copiata: {dst_image.name}")
         else:
             print(f"    ⚠  Immagine non trovata, skip copia: {src_image}")
 
-        camera = _camera_from_matrix(frame.transform_matrix, intr.camera_angle_y, [intr.w, intr.h], optix)
-        depth_gen.set_camera(
-            camera
-        )
+        camera = _camera_from_matrix(frame.transform_matrix, intr.camera_angle_y, [W, H], optix_mod)
+        depth_gen.set_camera(camera)
         depth_gen.render()
-        result = depth_gen.get_result()  # teniamo il riferimento vivo per tutto il frame
+        result = depth_gen.get_result()
 
         frame_entry: dict = {
             "file_path":        _as_relative_to(dst_image.as_posix(), json_dir_str),
             "sharpness":        frame.sharpness,
             "transform_matrix": frame.transform_matrix,
         }
-        stem = frame.stem
-        W, H = intr.w, intr.h
 
-        # Depth — (N,) float32 → reshape (H, W) --------------------------------
-        if cfg.render_depth and result.has_depth_data():
+        if result.has_depth_data():
             depth_arr = _reshape_flat(result.depths_np.astype(np.float32), W, H)
-            if cfg.apply_scale:
+            if rc.apply_scale:
                 depth_arr = depth_arr * scale
-            out_path = _build_output_path(cfg.output_dir, stem, "depth", cfg.depth_format)
-            _save_layer(depth_arr, out_path, cfg.depth_format, DataLayer.DEPTH)
+            out_path = _build_output_path(rc.output_dir, frame.stem, "depth", rc.depth_format)
+            _save_layer(depth_arr, out_path, rc.depth_format, DataLayer.DEPTH)
             frame_entry["depth_path"] = _as_relative_to(out_path, json_dir_str)
 
-        # Position — (N, 3) float32 → reshape (H, W, 3) ------------------------
-        if cfg.render_position and result.has_positional_data():
-            pos_arr = _reshape_flat(result.positions_np.astype(np.float32), W, H)
-            out_path = _build_output_path(cfg.output_dir, stem, "position", cfg.position_format)
-            _save_layer(pos_arr, out_path, cfg.position_format, DataLayer.POSITION)
-            frame_entry["position_path"] = _as_relative_to(out_path, json_dir_str)
-
-        # Normal — (N, 3) float32 → reshape (H, W, 3) --------------------------
-        if cfg.render_normal and result.has_normal_data():
-            norm_arr = _reshape_flat(result.normals_np.astype(np.float32), W, H)
-            out_path = _build_output_path(cfg.output_dir, stem, "normal", cfg.normal_format)
-            _save_layer(norm_arr, out_path, cfg.normal_format, DataLayer.NORMAL)
-            frame_entry["normal_path"] = _as_relative_to(out_path, json_dir_str)
-
-        # Mask — (N,) uint8 → reshape (H, W) -----------------------------------
-        if cfg.render_mask:
-            mask_arr = _reshape_flat(result.masks_np, W, H)
-            out_path = _build_output_path(cfg.output_dir, stem, "mask", cfg.mask_format)
-            _save_layer(mask_arr, out_path, cfg.mask_format, DataLayer.MASK)
-            frame_entry["mask_path"] = _as_relative_to(out_path, json_dir_str)
+        mask_arr = _reshape_flat(result.masks_np, W, H)
+        out_path = _build_output_path(rc.output_dir, frame.stem, "mask", rc.mask_format)
+        _save_layer(mask_arr, out_path, rc.mask_format, DataLayer.MASK)
+        frame_entry["mask_path"] = _as_relative_to(out_path, json_dir_str)
 
         output_frames.append(frame_entry)
-        # result può uscire di scope in sicurezza solo dopo questo punto
 
-    # ── Salva JSON arricchito ───────────────────────────────────────────────
+    output_json: dict = {**tf.raw}
+    output_json["fl_x"] = float(intr.fl_x)
+    output_json["fl_y"] = float(intr.fl_y)
+    output_json["h"] = H
+    output_json["w"] = W
     output_json["frames"] = output_frames
-    if ium_result_data:
-        output_json["ium"] = ium_result_data
 
-    out_json_path = (json_dir / "transforms_extended.json").as_posix()
+    out_json_path = json_dir / "transforms_extended.json"
     with open(out_json_path, "w", encoding="utf-8") as fh:
         json.dump(output_json, fh, indent=4)
-    print(f"\n✓ JSON arricchito salvato in: {out_json_path}")
+    print(f"\n[Step 1] JSON minimo salvato in: {out_json_path}")
+    return out_json_path
 
+
+def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Path:
+    """Allena il NeRF usando nerf_module.train() e restituisce il path del checkpoint."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    import torch
+    from nerf_module import NerfConfig, NerfDataset, train as nerf_train
+
+    rc = cfg.render
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    nerf_cfg = NerfConfig(
+        num_encoding_functions=rc.indirect_nerf_num_encoding_functions,
+        filter_size=rc.indirect_nerf_filter_size,
+        depth_window=rc.indirect_nerf_depth_window,
+        depth_samples_per_ray=rc.indirect_nerf_depth_samples,
+    )
+
+    print(f"[Step 2] Caricamento dataset: {transforms_extended_path}")
+    dataset = NerfDataset(str(transforms_extended_path), device=device)
+
+    ckpt = Path(cfg.nerf_ckpt_path or
+                Path(rc.output_dir) / "model" / "tinynerf_model_cache.pkl")
+    out_dir = Path(cfg.nerf_train_output_dir or Path(rc.output_dir) / "nerf_train")
+
+    print(f"[Step 2] Training NeRF — {cfg.nerf_num_iters} iter, ckpt → {ckpt}")
+    nerf_train(
+        dataset, nerf_cfg,
+        num_iters     = cfg.nerf_num_iters,
+        batch_size    = cfg.nerf_batch_size,
+        mask_bias     = cfg.nerf_mask_bias,
+        lr            = cfg.nerf_lr,
+        ckpt_path     = str(ckpt),
+        display_every = cfg.nerf_display_every,
+        output_dir    = str(out_dir),
+        on_step       = None,
+        seed          = cfg.nerf_seed,
+    )
+    print(f"[Step 2] Training completato. Checkpoint: {ckpt}")
+    return ckpt
+
+
+def _step3_posttrain_assets(cfg: PipelineConfig,
+                             transforms_extended_path: Path,
+                             optix_mod) -> dict:
+    """Esegue IUM/visibility/color_texture/irradiance/indirect/albedo e aggiorna
+    transforms_extended.json in-place con le nuove chiavi.
+    """
+    rc = cfg.render
+    tf = load_transforms(str(transforms_extended_path))
+    intr = tf.intrinsics
+    print(f"[Step 3] {len(tf.frames)} frame  [{intr.w}×{intr.h}]")
+
+    json_dir = Path(rc.output_dir).resolve()
+    json_dir_str = json_dir.as_posix()
+    os.makedirs(json_dir, exist_ok=True)
+
+    model = optix_mod.TriangleMesh()
+    model.add_from_obj_file(rc.model_path)
+    print(f"[Step 3] Modello caricato: {rc.model_path}")
+
+    # Leggi il JSON esistente — lo arricchiremo alla fine
+    with open(transforms_extended_path, encoding="utf-8") as fh:
+        output_json = json.load(fh)
+
+    ium_result_data: dict = output_json.get("ium", {})
+
+    if rc.render_ium:
+        ium_w, ium_h = rc.ium_texture_size[0], rc.ium_texture_size[1]
+
+        ium_gen = optix_mod.IUMGenerator()
+        ium_gen.set_traversable(model)
+        ium_gen.set_texture_size([ium_w, ium_h])
+        ium_gen.render()
+        ium_res = ium_gen.get_result()
+        print("[Step 3] IUM rendering completato")
+
+        ium_out_dir = json_dir / "ium"
+        os.makedirs(ium_out_dir, exist_ok=True)
+
+        if ium_res.has_positions():
+            pos_arr = _reshape_flat(ium_res.positions_np.astype(np.float32), ium_w, ium_h)
+            ium_pos_path = (ium_out_dir / f"ium_positions{rc.ium_format.extension}").resolve().as_posix()
+            _save_layer(pos_arr, ium_pos_path, rc.ium_format, DataLayer.POSITION)
+            ium_result_data["ium_positions_path"] = _as_relative_to(ium_pos_path, json_dir_str)
+
+        if ium_res.has_normals():
+            norm_arr = _reshape_flat(ium_res.normals_np.astype(np.float32), ium_w, ium_h)
+            ium_norm_path = (ium_out_dir / f"ium_normals{rc.ium_format.extension}").resolve().as_posix()
+            _save_layer(norm_arr, ium_norm_path, rc.ium_format, DataLayer.NORMAL)
+            ium_result_data["ium_normals_path"] = _as_relative_to(ium_norm_path, json_dir_str)
+
+        if ium_res.has_masks():
+            mask_arr = _reshape_flat(ium_res.masks_np, ium_w, ium_h)
+            ium_mask_path = (ium_out_dir / f"ium_masks{rc.ium_format.extension}").resolve().as_posix()
+            _save_layer(mask_arr, ium_mask_path, rc.ium_format, DataLayer.MASK)
+            ium_result_data["ium_masks_path"] = _as_relative_to(ium_mask_path, json_dir_str)
+
+        all_cameras = []
+        for frame in tf.frames:
+            cam = _camera_from_matrix(frame.transform_matrix, intr.camera_angle_y, [intr.w, intr.h], optix_mod)
+            all_cameras.append(cam)
+
+        # ── Visibility ───────────────────────────────────────────────────────
+        visibility_map = None
+        if rc.render_visibility and ium_res.has_positions() and ium_res.has_masks():
+            print("[Step 3] Calcolo Visibilità telecamere…")
+            vis_gen = optix_mod.VisibilityGenerator()
+            vis_gen.set_traversable(model)
+            visibility_map = vis_gen.check_visibility(ium_res, ium_w, ium_h, all_cameras)
+
+            vis_out_dir = json_dir / "visibility"
+            os.makedirs(vis_out_dir, exist_ok=True)
+            vis_path = (vis_out_dir / f"visibility{rc.visibility_format.extension}").resolve().as_posix()
+
+            if rc.visibility_format == ImageFormat.OPENEXR:
+                vis_arr = visibility_map.reshape((ium_h, ium_w, len(all_cameras))).astype(np.float32)
+                _save_layer(vis_arr, vis_path, rc.visibility_format, DataLayer.VISIBILITY)
+            else:
+                visible_count = np.sum(visibility_map, axis=1)
+                ratio = visible_count.astype(np.float32) / float(len(all_cameras))
+                vis_arr = _reshape_flat(ratio, ium_w, ium_h)
+                _save_layer(vis_arr, vis_path, rc.visibility_format, DataLayer.VISIBILITY)
+
+            ium_result_data["visibility_path"] = _as_relative_to(vis_path, json_dir_str)
+
+        # ── Color Texture ────────────────────────────────────────────────────
+        ct_result = None
+        if (rc.render_color_texture and rc.render_ium and rc.render_visibility
+                and visibility_map is not None):
+            print("[Step 3] Calcolo Color Texture…")
+
+            images_out_dir_ct = json_dir / "images"
+            os.makedirs(images_out_dir_ct, exist_ok=True)
+            # Images already copied by Step 1; copy only if src differs from dst
+            for frame in tf.frames:
+                src = Path(frame.file_path)
+                dst = images_out_dir_ct / src.name
+                if src.exists() and src.resolve() != dst.resolve():
+                    shutil.copy2(src, dst)
+
+            optix_frames = []
+            for i, frame in enumerate(tf.frames):
+                cam = all_cameras[i]
+                img_path = (images_out_dir_ct / Path(frame.file_path).name).as_posix()
+                img_flat = _load_image_as_vec3(img_path, intr.w, intr.h)
+                peak = _compute_peak(img_flat.reshape(intr.h, intr.w, 3),
+                                     rc.color_texture_peak_percentile)
+                optix_frames.append(optix_mod.Frame(cam, peak, img_flat))
+
+            ct_gen = optix_mod.ColorTexGenerator()
+            ct_gen.set_inputs(ium_res, visibility_map, optix_frames)
+            ct_gen.render()
+            ct_result = ct_gen.get_result()
+
+            ct_out_dir = json_dir / "color_texture"
+            os.makedirs(ct_out_dir, exist_ok=True)
+            ct_path = (ct_out_dir / f"color_texture{rc.color_texture_format.extension}").resolve().as_posix()
+            ct_arr = _reshape_flat(ct_result.colors_np.astype(np.float32), ium_w, ium_h)
+            _save_layer(ct_arr, ct_path, rc.color_texture_format, DataLayer.POSITION)
+            ium_result_data["color_texture_path"] = _as_relative_to(ct_path, json_dir_str)
+
+            if rc.render_pixel_change:
+                pc_dir = json_dir / "pixel_change"
+                pc_dir.mkdir(parents=True, exist_ok=True)
+                min_arr   = _reshape_flat(ct_result.color_min_np.astype(np.float32), ium_w, ium_h)
+                max_arr   = _reshape_flat(ct_result.color_max_np.astype(np.float32), ium_w, ium_h)
+                range_arr = np.clip(max_arr - min_arr, 0.0, None)
+                var_arr   = _reshape_flat(ct_result.color_variance_np.astype(np.float32), ium_w, ium_h)
+                ext = rc.color_texture_format
+                _save_layer(min_arr,   (pc_dir / f"color_min{ext.extension}").as_posix(),      ext, DataLayer.POSITION)
+                _save_layer(max_arr,   (pc_dir / f"color_max{ext.extension}").as_posix(),      ext, DataLayer.POSITION)
+                _save_layer(range_arr, (pc_dir / f"color_range{ext.extension}").as_posix(),    ext, DataLayer.POSITION)
+                _save_layer(var_arr,   (pc_dir / f"color_variance{ext.extension}").as_posix(), ext, DataLayer.POSITION)
+                if rc.debug_pixel_change:
+                    _save_debug_pixel_change(min_arr, max_arr, range_arr, json_dir / "debug_pixel_change")
+
+            cam_tex_dir = json_dir / "camera_texture"
+            os.makedirs(cam_tex_dir, exist_ok=True)
+            cam_colors = ct_result.camera_colors_np
+            for cam_idx, frame in enumerate(tf.frames):
+                cam_slice = cam_colors[:, cam_idx, :]
+                cam_arr   = _reshape_flat(cam_slice.astype(np.float32), ium_w, ium_h)
+                cam_path  = (cam_tex_dir / f"{frame.stem}{rc.color_texture_format.extension}").resolve().as_posix()
+                _save_layer(cam_arr, cam_path, rc.color_texture_format, DataLayer.POSITION)
+                if rc.debug_camera_texture:
+                    src_img_path = images_out_dir_ct / Path(frame.file_path).name
+                    _save_debug_comparison(src_img_path, cam_arr, frame.stem,
+                                           json_dir / "debug_camera_texture")
+
+        # ── Irradiance (Monte Carlo skybox) ──────────────────────────────────
+        irr_res = None
+        if (rc.render_irradiance and rc.skybox_path
+                and ium_res.has_positions() and ium_res.has_normals()):
+            print(f"[Step 3] Calcolo Irradiance "
+                  f"({rc.irradiance_sample_side}×{rc.irradiance_sample_side} samples)…")
+            sky_w, sky_h = rc.skybox_size[0], rc.skybox_size[1]
+            skybox_flat = _load_image_as_vec3(rc.skybox_path, sky_w, sky_h)
+            irr_gen = optix_mod.IrradianceGenerator()
+            irr_gen.set_traversable(model)
+            irr_gen.set_inputs(ium_res, skybox_flat, [sky_w, sky_h],
+                               rc.irradiance_sample_side, rc.skybox_yaw_degrees)
+            irr_gen.render()
+            irr_res = irr_gen.get_result()
+            irr_out_dir = json_dir / "irradiance"
+            os.makedirs(irr_out_dir, exist_ok=True)
+            irr_path = (irr_out_dir / f"irradiance{rc.irradiance_format.extension}").resolve().as_posix()
+            irr_arr = _reshape_flat(irr_res.irradiance_np.astype(np.float32), ium_w, ium_h)
+            _save_layer(irr_arr, irr_path, rc.irradiance_format, DataLayer.IRRADIANCE)
+            ium_result_data["irradiance_path"] = _as_relative_to(irr_path, json_dir_str)
+
+        # ── Indirect Irradiance via NeRF ─────────────────────────────────────
+        irr_indirect_flat = None
+        if rc.precompute_indirect and ium_res.has_positions() and ium_res.has_normals():
+            ind_out_dir = json_dir / "irradiance"
+            os.makedirs(ind_out_dir, exist_ok=True)
+            ind_path = (ind_out_dir / f"irradiance_indirect{rc.indirect_format.extension}").resolve().as_posix()
+            if not os.path.exists(ind_path):
+                print(f"[Step 3] Precompute Indirect Irradiance "
+                      f"(N={rc.indirect_sample_side}, tile={rc.indirect_tile_size})…")
+                _precompute_indirect_irradiance(rc, ium_res, model, ium_w, ium_h, ind_path)
+            else:
+                print(f"[Step 3] Indirect irradiance trovata su disco: {ind_path}")
+            ind_arr = _load_exr_as_flat(ind_path)
+            if ind_arr is not None:
+                irr_indirect_flat = ind_arr
+                ium_result_data["irradiance_indirect_path"] = _as_relative_to(ind_path, json_dir_str)
+
+        # ── Albedo ───────────────────────────────────────────────────────────
+        if (rc.render_albedo and ct_result is not None and irr_res is not None):
+            print(f"[Step 3] Calcolo Albedo = π · color / max(irradiance, {rc.albedo_eps})…")
+            color_flat = ct_result.colors_np.astype(np.float32)
+            irr_flat   = irr_res.irradiance_np.astype(np.float32)
+            if irr_indirect_flat is not None:
+                irr_flat = irr_flat + irr_indirect_flat
+            denom = np.maximum(irr_flat, rc.albedo_eps)
+            albedo_flat = (np.float32(np.pi) * color_flat) / denom
+            if ium_res.has_masks():
+                albedo_flat[~ium_res.masks_np.astype(bool)] = 0.0
+            albedo_flat = np.clip(albedo_flat, 0.0, 1.0)
+            alb_out_dir = json_dir / "albedo"
+            os.makedirs(alb_out_dir, exist_ok=True)
+            alb_path = (alb_out_dir / f"albedo{rc.albedo_format.extension}").resolve().as_posix()
+            alb_arr = _reshape_flat(albedo_flat, ium_w, ium_h)
+            _save_layer(alb_arr, alb_path, rc.albedo_format, DataLayer.ALBEDO)
+            ium_result_data["albedo_path"] = _as_relative_to(alb_path, json_dir_str)
+
+    # Aggiorna il JSON in-place e riscrivi
+    if ium_result_data:
+        output_json["ium"] = ium_result_data
+    with open(transforms_extended_path, "w", encoding="utf-8") as fh:
+        json.dump(output_json, fh, indent=4)
+    print(f"\n[Step 3] JSON aggiornato: {transforms_extended_path}")
     return output_json
+
+
+def run_pipeline(cfg: PipelineConfig) -> dict:
+    """Orchestratore a tre step. Ogni step può essere abilitato/disabilitato.
+
+    Step 1 (run_step1): depth+mask per frame + copia immagini + transforms_extended.json minimo.
+    Step 2 (run_step2): training NeRF via nerf_module.train(), salva checkpoint.
+    Step 3 (run_step3): IUM/visibility/color_texture/irradiance/indirect/albedo.
+    """
+    import OptixProgrammablePasses as optix
+    optix.LogManager.set_min_level(optix.LogLevel.Error)
+    optix.OptixManager.instance().set_log_level(optix.LogLevel.Disabled)
+
+    transforms_extended = Path(cfg.render.output_dir) / "transforms_extended.json"
+
+    if cfg.run_step1:
+        transforms_extended = _step1_pretrain_data(cfg, optix)
+    elif not transforms_extended.exists():
+        raise FileNotFoundError(
+            f"Step 1 disabilitato ma {transforms_extended} non esiste.\n"
+            "Attivare run_step1=True oppure eseguire Step 1 manualmente."
+        )
+    else:
+        # Validazione minima del JSON esistente
+        with open(transforms_extended, encoding="utf-8") as fh:
+            _probe = json.load(fh)
+        frames = _probe.get("frames", [])
+        if frames and ("depth_path" not in frames[0] or "mask_path" not in frames[0]):
+            raise ValueError(
+                f"{transforms_extended} non contiene depth_path/mask_path per frame.\n"
+                "Attivare run_step1=True per rigenerarlo."
+            )
+
+    ckpt_path = Path(cfg.nerf_ckpt_path or
+                     Path(cfg.render.output_dir) / "model" / "tinynerf_model_cache.pkl")
+
+    if cfg.run_step2:
+        ckpt_path = _step2_train_nerf(cfg, transforms_extended)
+    elif cfg.run_step3 and cfg.render.precompute_indirect and not ckpt_path.exists():
+        raise FileNotFoundError(
+            f"Step 2 disabilitato ma il checkpoint NeRF non esiste: {ckpt_path}\n"
+            "Attivare run_step2=True oppure fornire nerf_ckpt_path valido."
+        )
+
+    if cfg.run_step3:
+        if cfg.render.precompute_indirect and not cfg.render.indirect_nerf_cache_path:
+            cfg.render.indirect_nerf_cache_path = str(ckpt_path)
+        return _step3_posttrain_assets(cfg, transforms_extended, optix)
+
+    with open(transforms_extended, encoding="utf-8") as fh:
+        return json.load(fh)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1047,42 +1039,56 @@ def run_pipeline(cfg: RenderConfig) -> dict:
 if __name__ == "__main__":
     REPO = "C:/Users/adria/Documents/GitHub/Tesi/OptixProjectCMake"
 
-    cfg = RenderConfig(
-        transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
-        model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-        output_dir      = "output/sworshield_render_Albedo_clamp3",
+    cfg = PipelineConfig(
+        run_step1 = True,
+        run_step2 = True,
+        run_step3 = True,
 
-        render_depth    = True,
-        render_position = True,
-        render_normal   = True,
-        render_mask     = True,
-        render_ium      = True,
-        render_color_texture=True,
-        debug_camera_texture=False,
-        render_pixel_change=True,
-        debug_pixel_change=False,
+        render = RenderConfig(
+            transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
+            model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
+            output_dir      = "output/sworshield_render_nerf_2",
 
-        render_irradiance      = True,
-        irradiance_format      = ImageFormat.OPENEXR,
-        skybox_path            = f"{REPO}/Scenes/SwordShield/Blender/assets/hdrs/clouds-sunshine_b963efc0-83f3-4957-8725-34f73b8744ff/clouds-sunshine_2K_09c69240-8e00-4b23-896f-fcde6fd514cc.exr",
-        skybox_size            = [1024, 512],
-        irradiance_sample_side = 512,
+            render_depth    = True,
+            render_position = False,  # Step 1 produces only depth+mask
+            render_normal   = False,
+            render_mask     = True,
+            render_ium      = True,
+            render_color_texture  = True,
+            debug_camera_texture  = False,
+            render_pixel_change   = True,
+            debug_pixel_change    = False,
 
-        render_albedo = True,
-        albedo_format = ImageFormat.OPENEXR,
-        albedo_eps    = 1e-3,
+            render_irradiance      = True,
+            irradiance_format      = ImageFormat.OPENEXR,
+            skybox_path            = f"{REPO}/Scenes/SwordShield/Blender/assets/hdrs/clouds-sunshine_b963efc0-83f3-4957-8725-34f73b8744ff/clouds-sunshine_2K_09c69240-8e00-4b23-896f-fcde6fd514cc.exr",
+            skybox_size            = [1024, 512],
+            irradiance_sample_side = 512,
 
-        # Cambia OPENEXR → PNG per normalizzare automaticamente in uint8
-        depth_format    = ImageFormat.OPENEXR,
-        position_format = ImageFormat.OPENEXR,
-        normal_format   = ImageFormat.OPENEXR,
-        mask_format     = ImageFormat.OPENEXR,
-        ium_format      = ImageFormat.OPENEXR,
-        visibility_format = ImageFormat.OPENEXR,
-        color_texture_format=ImageFormat.OPENEXR,
+            precompute_indirect = True,
+            indirect_sample_side = 64,
+            indirect_tile_size   = 1024,
 
-        ium_texture_size = [512, 512],
-        apply_scale      = True,
+            render_albedo = True,
+            albedo_format = ImageFormat.OPENEXR,
+            albedo_eps    = 1e-3,
+
+            depth_format      = ImageFormat.OPENEXR,
+            mask_format       = ImageFormat.PNG,
+            ium_format        = ImageFormat.OPENEXR,
+            visibility_format = ImageFormat.OPENEXR,
+            color_texture_format = ImageFormat.OPENEXR,
+
+            ium_texture_size = [512, 512],
+            apply_scale      = False,
+        ),
+
+        nerf_num_iters    = 10000,
+        nerf_batch_size   = 4096,
+        nerf_mask_bias    = 0.9,
+        nerf_lr           = 5e-3,
+        nerf_display_every = 100,
+        nerf_seed         = 9458,
     )
 
     run_pipeline(cfg)
