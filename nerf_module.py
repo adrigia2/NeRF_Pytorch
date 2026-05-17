@@ -44,6 +44,8 @@ class NerfConfig:
     scene_scale: float = 3.0
     # LR schedule: lr decays to 10% after lrate_decay * 1000 steps
     lrate_decay: int = 250
+    # HDR mode: predict linear-light radiance (softplus output, Reinhard loss, linear targets)
+    hdr_mode: bool = True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -78,6 +80,10 @@ class TinyNerfModel(nn.Module):
         self.layer1 = nn.Linear(in_dim, filter_size)
         self.layer2 = nn.Linear(filter_size, filter_size)
         self.layer3 = nn.Linear(filter_size, 4)
+        # Bias density channel toward positive values so weights accumulate from the start.
+        # Prevents the "empty scene" sigma-collapse local minimum.
+        with torch.no_grad():
+            self.layer3.bias[3].fill_(1.0)
 
     def forward(self, x):
         x = F.relu(self.layer1(x))
@@ -124,8 +130,12 @@ class NeRFModel(nn.Module):
             view_dim = 3 + 3 * 2 * num_encoding_functions_views
             self.views_linear = nn.Linear(W + view_dim, W // 2)
             self.rgb_linear   = nn.Linear(W // 2, 3)
+            # Positive density bias to prevent empty-scene sigma collapse.
+            nn.init.constant_(self.alpha_linear.bias, 1.0)
         else:
             self.output_linear = nn.Linear(W, 4)
+            with torch.no_grad():
+                self.output_linear.bias[3].fill_(1.0)
 
     def forward(self, x: torch.Tensor, dirs: torch.Tensor = None) -> torch.Tensor:
         pts_enc = x
@@ -248,9 +258,14 @@ def compute_query_points_from_depth(
 # Volume rendering
 # ──────────────────────────────────────────────────────────────────────────────
 
-def render_volume_density(radiance_field, ray_origins, depth_values):
-    sigma   = F.softplus(radiance_field[..., 3])
-    rgb     = torch.sigmoid(radiance_field[..., :3])
+def render_volume_density(radiance_field, ray_origins, depth_values, hdr_mode: bool = False):
+    sigma = F.softplus(radiance_field[..., 3])
+    if hdr_mode:
+        # exp activation: log(pred)=z so gradient of log-MSE loss w.r.t. z never saturates.
+        # softplus gradient dies for z<<0 (sigmoid(−10)≈4e-5); exp has no such dead zone.
+        rgb = torch.exp(radiance_field[..., :3].clamp(-15.0, 8.0))
+    else:
+        rgb = torch.sigmoid(radiance_field[..., :3])
     one_e10 = torch.tensor([1e10], dtype=ray_origins.dtype, device=ray_origins.device)
     dists   = torch.cat([depth_values[..., 1:] - depth_values[..., :-1],
                           one_e10.expand(depth_values[..., :1].shape)], dim=-1)
@@ -347,7 +362,7 @@ def run_one_iter(
 
     query_points = origins[..., None, :] + dirs[..., None, :] * depth_values[..., :, None]
     rf = _encode_and_run(query_points, model, cfg, dirs=dirs)
-    return render_volume_density(rf, origins, depth_values)
+    return render_volume_density(rf, origins, depth_values, hdr_mode=getattr(cfg, 'hdr_mode', False))
 
 
 def render_image(H, W, focal, c2w, model, cfg,
@@ -413,6 +428,15 @@ def save_checkpoint(path: str, model, optimizer,
         'num_layers':                   int(getattr(cfg, 'num_layers', 3)),
         'skips':                        tuple(getattr(cfg, 'skips', (4,))),
         'use_viewdirs':                 bool(getattr(cfg, 'use_viewdirs', False)),
+        # Scene / sampling parameters — needed to reproduce inference conditions
+        'near':                         float(cfg.near),
+        'far':                          float(cfg.far),
+        'scene_scale':                  float(cfg.scene_scale),
+        'depth_samples_per_ray':        int(cfg.depth_samples_per_ray),
+        'depth_window':                 float(cfg.depth_window),
+        'depth_window_end':             float(cfg.depth_window_end),
+        'chunk_size':                   int(cfg.chunk_size),
+        'hdr_mode':                     bool(getattr(cfg, 'hdr_mode', True)),
     }
     with open(path, 'wb') as f:
         pickle.dump(payload, f)
@@ -432,6 +456,10 @@ def load_checkpoint(path: str, device=None):
     skips        = payload.get('skips', (4,))
     use_viewdirs = payload.get('use_viewdirs', False)
     model_type   = payload.get('model_type', 'TinyNerfModel')
+    hdr_mode     = payload.get('hdr_mode', None)
+    if hdr_mode is None:
+        print("[NeRF] WARNING: checkpoint has no 'hdr_mode' field (legacy). Defaulting to SDR (sigmoid).")
+        hdr_mode = False
 
     cfg = NerfConfig(
         num_encoding_functions=num_enc,
@@ -440,6 +468,14 @@ def load_checkpoint(path: str, device=None):
         num_layers=num_layers,
         skips=skips,
         use_viewdirs=use_viewdirs,
+        near=payload.get('near', 1.0),
+        far=payload.get('far', 20.0),
+        scene_scale=payload.get('scene_scale', 3.0),
+        depth_samples_per_ray=payload.get('depth_samples_per_ray', 64),
+        depth_window=payload.get('depth_window', 0.5),
+        depth_window_end=payload.get('depth_window_end', 0.0),
+        chunk_size=payload.get('chunk_size', 16384),
+        hdr_mode=hdr_mode,
     )
     if model_type == 'NeRFModel':
         model = NeRFModel(
@@ -487,11 +523,14 @@ def _load_exr_mask_np(path: str) -> np.ndarray:
     return np.frombuffer(f.channel(ch, PT), dtype=np.float32).reshape(h, w)
 
 
-def _load_exr_rgb_np(path: str) -> np.ndarray:
-    """Load EXR as (H, W, 3) float32 sRGB-encoded in [0, 1].
-    Applies gamma 1/2.2 to linear HDR radiance values so targets are perceptually
-    uniform and not concentrated near zero (which causes the optimizer to collapse
-    predictions to 0 as a local minimum when training on raw linear-light data)."""
+def _load_exr_rgb_np(path: str, hdr_mode: bool = False) -> np.ndarray:
+    """Load EXR as (H, W, 3) float32.
+
+    hdr_mode=False (SDR): applies gamma 1/2.2 + clip to [0,1] — perceptually uniform
+      targets that avoid the "predict-zero" local minimum in MSE training.
+    hdr_mode=True  (HDR): returns linear-light radiance (clamped negative artefacts only),
+      values can exceed 1.0. Use with Reinhard-mapped loss and softplus output activation.
+    """
     import importlib
     OpenEXR = importlib.import_module('OpenEXR')
     Imath   = importlib.import_module('Imath')
@@ -508,10 +547,10 @@ def _load_exr_rgb_np(path: str) -> np.ndarray:
         return np.zeros((h, w), dtype=np.float32)
     r = _ch('R'); g = _ch('G'); b = _ch('B')
     rgb = np.stack([r, g, b], axis=-1)
-    # Clamp negatives (EXR artefacts), apply sRGB gamma ~2.2, clip HDR highlights
-    rgb = np.maximum(rgb, 0.0)
-    rgb = np.power(rgb, 1.0 / 2.2)
-    rgb = np.clip(rgb, 0.0, 1.0)
+    rgb = np.maximum(rgb, 0.0)     # clamp EXR negative artefacts
+    if not hdr_mode:
+        rgb = np.power(rgb, 1.0 / 2.2)
+        rgb = np.clip(rgb, 0.0, 1.0)
     return rgb.astype(np.float32)
 
 
@@ -536,11 +575,12 @@ class NerfDataset:
     Raises ValueError if those fields are absent.
     """
 
-    def __init__(self, transforms_json_path: str, device=None, test_idx: int = None):
+    def __init__(self, transforms_json_path: str, device=None, test_idx: int = None, hdr_mode: bool = True):
         if device is None:
             self._device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
             self._device = torch.device(device)
+        self._hdr_mode = hdr_mode
 
         json_dir = os.path.dirname(os.path.abspath(transforms_json_path))
         with open(transforms_json_path, 'r') as fh:
@@ -591,12 +631,20 @@ class NerfDataset:
                 continue
 
             if img_p.lower().endswith('.exr'):
-                img_np = _load_exr_rgb_np(img_p)
+                img_np = _load_exr_rgb_np(img_p, hdr_mode=self._hdr_mode)
                 if img_np.shape[:2] != (self._H, self._W):
-                    img_np = np.array(
-                        PILImage.fromarray((img_np * 255).astype(np.uint8)).resize(
-                            (self._W, self._H), PILImage.LANCZOS),
-                        dtype=np.float32) / 255.0
+                    if self._hdr_mode:
+                        # Resize per-channel in float32 mode to preserve HDR range
+                        chans = [np.array(
+                            PILImage.fromarray(img_np[:, :, c], mode='F').resize(
+                                (self._W, self._H), PILImage.LANCZOS),
+                            dtype=np.float32) for c in range(3)]
+                        img_np = np.stack(chans, axis=-1)
+                    else:
+                        img_np = np.array(
+                            PILImage.fromarray((img_np * 255).astype(np.uint8)).resize(
+                                (self._W, self._H), PILImage.LANCZOS),
+                            dtype=np.float32) / 255.0
             else:
                 im = PILImage.open(img_p).convert('RGB')
                 if im.width != self._W or im.height != self._H:
@@ -681,6 +729,7 @@ class NerfDataset:
         # Per-frame cache for test/full-image render
         self._imgs_pf  = [torch.from_numpy(imgs[i]).float()  for i in range(n)]
         self._deps_pf  = [torch.from_numpy(deps[i]).float()  for i in range(n)]
+        self._msks_pf  = [torch.from_numpy(msks[i]).float()  for i in range(n)]
         self._poses_pf = [torch.from_numpy(poses[i]).float() for i in range(n)]
 
     # ── properties ──────────────────────────────────────────────────────────
@@ -706,12 +755,14 @@ class NerfDataset:
         i = self._test_idx
         return (self._imgs_pf[i].to(self._device),
                 self._poses_pf[i].to(self._device),
-                self._deps_pf[i].to(self._device))
+                self._deps_pf[i].to(self._device),
+                self._msks_pf[i].to(self._device))
 
     def get_frame(self, idx: int):
         return (self._imgs_pf[idx].to(self._device),
                 self._poses_pf[idx].to(self._device),
-                self._deps_pf[idx].to(self._device))
+                self._deps_pf[idx].to(self._device),
+                self._msks_pf[idx].to(self._device))
 
     # ── sampling ────────────────────────────────────────────────────────────
 
@@ -754,8 +805,12 @@ def _save_preview(gt_rgb: torch.Tensor, pred_rgb: torch.Tensor,
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    gt_rgb_np   = gt_rgb.detach().cpu().numpy().clip(0, 1)
-    pred_rgb_np = pred_rgb.detach().cpu().numpy().clip(0, 1)
+    def _tonemap(t: torch.Tensor) -> np.ndarray:
+        x = t.detach().cpu()
+        x = x / (1.0 + x)   # Reinhard — works for both linear HDR and SDR [0,1]
+        return x.numpy().clip(0, 1)
+    gt_rgb_np   = _tonemap(gt_rgb)
+    pred_rgb_np = _tonemap(pred_rgb)
     gt_d_np     = gt_depth.detach().cpu().numpy()
     pred_d_np   = pred_depth.detach().cpu().numpy()
 
@@ -789,8 +844,9 @@ def _save_test_comparison(gt: torch.Tensor, pred: torch.Tensor,
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    gt_np   = gt.detach().cpu().numpy().clip(0, 1)
-    pred_np = pred.detach().cpu().numpy().clip(0, 1)
+    def _tm(t): x = t.detach().cpu(); return (x / (1.0 + x)).numpy().clip(0, 1)
+    gt_np   = _tm(gt)
+    pred_np = _tm(pred)
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     axes[0].imshow(gt_np);   axes[0].set_title("GT");                    axes[0].axis('off')
     axes[1].imshow(pred_np); axes[1].set_title(f"Pred  PSNR={psnr:.2f}dB"); axes[1].axis('off')
@@ -800,13 +856,16 @@ def _save_test_comparison(gt: torch.Tensor, pred: torch.Tensor,
     plt.close(fig)
 
 
-def _save_loss_curve(iternums, losses, psnrs, path: str):
+def _save_loss_curve(iternums, losses, psnrs, path: str, psnrs_fg=None):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
     ax1.plot(iternums, losses); ax1.set_title("Loss");      ax1.set_xlabel("Iter"); ax1.set_yscale('log')
-    ax2.plot(iternums, psnrs);  ax2.set_title("PSNR (dB)"); ax2.set_xlabel("Iter")
+    ax2.plot(iternums, psnrs, label="full");  ax2.set_title("PSNR (dB)"); ax2.set_xlabel("Iter")
+    if psnrs_fg:
+        ax2.plot(iternums, psnrs_fg, label="FG", linestyle='--')
+        ax2.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=100)
     plt.close(fig)
@@ -878,8 +937,8 @@ def train(
         os.makedirs(preview_dir, exist_ok=True)
         os.makedirs(test_dir,    exist_ok=True)
 
-    losses, psnrs, iternums = [], [], []
-    testimg, testpose, testdepth = dataset.get_test_frame()
+    losses, psnrs, psnrs_fg, iternums = [], [], [], []
+    testimg, testpose, testdepth, testmask = dataset.get_test_frame()
 
     model_name = type(model).__name__
     print(f"[NeRF] {model_name} | iters {start_iter}→{num_iters} | "
@@ -910,17 +969,16 @@ def train(
             parts_pred.append(rgb_bg)
             parts_tgt.append(rgb_tgt[~is_fg])
 
-        loss = F.mse_loss(torch.cat(parts_pred), torch.cat(parts_tgt))
-
-        if i in (0, 1, 100):
-            with torch.no_grad():
-                if n_fg > 0:
-                    print(f"  [DBG i={i}] rgb_fg  mean={rgb_fg.mean():.4f}  std={rgb_fg.std():.4f}  "
-                          f"tgt_fg={rgb_tgt[is_fg].mean():.4f}")
-                if n_bg > 0:
-                    print(f"  [DBG i={i}] rgb_bg  mean={rgb_bg.mean():.4f}  "
-                          f"tgt_bg={rgb_tgt[~is_fg].mean():.4f}  std={rgb_tgt[~is_fg].std():.4f}")
-                print(f"  [DBG i={i}] loss={loss.item():.5f}")
+        all_pred = torch.cat(parts_pred)
+        all_tgt  = torch.cat(parts_tgt)
+        if getattr(cfg, 'hdr_mode', False):
+            # Log-space MSE: uniform gradient across HDR dynamic range (RawNeRF-style).
+            # With exp activation, log(pred)=z, so loss ≈ (z_pred − log(tgt))² — no saturation.
+            _eps = 1e-3
+            loss = ((torch.log(all_pred.clamp_min(0) + _eps)
+                     - torch.log(all_tgt.clamp_min(0) + _eps)) ** 2).mean()
+        else:
+            loss = F.mse_loss(all_pred, all_tgt)
 
         loss.backward()
         new_lr = lr * (0.1 ** (i / decay_steps))
@@ -931,46 +989,97 @@ def train(
 
         if i % display_every == 0:
             model.eval()
-            rgb_eval, dep_eval, _ = render_image(dataset.H, dataset.W, dataset.focal,
-                                                   testpose, model, cfg,
-                                                   target_depth=testdepth, randomize=False,
-                                                   focal_y=dataset.focal_y)
-            eval_loss = F.mse_loss(rgb_eval, testimg)
-            psnr      = -10.0 * torch.log10(eval_loss).item()
+            rgb_eval, dep_eval, acc_eval = render_image(dataset.H, dataset.W, dataset.focal,
+                                                         testpose, model, cfg,
+                                                         target_depth=testdepth, randomize=False,
+                                                         focal_y=dataset.focal_y)
+            hdr = getattr(cfg, 'hdr_mode', False)
+            _eps = 1e-3
+            if hdr:
+                eval_loss = F.mse_loss(
+                    torch.log(rgb_eval.clamp_min(0) + _eps),
+                    torch.log(testimg .clamp_min(0) + _eps))
+            else:
+                eval_loss = F.mse_loss(rgb_eval, testimg)
+            psnr = -10.0 * torch.log10(eval_loss).item()
+
+            # FG-only PSNR — measures object quality regardless of BG
+            fg_mask = testmask.bool()
+            if fg_mask.any():
+                if hdr:
+                    fg_loss = F.mse_loss(
+                        torch.log(rgb_eval[fg_mask].clamp_min(0) + _eps),
+                        torch.log(testimg [fg_mask].clamp_min(0) + _eps))
+                else:
+                    fg_loss = F.mse_loss(rgb_eval[fg_mask], testimg[fg_mask])
+                psnr_fg = -10.0 * torch.log10(fg_loss).item()
+            else:
+                psnr_fg = float('nan')
+
             losses.append(loss.item())
             psnrs.append(psnr)
+            psnrs_fg.append(psnr_fg)
             iternums.append(i)
+
+            # Diagnostic: detect sigma/rgb collapse early
+            bg_mask = ~fg_mask
+            print(f"  [{i:5d}] loss={loss.item():.5f}  "
+                  f"PSNR fg={psnr_fg:.2f}dB | full={psnr:.2f}dB  "
+                  f"acc[fg={acc_eval[fg_mask].mean():.2f} bg={acc_eval[bg_mask].mean():.2f}]  "
+                  f"rgb[fg={rgb_eval[fg_mask].mean():.3f} bg={rgb_eval[bg_mask].mean():.3f}]  "
+                  f"tgt[fg={testimg[fg_mask].mean():.3f} bg={testimg[bg_mask].mean():.3f}]")
 
             if preview_dir:
                 _save_preview(testimg, rgb_eval, testdepth, dep_eval, preview_dir, i)
 
             if on_step:
                 on_step(i, loss.item(), psnrs, losses, model)
-            else:
-                print(f"  [{i:5d}] loss={loss.item():.5f}  PSNR={psnr:.2f}dB")
 
     if ckpt_path:
         save_checkpoint(ckpt_path, model, optim, num_iters, cfg, seed)
 
     if output_dir and iternums:
         _save_loss_curve(iternums, losses, psnrs,
-                          os.path.join(output_dir, 'nerf_train', 'loss_curve.png'))
+                          os.path.join(output_dir, 'nerf_train', 'loss_curve.png'),
+                          psnrs_fg=psnrs_fg)
 
     # Final test loop
     if test_dir:
         print("[NeRF] Test loop...")
         model.eval()
-        all_psnr = []
+        all_psnr_full, all_psnr_fg = [], []
+        hdr = getattr(cfg, 'hdr_mode', False)
         for fi in range(dataset.num_frames):
-            gt, pose, dep = dataset.get_frame(fi)
+            gt, pose, dep, msk = dataset.get_frame(fi)
             pred, _, _ = render_image(dataset.H, dataset.W, dataset.focal,
                                        pose, model, cfg,
                                        target_depth=dep, randomize=False,
                                        focal_y=dataset.focal_y)
-            psnr_v = -10.0 * torch.log10(F.mse_loss(pred, gt)).item()
-            all_psnr.append(psnr_v)
-            _save_test_comparison(gt, pred, psnr_v, fi, test_dir)
-        print(f"[NeRF] Test PSNR  mean={np.mean(all_psnr):.2f}  "
-              f"min={min(all_psnr):.2f}  max={max(all_psnr):.2f} dB")
+            _eps = 1e-3
+            if hdr:
+                psnr_full = -10.0 * torch.log10(F.mse_loss(
+                    torch.log(pred.clamp_min(0) + _eps),
+                    torch.log(gt  .clamp_min(0) + _eps))).item()
+            else:
+                psnr_full = -10.0 * torch.log10(F.mse_loss(pred, gt)).item()
+            fg_m = msk.bool()
+            if fg_m.any():
+                if hdr:
+                    psnr_fg_v = -10.0 * torch.log10(F.mse_loss(
+                        torch.log(pred[fg_m].clamp_min(0) + _eps),
+                        torch.log(gt  [fg_m].clamp_min(0) + _eps))).item()
+                else:
+                    psnr_fg_v = -10.0 * torch.log10(F.mse_loss(pred[fg_m], gt[fg_m])).item()
+            else:
+                psnr_fg_v = float('nan')
+            all_psnr_full.append(psnr_full)
+            all_psnr_fg.append(psnr_fg_v)
+            _save_test_comparison(gt, pred, psnr_fg_v, fi, test_dir)
+        valid_fg = [v for v in all_psnr_fg if not np.isnan(v)]
+        print(f"[NeRF] Test PSNR (full)  mean={np.mean(all_psnr_full):.2f}  "
+              f"min={min(all_psnr_full):.2f}  max={max(all_psnr_full):.2f} dB")
+        if valid_fg:
+            print(f"[NeRF] Test PSNR (FG)    mean={np.mean(valid_fg):.2f}  "
+                  f"min={min(valid_fg):.2f}  max={max(valid_fg):.2f} dB")
 
     return model

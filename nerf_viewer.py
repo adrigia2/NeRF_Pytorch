@@ -93,6 +93,9 @@ def launch_viewer(
     torch_dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model, _, iter_done, nerf_cfg = load_checkpoint(ckpt_path, torch_dev)
     model.eval()
+    # Increase stratified sample count for viewer to resolve the thin density bands
+    # that depth-guided training learns; near/far come from the checkpoint now.
+    nerf_cfg.depth_samples_per_ray = max(nerf_cfg.depth_samples_per_ray, 192)
 
     json_dir = os.path.dirname(os.path.abspath(transforms_json))
     with open(transforms_json, "r", encoding="utf-8") as fh:
@@ -203,7 +206,7 @@ def _resolve_path(maybe_path: str | None, base_dir: str) -> str | None:
     return p if os.path.exists(p) else None
 
 
-def _load_gt_image(gt_path: str | None, target_wh: tuple[int, int]):
+def _load_gt_image(gt_path: str | None, target_wh: tuple[int, int], hdr_mode: bool = False):
     """Load a GT image and return a pygame.Surface of size target_wh, or None on failure."""
     import pygame
     from PIL import Image
@@ -214,7 +217,10 @@ def _load_gt_image(gt_path: str | None, target_wh: tuple[int, int]):
         ext = os.path.splitext(gt_path)[1].lower()
         if ext == ".exr":
             from nerf_module import _load_exr_rgb_np
-            arr = _load_exr_rgb_np(gt_path)
+            arr = _load_exr_rgb_np(gt_path, hdr_mode=hdr_mode)
+            if hdr_mode:
+                arr = arr / (1.0 + arr)           # Reinhard
+                arr = np.power(arr.clip(0, 1), 1.0 / 2.2)  # gamma for display
             arr = np.clip(arr, 0.0, 1.0)
             rgb_uint8 = (arr * 255).astype(np.uint8)
             im = Image.fromarray(rgb_uint8, mode="RGB")
@@ -365,7 +371,8 @@ class _Viewer:
         if idx not in self._gt_cache:
             gt_path = self._frames_meta[idx].get("gt_path")
             half_w = self._dW // 2
-            surf = _load_gt_image(gt_path, (half_w, self._dH))
+            surf = _load_gt_image(gt_path, (half_w, self._dH),
+                                   hdr_mode=getattr(self._cfg, 'hdr_mode', False))
             if surf is None:
                 surf = _make_placeholder_surface(half_w, self._dH, "GT non disponibile")
             self._gt_cache[idx] = surf
@@ -385,13 +392,22 @@ class _Viewer:
         c2w = torch.from_numpy(self._current_c2w()).to(self._device)
         t0 = time.time()
         with torch.no_grad():
-            rgb, _, _ = self._render_fn(
+            rgb, _, acc = self._render_fn(
                 H, W, fx, c2w, self._model, self._cfg,
                 focal_y=fy, randomize=False,
             )
         self._last_render_s = time.time() - t0
         self._last_render_wh = (W, H)
-        rgb_np = (rgb.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)  # (H,W,3)
+        # Composite NeRF output over a dark background using accumulated opacity.
+        # This hides undertrained BG regions (acc≈0) that would otherwise show noise.
+        bg = torch.tensor([0.05, 0.05, 0.05], device=rgb.device, dtype=rgb.dtype)
+        rgb = acc.unsqueeze(-1) * rgb + (1.0 - acc.unsqueeze(-1)) * bg
+        if getattr(self._cfg, 'hdr_mode', False):
+            disp = rgb / (1.0 + rgb)          # Reinhard tone-map
+            disp = disp.clamp(0, 1).pow(1.0 / 2.2)   # gamma encode for display
+            rgb_np = (disp.cpu().numpy() * 255).astype(np.uint8)
+        else:
+            rgb_np = (rgb.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)  # (H,W,3)
         self._last_surf = pygame.surfarray.make_surface(rgb_np.transpose(1, 0, 2))
         self._dirty = False
 

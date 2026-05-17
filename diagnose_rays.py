@@ -168,7 +168,7 @@ def main(json_path: str, obj_path: str | None = None) -> None:
               f"{abs(fl_y/focal - 1)*100:.1f}%")
 
     # Test frame data
-    _, test_pose, test_depth = dataset.get_test_frame()
+    _, test_pose, test_depth, _ = dataset.get_test_frame()
     test_idx = dataset.test_idx
     print(f"\n=== Test frame idx={test_idx} ===")
 

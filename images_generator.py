@@ -527,6 +527,9 @@ class RenderConfig:
     indirect_nerf_depth_window_end: float = 0.0   # 0.0 = ultimo sample esattamente sulla superficie (fisicamente corretto)
     indirect_format: ImageFormat = ImageFormat.OPENEXR
 
+    # NeRF training
+    nerf_hdr_mode: bool = True             # predice radiance lineare HDR (softplus output, Reinhard loss)
+
     # Albedo (color_texture / irradiance) — modello Lambertiano ρ = π · L / E
     render_albedo: bool = False
     albedo_format: ImageFormat = ImageFormat.OPENEXR
@@ -550,7 +553,7 @@ class PipelineConfig:
     # Parametri di nerf_module.train (Step 2)
     nerf_num_iters:        int   = 10000
     nerf_batch_size:       int   = 4096
-    nerf_mask_bias:        float = 0.9
+    nerf_mask_bias:        float = 0.5
     nerf_lr:               float = 5e-3
     nerf_display_every:    int   = 100
     nerf_seed:             int   = 9458
@@ -600,6 +603,7 @@ def _precompute_indirect_irradiance(
         depth_window=cfg.indirect_nerf_depth_window,
         depth_window_end=cfg.indirect_nerf_depth_window_end,
         depth_samples_per_ray=cfg.indirect_nerf_depth_samples,
+        hdr_mode=cfg.nerf_hdr_mode,
     )
     print(f"✓ NeRF model caricato da: {cache_path}")
 
@@ -749,10 +753,12 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
         depth_window=rc.indirect_nerf_depth_window,
         depth_window_end=rc.indirect_nerf_depth_window_end,
         depth_samples_per_ray=rc.indirect_nerf_depth_samples,
+        hdr_mode=rc.nerf_hdr_mode,
     )
 
     print(f"[Step 2] Caricamento dataset: {transforms_extended_path}")
-    dataset = NerfDataset(str(transforms_extended_path), device=device)
+    dataset = NerfDataset(str(transforms_extended_path), device=device,
+                          hdr_mode=rc.nerf_hdr_mode)
 
     ckpt = Path(cfg.nerf_ckpt_path or
                 Path(rc.output_dir) / "model" / "tinynerf_model_cache.pkl")
@@ -1116,7 +1122,7 @@ if __name__ == "__main__":
 
         nerf_num_iters    = 10000,
         nerf_batch_size   = 4096,
-        nerf_mask_bias    = 0.9,
+        nerf_mask_bias    = 0.5,
         nerf_lr           = 5e-3,
         nerf_display_every = 100,
         nerf_seed         = 9458,
