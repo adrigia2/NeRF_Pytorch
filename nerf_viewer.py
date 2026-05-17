@@ -131,7 +131,8 @@ def launch_viewer(
         raise ValueError("No frames with 'transform_matrix' found in JSON")
 
     cam_positions = np.stack([f["pose"][:3, 3] for f in frames_meta])
-    pivot = cam_positions.mean(axis=0)
+    all_poses = [f["pose"] for f in frames_meta]
+    pivot = _scene_center_from_lookats(all_poses)
     radii = np.linalg.norm(cam_positions - pivot, axis=1)
     init_radius = max(float(np.median(radii)), 1e-4)
 
@@ -156,6 +157,29 @@ def launch_viewer(
 
 
 # ─── Camera helpers ───────────────────────────────────────────────────────────
+
+def _scene_center_from_lookats(poses: list[np.ndarray]) -> np.ndarray:
+    """LSQ intersection of camera look-at rays across all training frames.
+
+    For each c2w, the ray is: p_i + t * d_i  where d_i = -c2w[:3, 2] (look direction).
+    We solve  Σ (I − d_i d_iᵀ) x = Σ (I − d_i d_iᵀ) p_i  for x.
+    Falls back to mean(positions) if the system is degenerate.
+    """
+    A = np.zeros((3, 3), dtype=np.float64)
+    b = np.zeros(3, dtype=np.float64)
+    for c2w in poses:
+        p = c2w[:3, 3].astype(np.float64)
+        d = -c2w[:3, 2].astype(np.float64)
+        d /= np.linalg.norm(d) + 1e-12
+        M = np.eye(3) - np.outer(d, d)
+        A += M
+        b += M @ p
+    try:
+        x = np.linalg.solve(A, b)
+    except np.linalg.LinAlgError:
+        x = np.stack([c2w[:3, 3] for c2w in poses]).mean(axis=0)
+    return x.astype(np.float32)
+
 
 def _lookat_c2w(pos: np.ndarray, forward: np.ndarray) -> np.ndarray:
     """Build a 4×4 c2w matrix (camera looks along local -Z, OpenGL/NeRF convention).
@@ -314,6 +338,7 @@ class _Viewer:
         self._current_frame_idx: int | None = None
         self._compare_mode: bool = False
         self._gt_cache: dict[int, object] = {}   # int → pygame.Surface or None
+        self._frame_c2w_override: np.ndarray | None = None  # exact pose while in frame-view
 
     # ── Camera ────────────────────────────────────────────────────────────────
 
@@ -327,6 +352,8 @@ class _Viewer:
         self._dirty = True
 
     def _current_c2w(self) -> np.ndarray:
+        if self._frame_c2w_override is not None:
+            return self._frame_c2w_override
         if self._mode == "orbit":
             y, p, r = self._orbit_yaw, self._orbit_pitch, self._orbit_radius
             dfp = np.array(
@@ -351,8 +378,10 @@ class _Viewer:
         idx = max(0, min(n - 1, idx))
         self._current_frame_idx = idx
         self._compare_mode = True
-        # Snap camera to frame pose
+        # Use the exact training-frame pose so GT and prediction are bit-for-bit the same camera.
         c2w = self._frames_meta[idx]["pose"]
+        self._frame_c2w_override = c2w.copy()
+        # Also sync orbit/fly state so transitioning out of frame-view feels smooth.
         yaw, pitch, radius = _c2w_to_orbit(c2w, self._pivot)
         self._orbit_yaw = yaw
         self._orbit_pitch = pitch
@@ -365,6 +394,7 @@ class _Viewer:
     def _exit_frame_view(self):
         self._current_frame_idx = None
         self._compare_mode = False
+        self._frame_c2w_override = None
 
     def _get_gt_surface(self, idx: int):
         """Return a pygame.Surface for the GT image at frame idx (lazy + cached)."""

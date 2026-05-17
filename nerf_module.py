@@ -333,22 +333,41 @@ def run_one_iter(
         valid    = (target_depth > 1e-4)                                   # (*,) bool
         ray_norm = torch.linalg.norm(dirs, dim=-1).clamp_min(1e-8)        # (*,)
         depth_t  = target_depth / ray_norm                                  # (*,)
-        offsets  = torch.linspace(-cfg.depth_window, cfg.depth_window_end,
-                                   cfg.depth_samples_per_ray,
+
+        S_total  = cfg.depth_samples_per_ray
+        S_strat  = S_total // 2
+        S_guided = S_total - S_strat
+
+        # Stratified backbone: S_strat samples uniformly over [near, far].
+        # These constrain the model in free-space so density outside the surface converges to 0,
+        # making stratified-inference at viewer time produce correct results.
+        dv_strat = torch.linspace(cfg.near, cfg.far, S_strat,
                                    device=origins.device, dtype=origins.dtype)
-        offsets_br  = offsets.view(*([1] * depth_t.dim()), cfg.depth_samples_per_ray)
-        dv_guided   = depth_t.unsqueeze(-1) + offsets_br / ray_norm.unsqueeze(-1)  # (*,S)
+        if randomize and S_strat > 1:
+            bin_w    = (cfg.far - cfg.near) / S_strat
+            dv_strat = dv_strat + (torch.rand_like(dv_strat) - 0.5) * bin_w
+        strat_br = dv_strat.expand(list(depth_t.shape) + [S_strat])        # (*,S_strat)
 
-        # BG fallback: stratified over [near, far] — broadcast to (*,S)
-        dv_strat = torch.linspace(cfg.near, cfg.far, cfg.depth_samples_per_ray,
-                                   device=origins.device, dtype=origins.dtype)     # (S,)
+        # Depth-guided fine samples: S_guided samples concentrated near the surface.
+        offsets = torch.linspace(-cfg.depth_window, cfg.depth_window_end,
+                                  S_guided, device=origins.device, dtype=origins.dtype)
+        if randomize and S_guided > 1:
+            bin_w_g = (cfg.depth_window_end - (-cfg.depth_window)) / S_guided
+            offsets = offsets + (torch.rand_like(offsets) - 0.5) * bin_w_g
+        offsets_br = offsets.view(*([1] * depth_t.dim()), S_guided)
+        dv_guided  = depth_t.unsqueeze(-1) + offsets_br / ray_norm.unsqueeze(-1)  # (*,S_guided)
 
-        depth_values = torch.where(valid.unsqueeze(-1), dv_guided, dv_strat)      # (*,S)
-        if randomize and cfg.depth_samples_per_ray > 1:
-            mids  = 0.5 * (depth_values[..., 1:] + depth_values[..., :-1])
-            upper = torch.cat([mids, depth_values[..., -1:]], dim=-1)
-            lower = torch.cat([depth_values[..., :1], mids],  dim=-1)
-            depth_values = lower + (upper - lower) * torch.rand_like(depth_values)
+        hybrid = torch.cat([strat_br, dv_guided], dim=-1)                  # (*,S_total)
+
+        # BG fallback (valid=False): full stratified over S_total samples
+        dv_strat_full = torch.linspace(cfg.near, cfg.far, S_total,
+                                        device=origins.device, dtype=origins.dtype)
+        if randomize and S_total > 1:
+            bin_wf = (cfg.far - cfg.near) / S_total
+            dv_strat_full = dv_strat_full + (torch.rand_like(dv_strat_full) - 0.5) * bin_wf
+
+        depth_values = torch.where(valid.unsqueeze(-1), hybrid, dv_strat_full)
+        depth_values, _ = torch.sort(depth_values, dim=-1)                 # front-to-back required by compositing
         depth_values = depth_values.clamp(min=1e-4)
     else:
         depth_values = torch.linspace(cfg.near, cfg.far, cfg.depth_samples_per_ray,
