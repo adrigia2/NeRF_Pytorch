@@ -522,8 +522,9 @@ class RenderConfig:
     indirect_nerf_cache_path: str = ""   # path al .pkl del modello NeRF (default: auto-detect)
     indirect_nerf_num_encoding_functions: int = 6
     indirect_nerf_filter_size: int = 128
-    indirect_nerf_depth_samples: int = 8 # campioni volumetrici lungo ogni raggio occluso
+    indirect_nerf_depth_samples: int = 64  # campioni volumetrici lungo ogni raggio occluso
     indirect_nerf_depth_window: float = 0.15
+    indirect_nerf_depth_window_end: float = 0.0   # 0.0 = ultimo sample esattamente sulla superficie (fisicamente corretto)
     indirect_format: ImageFormat = ImageFormat.OPENEXR
 
     # Albedo (color_texture / irradiance) — modello Lambertiano ρ = π · L / E
@@ -555,6 +556,11 @@ class PipelineConfig:
     nerf_seed:             int   = 9458
     nerf_ckpt_path:        str   = ""  # default: <output_dir>/model/tinynerf_model_cache.pkl
     nerf_train_output_dir: str   = ""  # default: <output_dir>/nerf_train
+
+    # Viewer interattivo (Step 2 → viewer → Step 3)
+    enable_nerf_viewer:            bool            = False
+    nerf_viewer_idle_size:         tuple[int, int] = (160, 120)  # risoluzione a camera ferma
+    nerf_viewer_interactive_size:  tuple[int, int] = (80, 60)    # risoluzione durante movimento
 
 
 def _precompute_indirect_irradiance(
@@ -592,6 +598,7 @@ def _precompute_indirect_irradiance(
         num_encoding_functions=cfg.indirect_nerf_num_encoding_functions,
         filter_size=cfg.indirect_nerf_filter_size,
         depth_window=cfg.indirect_nerf_depth_window,
+        depth_window_end=cfg.indirect_nerf_depth_window_end,
         depth_samples_per_ray=cfg.indirect_nerf_depth_samples,
     )
     print(f"✓ NeRF model caricato da: {cache_path}")
@@ -740,6 +747,7 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
         num_encoding_functions=rc.indirect_nerf_num_encoding_functions,
         filter_size=rc.indirect_nerf_filter_size,
         depth_window=rc.indirect_nerf_depth_window,
+        depth_window_end=rc.indirect_nerf_depth_window_end,
         depth_samples_per_ray=rc.indirect_nerf_depth_samples,
     )
 
@@ -1023,6 +1031,27 @@ def run_pipeline(cfg: PipelineConfig) -> dict:
             "Attivare run_step2=True oppure fornire nerf_ckpt_path valido."
         )
 
+    if cfg.run_step2 and cfg.enable_nerf_viewer:
+        from nerf_viewer import launch_viewer
+        while True:
+            print("\n[Viewer] Apertura viewer interattivo NeRF…")
+            res = launch_viewer(
+                ckpt_path=str(ckpt_path),
+                transforms_json=str(transforms_extended),
+                idle_render_size=cfg.nerf_viewer_idle_size,
+                interactive_render_size=cfg.nerf_viewer_interactive_size,
+            )
+            if res.action == "continue":
+                cfg.nerf_num_iters += res.extra_iters
+                print(f"[Viewer] Riprendo training per {res.extra_iters} iterazioni aggiuntive "
+                      f"(target totale: {cfg.nerf_num_iters})")
+                ckpt_path = _step2_train_nerf(cfg, transforms_extended)
+                continue
+            elif res.action == "abort":
+                print("[Viewer] Annullato dall'utente — pipeline interrotta.")
+                return {}
+            break  # action == "proceed"
+
     if cfg.run_step3:
         if cfg.render.precompute_indirect and not cfg.render.indirect_nerf_cache_path:
             cfg.render.indirect_nerf_cache_path = str(ckpt_path)
@@ -1047,7 +1076,7 @@ if __name__ == "__main__":
         render = RenderConfig(
             transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-            output_dir      = "output/sworshield_render_nerf_2",
+            output_dir      = "output/sworshield_render_nerf_interactive",
 
             render_depth    = True,
             render_position = False,  # Step 1 produces only depth+mask
@@ -1079,6 +1108,8 @@ if __name__ == "__main__":
             visibility_format = ImageFormat.OPENEXR,
             color_texture_format = ImageFormat.OPENEXR,
 
+            indirect_nerf_depth_samples = 8,
+
             ium_texture_size = [512, 512],
             apply_scale      = False,
         ),
@@ -1089,6 +1120,9 @@ if __name__ == "__main__":
         nerf_lr           = 5e-3,
         nerf_display_every = 100,
         nerf_seed         = 9458,
+
+        enable_nerf_viewer=True,
+
     )
 
     run_pipeline(cfg)

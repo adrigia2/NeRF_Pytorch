@@ -26,13 +26,24 @@ import torch.nn.functional as F
 
 @dataclass
 class NerfConfig:
-    num_encoding_functions: int = 6
-    filter_size: int = 128
-    near: float = 2.0
-    far: float = 6.0
-    depth_window: float = 0.15
-    depth_samples_per_ray: int = 8
+    # Positional encoding
+    num_encoding_functions: int = 10
+    num_encoding_functions_views: int = 4
+    # Model
+    filter_size: int = 256
+    num_layers: int = 8
+    skips: tuple = (4,)
+    use_viewdirs: bool = True
+    # Sampling
+    near: float = 1.0
+    far: float = 20.0
+    depth_window: float = 0.5
+    depth_window_end: float = 0.0   # if >0, linspace end override (asym front-biased window); 0=use depth_window
+    depth_samples_per_ray: int = 64
     chunk_size: int = 16384
+    scene_scale: float = 3.0
+    # LR schedule: lr decays to 10% after lrate_decay * 1000 steps
+    lrate_decay: int = 250
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -75,6 +86,63 @@ class TinyNerfModel(nn.Module):
 
 
 VeryTinyNerfModel = TinyNerfModel  # backward-compatible alias
+
+
+class NeRFModel(nn.Module):
+    """Full NeRF MLP — 8 layers × 256 units, skip connection at layer 4,
+    optional view-dependent RGB branch (yenchenlin architecture)."""
+
+    def __init__(
+        self,
+        D: int = 8,
+        W: int = 256,
+        skips: tuple = (4,),
+        num_encoding_functions: int = 10,
+        use_viewdirs: bool = True,
+        num_encoding_functions_views: int = 4,
+    ):
+        super().__init__()
+        self.D = D
+        self.W = W
+        self.skips = set(skips)
+        self.use_viewdirs = use_viewdirs
+
+        pt_dim = 3 + 3 * 2 * num_encoding_functions
+
+        # Build point MLP layers, inserting skip concatenation where needed.
+        layers = []
+        in_dim = pt_dim
+        for i in range(D):
+            layers.append(nn.Linear(in_dim, W))
+            # After layer i, if it's a skip layer the *next* layer receives W + pt_dim.
+            in_dim = (W + pt_dim) if i in self.skips else W
+        self.pts_linears = nn.ModuleList(layers)
+
+        if use_viewdirs:
+            self.alpha_linear   = nn.Linear(W, 1)
+            self.feature_linear = nn.Linear(W, W)
+            view_dim = 3 + 3 * 2 * num_encoding_functions_views
+            self.views_linear = nn.Linear(W + view_dim, W // 2)
+            self.rgb_linear   = nn.Linear(W // 2, 3)
+        else:
+            self.output_linear = nn.Linear(W, 4)
+
+    def forward(self, x: torch.Tensor, dirs: torch.Tensor = None) -> torch.Tensor:
+        pts_enc = x
+        h = x
+        for i, layer in enumerate(self.pts_linears):
+            h = F.relu(layer(h))
+            if i in self.skips:
+                h = torch.cat([pts_enc, h], dim=-1)
+
+        if self.use_viewdirs and dirs is not None:
+            alpha = self.alpha_linear(h)
+            feat  = self.feature_linear(h)
+            h     = F.relu(self.views_linear(torch.cat([feat, dirs], dim=-1)))
+            rgb   = self.rgb_linear(h)
+            return torch.cat([rgb, alpha], dim=-1)   # (..., 4)
+        else:
+            return self.output_linear(h)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -181,7 +249,7 @@ def compute_query_points_from_depth(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def render_volume_density(radiance_field, ray_origins, depth_values):
-    sigma   = F.relu(radiance_field[..., 3])
+    sigma   = F.softplus(radiance_field[..., 3])
     rgb     = torch.sigmoid(radiance_field[..., :3])
     one_e10 = torch.tensor([1e10], dtype=ray_origins.dtype, device=ray_origins.device)
     dists   = torch.cat([depth_values[..., 1:] - depth_values[..., :-1],
@@ -198,14 +266,37 @@ def render_volume_density(radiance_field, ray_origins, depth_values):
 # Core forward pass  (works for any batch shape * before the 3 dims)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _encode_and_run(query_points: torch.Tensor, model: TinyNerfModel, cfg: NerfConfig):
-    """query_points: (*, n_samp, 3) → radiance_field: (*, n_samp, 4)"""
-    flat_pts  = query_points.reshape(-1, 3)
-    encoded   = positional_encoding(flat_pts, cfg.num_encoding_functions)
+def _encode_and_run(query_points: torch.Tensor, model, cfg: NerfConfig,
+                    dirs: torch.Tensor = None):
+    """query_points: (*, S, 3), dirs: (*, 3) optional → radiance_field: (*, S, 4)"""
+    shape     = query_points.shape          # (*, S, 3)
+    S         = shape[-2]
+    batch_shp = shape[:-2]
+
+    flat_pts = query_points.reshape(-1, 3) / cfg.scene_scale    # (N, 3) — not encoded yet
+    N = flat_pts.shape[0]
+
+    use_views = (
+        dirs is not None
+        and getattr(cfg, 'use_viewdirs', False)
+        and getattr(model, 'use_viewdirs', False)
+    )
+    if use_views:
+        dirs_norm = F.normalize(dirs, dim=-1)                              # (*, 3)
+        dirs_flat = dirs_norm.unsqueeze(-2).expand(*batch_shp, S, 3).reshape(-1, 3)
+    else:
+        dirs_flat = None
+
+    # Encode and run model per-chunk so peak VRAM is O(chunk_size) not O(N)
     preds = []
-    for i in range(0, encoded.shape[0], cfg.chunk_size):
-        preds.append(model(encoded[i:i + cfg.chunk_size]))
-    return torch.cat(preds, dim=0).reshape(*query_points.shape[:-1], 4)
+    for i in range(0, N, cfg.chunk_size):
+        ep = positional_encoding(flat_pts[i:i + cfg.chunk_size], cfg.num_encoding_functions)
+        if dirs_flat is not None:
+            ed = positional_encoding(dirs_flat[i:i + cfg.chunk_size], cfg.num_encoding_functions_views)
+            preds.append(model(ep, ed))
+        else:
+            preds.append(model(ep))
+    return torch.cat(preds, dim=0).reshape(*batch_shp, S, 4)
 
 
 def run_one_iter(
@@ -219,17 +310,25 @@ def run_one_iter(
     """Forward pass for rays of any shape (*, 3).
 
     target_depth: (*,) euclidean depth  → depth-guided sampling around t_hit.
+      Rays with target_depth <= 1e-4 (BG / sky pixels) automatically fall back
+      to stratified sampling over [cfg.near, cfg.far].
     Returns (rgb, depth_map, acc_map) each shape (*,) / (*,3).
     """
     if target_depth is not None:
-        ray_norm    = torch.linalg.norm(dirs, dim=-1).clamp_min(1e-8)   # (*,)
-        depth_t     = target_depth / ray_norm                             # (*,)
-        offsets     = torch.linspace(-cfg.depth_window, cfg.depth_window,
-                                      cfg.depth_samples_per_ray,
-                                      device=origins.device, dtype=origins.dtype)
-        # broadcast offsets over all batch dims
+        valid    = (target_depth > 1e-4)                                   # (*,) bool
+        ray_norm = torch.linalg.norm(dirs, dim=-1).clamp_min(1e-8)        # (*,)
+        depth_t  = target_depth / ray_norm                                  # (*,)
+        offsets  = torch.linspace(-cfg.depth_window, cfg.depth_window_end,
+                                   cfg.depth_samples_per_ray,
+                                   device=origins.device, dtype=origins.dtype)
         offsets_br  = offsets.view(*([1] * depth_t.dim()), cfg.depth_samples_per_ray)
-        depth_values = depth_t.unsqueeze(-1) + offsets_br / ray_norm.unsqueeze(-1)
+        dv_guided   = depth_t.unsqueeze(-1) + offsets_br / ray_norm.unsqueeze(-1)  # (*,S)
+
+        # BG fallback: stratified over [near, far] — broadcast to (*,S)
+        dv_strat = torch.linspace(cfg.near, cfg.far, cfg.depth_samples_per_ray,
+                                   device=origins.device, dtype=origins.dtype)     # (S,)
+
+        depth_values = torch.where(valid.unsqueeze(-1), dv_guided, dv_strat)      # (*,S)
         if randomize and cfg.depth_samples_per_ray > 1:
             mids  = 0.5 * (depth_values[..., 1:] + depth_values[..., :-1])
             upper = torch.cat([mids, depth_values[..., -1:]], dim=-1)
@@ -247,7 +346,7 @@ def run_one_iter(
                            * (cfg.far - cfg.near) / cfg.depth_samples_per_ray
 
     query_points = origins[..., None, :] + dirs[..., None, :] * depth_values[..., :, None]
-    rf = _encode_and_run(query_points, model, cfg)
+    rf = _encode_and_run(query_points, model, cfg, dirs=dirs)
     return render_volume_density(rf, origins, depth_values)
 
 
@@ -299,16 +398,21 @@ def query_radiance(
 # Checkpoint I/O  (format compatible with existing tinynerf_model_cache.pkl)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def save_checkpoint(path: str, model: TinyNerfModel, optimizer,
+def save_checkpoint(path: str, model, optimizer,
                     iter_done: int, cfg: NerfConfig, seed: int = 9458):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     payload = {
-        'iter_done':            int(iter_done),
-        'model_state_dict':     model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'seed':                 int(seed),
-        'num_encoding_functions': int(cfg.num_encoding_functions),
-        'filter_size':          int(cfg.filter_size),
+        'iter_done':                    int(iter_done),
+        'model_state_dict':             model.state_dict(),
+        'optimizer_state_dict':         optimizer.state_dict(),
+        'seed':                         int(seed),
+        'model_type':                   'NeRFModel' if isinstance(model, NeRFModel) else 'TinyNerfModel',
+        'num_encoding_functions':       int(cfg.num_encoding_functions),
+        'num_encoding_functions_views': int(getattr(cfg, 'num_encoding_functions_views', 4)),
+        'filter_size':                  int(cfg.filter_size),
+        'num_layers':                   int(getattr(cfg, 'num_layers', 3)),
+        'skips':                        tuple(getattr(cfg, 'skips', (4,))),
+        'use_viewdirs':                 bool(getattr(cfg, 'use_viewdirs', False)),
     }
     with open(path, 'wb') as f:
         pickle.dump(payload, f)
@@ -321,10 +425,31 @@ def load_checkpoint(path: str, device=None):
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     with open(path, 'rb') as f:
         payload = pickle.load(f)
-    num_enc     = payload.get('num_encoding_functions', 6)
-    filter_size = payload.get('filter_size', 128)
-    cfg   = NerfConfig(num_encoding_functions=num_enc, filter_size=filter_size)
-    model = TinyNerfModel(filter_size, num_enc).to(device)
+    num_enc      = payload.get('num_encoding_functions', 6)
+    num_enc_view = payload.get('num_encoding_functions_views', 4)
+    filter_size  = payload.get('filter_size', 128)
+    num_layers   = payload.get('num_layers', 3)
+    skips        = payload.get('skips', (4,))
+    use_viewdirs = payload.get('use_viewdirs', False)
+    model_type   = payload.get('model_type', 'TinyNerfModel')
+
+    cfg = NerfConfig(
+        num_encoding_functions=num_enc,
+        num_encoding_functions_views=num_enc_view,
+        filter_size=filter_size,
+        num_layers=num_layers,
+        skips=skips,
+        use_viewdirs=use_viewdirs,
+    )
+    if model_type == 'NeRFModel':
+        model = NeRFModel(
+            D=num_layers, W=filter_size, skips=skips,
+            num_encoding_functions=num_enc,
+            use_viewdirs=use_viewdirs,
+            num_encoding_functions_views=num_enc_view,
+        ).to(device)
+    else:
+        model = TinyNerfModel(filter_size, num_enc).to(device)
     model.load_state_dict(payload['model_state_dict'])
     model.eval()
     return model, payload.get('optimizer_state_dict'), payload.get('iter_done', 0), cfg
@@ -363,8 +488,10 @@ def _load_exr_mask_np(path: str) -> np.ndarray:
 
 
 def _load_exr_rgb_np(path: str) -> np.ndarray:
-    """Load an EXR file as (H, W, 3) float32 in [0, 1] range.  Tone-maps HDR values
-    via simple normalization so the result is usable as an RGB training target."""
+    """Load EXR as (H, W, 3) float32 sRGB-encoded in [0, 1].
+    Applies gamma 1/2.2 to linear HDR radiance values so targets are perceptually
+    uniform and not concentrated near zero (which causes the optimizer to collapse
+    predictions to 0 as a local minimum when training on raw linear-light data)."""
     import importlib
     OpenEXR = importlib.import_module('OpenEXR')
     Imath   = importlib.import_module('Imath')
@@ -381,8 +508,11 @@ def _load_exr_rgb_np(path: str) -> np.ndarray:
         return np.zeros((h, w), dtype=np.float32)
     r = _ch('R'); g = _ch('G'); b = _ch('B')
     rgb = np.stack([r, g, b], axis=-1)
-    # Clamp to [0, 1]; HDR images with values > 1 are common but NeRF expects LDR targets
-    return np.clip(rgb, 0.0, 1.0)
+    # Clamp negatives (EXR artefacts), apply sRGB gamma ~2.2, clip HDR highlights
+    rgb = np.maximum(rgb, 0.0)
+    rgb = np.power(rgb, 1.0 / 2.2)
+    rgb = np.clip(rgb, 0.0, 1.0)
+    return rgb.astype(np.float32)
 
 
 def _resolve_path(path_str: str, json_dir: str) -> Optional[str]:
@@ -541,6 +671,12 @@ class NerfDataset:
         self._bg_indices = torch.where((~self._masks) & non_test)[0]
         print(f"[NerfDataset] FG rays: {len(self._fg_indices):,} | "
               f"BG rays: {len(self._bg_indices):,}")
+        if len(self._fg_indices) == 0:
+            raise RuntimeError(
+                "[NerfDataset] No foreground rays found — the mask is empty or all-False.\n"
+                "Check that Step 1 (Depth_Generator) ran correctly and that the mask EXR "
+                "was saved without normalization. Pixel values should be 0.0 or 1.0."
+            )
 
         # Per-frame cache for test/full-image render
         self._imgs_pf  = [torch.from_numpy(imgs[i]).float()  for i in range(n)]
@@ -681,20 +817,35 @@ def _save_loss_curve(iternums, losses, psnrs, path: str):
 # Training
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _make_model(cfg: NerfConfig, device):
+    """Instantiate the right model class from a NerfConfig."""
+    use_full = getattr(cfg, 'num_layers', 3) > 3 or getattr(cfg, 'use_viewdirs', False)
+    if use_full:
+        return NeRFModel(
+            D=getattr(cfg, 'num_layers', 8),
+            W=cfg.filter_size,
+            skips=getattr(cfg, 'skips', (4,)),
+            num_encoding_functions=cfg.num_encoding_functions,
+            use_viewdirs=getattr(cfg, 'use_viewdirs', True),
+            num_encoding_functions_views=getattr(cfg, 'num_encoding_functions_views', 4),
+        ).to(device)
+    return TinyNerfModel(cfg.filter_size, cfg.num_encoding_functions).to(device)
+
+
 def train(
     dataset: NerfDataset,
     cfg: NerfConfig,
     num_iters:     int      = 10000,
     batch_size:    int      = 4096,
     mask_bias:     float    = 0.9,
-    lr:            float    = 5e-3,
+    lr:            float    = 5e-4,
     ckpt_path:     str      = None,
     display_every: int      = 100,
     output_dir:    str      = None,
     on_step:       Callable = None,
     seed:          int      = 9458,
-) -> TinyNerfModel:
-    """Train TinyNeRF on dataset.
+):
+    """Train NeRF on dataset.
 
     on_step(iter_num, loss, psnrs_list, losses_list, model) — called every display_every iters.
     Returns trained model.
@@ -703,10 +854,12 @@ def train(
     np.random.seed(seed)
 
     device = dataset.device
-    model  = TinyNerfModel(cfg.filter_size, cfg.num_encoding_functions).to(device)
+    model  = _make_model(cfg, device)
     optim  = torch.optim.Adam(model.parameters(), lr=lr)
 
-    start_iter = 0
+    start_iter   = 0
+    decay_steps  = getattr(cfg, 'lrate_decay', 250) * 1000
+
     if ckpt_path and os.path.exists(ckpt_path):
         loaded, opt_state, start_iter, _ = load_checkpoint(ckpt_path, device)
         model.load_state_dict(loaded.state_dict())
@@ -728,8 +881,10 @@ def train(
     losses, psnrs, iternums = [], [], []
     testimg, testpose, testdepth = dataset.get_test_frame()
 
-    print(f"[NeRF] Training iters {start_iter}→{num_iters}, "
-          f"batch={batch_size}, fg_bias={mask_bias:.0%}, lr={lr}")
+    model_name = type(model).__name__
+    print(f"[NeRF] {model_name} | iters {start_iter}→{num_iters} | "
+          f"batch={batch_size} | fg_bias={mask_bias:.0%} | "
+          f"lr={lr} | decay_steps={decay_steps}")
 
     for i in range(start_iter, num_iters):
         model.train()
@@ -756,7 +911,21 @@ def train(
             parts_tgt.append(rgb_tgt[~is_fg])
 
         loss = F.mse_loss(torch.cat(parts_pred), torch.cat(parts_tgt))
+
+        if i in (0, 1, 100):
+            with torch.no_grad():
+                if n_fg > 0:
+                    print(f"  [DBG i={i}] rgb_fg  mean={rgb_fg.mean():.4f}  std={rgb_fg.std():.4f}  "
+                          f"tgt_fg={rgb_tgt[is_fg].mean():.4f}")
+                if n_bg > 0:
+                    print(f"  [DBG i={i}] rgb_bg  mean={rgb_bg.mean():.4f}  "
+                          f"tgt_bg={rgb_tgt[~is_fg].mean():.4f}  std={rgb_tgt[~is_fg].std():.4f}")
+                print(f"  [DBG i={i}] loss={loss.item():.5f}")
+
         loss.backward()
+        new_lr = lr * (0.1 ** (i / decay_steps))
+        for g in optim.param_groups:
+            g['lr'] = new_lr
         optim.step()
         optim.zero_grad()
 
