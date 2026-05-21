@@ -560,6 +560,10 @@ class PipelineConfig:
     nerf_ckpt_path:        str   = ""  # default: <output_dir>/model/tinynerf_model_cache.pkl
     nerf_train_output_dir: str   = ""  # default: <output_dir>/nerf_train
 
+    # Render dei frame di training col NeRF allenato (post-Step 2)
+    enable_nerf_render_train_images: bool = False
+    nerf_render_train_images_dir:    str  = ""  # default: <output_dir>/nerf_render_images
+
     # Viewer interattivo (Step 2 → viewer → Step 3)
     enable_nerf_viewer:            bool            = False
     nerf_viewer_idle_size:         tuple[int, int] = (160, 120)  # risoluzione a camera ferma
@@ -779,6 +783,67 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
     )
     print(f"[Step 2] Training completato. Checkpoint: {ckpt}")
     return ckpt
+
+
+def _step2b_render_train_images(cfg: PipelineConfig,
+                                transforms_extended_path: Path,
+                                ckpt_path: Path) -> None:
+    """Per ogni frame di training: renderizza col NeRF e salva render + |GT−Pred| come EXR."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    import torch
+    import torch.nn.functional as F
+    from nerf_module import load_checkpoint, NerfDataset, render_image as nerf_render_image
+
+    rc = cfg.render
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model, _, _, nerf_cfg = load_checkpoint(str(ckpt_path), device)
+    model.eval()
+
+    dataset = NerfDataset(str(transforms_extended_path), device=device,
+                          hdr_mode=rc.nerf_hdr_mode)
+
+    base = Path(cfg.nerf_render_train_images_dir or
+                Path(rc.output_dir) / "nerf_render_images")
+    render_dir = base / "render"
+    diff_dir   = base / "difference"
+    render_dir.mkdir(parents=True, exist_ok=True)
+    diff_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n[Step 2b] Rendering {dataset.num_frames} frame di training con NeRF...")
+    _eps = 1e-3
+    psnrs = []
+    for i in range(dataset.num_frames):
+        gt, pose, dep, _ = dataset.get_frame(i)
+
+        pred, _, _ = nerf_render_image(
+            dataset.H, dataset.W, dataset.focal, pose, model, nerf_cfg,
+            target_depth=dep, randomize=False, focal_y=dataset.focal_y,
+        )
+
+        pred_np = pred.detach().cpu().numpy().astype(np.float32)
+        gt_np   = gt.detach().cpu().numpy().astype(np.float32)
+        diff_np = np.abs(gt_np - pred_np)
+
+        render_path = (render_dir / f"frame_{i:03d}.exr").resolve().as_posix()
+        diff_path   = (diff_dir  / f"frame_{i:03d}.exr").resolve().as_posix()
+        _save_layer(pred_np, render_path, ImageFormat.OPENEXR, DataLayer.IRRADIANCE)
+        _save_layer(diff_np, diff_path,   ImageFormat.OPENEXR, DataLayer.IRRADIANCE)
+
+        if rc.nerf_hdr_mode:
+            psnr = -10.0 * np.log10(
+                np.mean((np.log(pred_np.clip(0) + _eps)
+                         - np.log(gt_np.clip(0) + _eps)) ** 2) + 1e-10)
+        else:
+            psnr = -10.0 * np.log10(np.mean((pred_np - gt_np) ** 2) + 1e-10)
+        psnrs.append(psnr)
+
+        if (i + 1) % max(1, dataset.num_frames // 10) == 0 or i == dataset.num_frames - 1:
+            print(f"  [Step 2b] {i + 1}/{dataset.num_frames}  PSNR={psnr:.2f} dB")
+
+    print(f"[Step 2b] Completato — PSNR medio={np.mean(psnrs):.2f} dB  "
+          f"(render → {render_dir}  diff → {diff_dir})")
 
 
 def _step3_posttrain_assets(cfg: PipelineConfig,
@@ -1037,6 +1102,9 @@ def run_pipeline(cfg: PipelineConfig) -> dict:
             "Attivare run_step2=True oppure fornire nerf_ckpt_path valido."
         )
 
+    if cfg.run_step2 and cfg.enable_nerf_render_train_images:
+        _step2b_render_train_images(cfg, transforms_extended, ckpt_path)
+
     if cfg.run_step2 and cfg.enable_nerf_viewer:
         from nerf_viewer import launch_viewer
         while True:
@@ -1082,7 +1150,7 @@ if __name__ == "__main__":
         render = RenderConfig(
             transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-            output_dir      = "output/sworshield_render_nerf_interactive",
+            output_dir      = "output/sworshield_render_nerf_interactive_comparison",
 
             render_depth    = True,
             render_position = False,  # Step 1 produces only depth+mask
@@ -1127,6 +1195,7 @@ if __name__ == "__main__":
         nerf_display_every = 100,
         nerf_seed         = 9458,
 
+        enable_nerf_render_train_images=True,
         enable_nerf_viewer=True,
 
     )
