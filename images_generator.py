@@ -342,6 +342,32 @@ def _load_image_as_vec3(path: str, w: int, h: int) -> np.ndarray:
         return arr.reshape(-1, 3)
 
 
+def _load_image_hw3_native(path: str) -> np.ndarray:
+    """Carica un'immagine a risoluzione nativa come float32 (H, W, 3).
+    EXR → valori HDR raw. LDR (PNG/JPG) → uint8/255 scalato in [0, 1]."""
+    if path.lower().endswith(".exr"):
+        import OpenEXR, Imath
+        exr = OpenEXR.InputFile(path)
+        dw = exr.header()["dataWindow"]
+        src_w = dw.max.x - dw.min.x + 1
+        src_h = dw.max.y - dw.min.y + 1
+        pt = Imath.PixelType(Imath.PixelType.FLOAT)
+        chs = exr.header()["channels"]
+        if "R" in chs and "G" in chs and "B" in chs:
+            r = np.frombuffer(exr.channel("R", pt), dtype=np.float32).reshape(src_h, src_w)
+            g = np.frombuffer(exr.channel("G", pt), dtype=np.float32).reshape(src_h, src_w)
+            b = np.frombuffer(exr.channel("B", pt), dtype=np.float32).reshape(src_h, src_w)
+        else:
+            key = next(iter(chs))
+            ch = np.frombuffer(exr.channel(key, pt), dtype=np.float32).reshape(src_h, src_w)
+            r = g = b = ch
+        return np.stack([r, g, b], axis=-1)
+    else:
+        from PIL import Image
+        img = Image.open(path).convert("RGB")
+        return np.array(img, dtype=np.float32) / 255.0
+
+
 def _load_exr_as_flat(path: str) -> np.ndarray | None:
     """Carica un EXR RGB a dimensione nativa e restituisce (H*W, 3) float32."""
     try:
@@ -469,6 +495,10 @@ class RenderConfig:
     transforms_path: str
     model_path: str
     output_dir: str
+
+    # Normalizzazione HDR delle immagini sorgente (Step 1)
+    normalize_images: bool = True
+    normalization_skybox_path: str = ""  # se vuoto → max calcolato dalle immagini sorgente
 
     # Cosa renderizzare
     render_depth:    bool = True
@@ -692,15 +722,48 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
     scale = tf.scale if rc.apply_scale else 1.0
     W, H = intr.w, intr.h
 
+    # ── Calcolo divisore di normalizzazione HDR ───────────────────────────────
+    norm_divisor: float | None = None
+    norm_source: str | None = None
+    if rc.normalize_images:
+        if rc.normalization_skybox_path:
+            sky = _load_image_hw3_native(rc.normalization_skybox_path)
+            norm_divisor = float(sky.max())
+            norm_source = "skybox"
+            print(f"[Step 1] Normalizzazione: skybox → max={norm_divisor:.6f}")
+        else:
+            running_max = 0.0
+            print("[Step 1] Normalizzazione: scansione immagini per trovare il max globale…")
+            for frame in tf.frames:
+                src = Path(frame.file_path)
+                if not src.exists():
+                    continue
+                arr = _load_image_hw3_native(str(src))
+                running_max = max(running_max, float(arr.max()))
+            norm_divisor = running_max
+            norm_source = "images"
+            print(f"[Step 1] Normalizzazione: immagini → max={norm_divisor:.6f}")
+        if norm_divisor <= 0:
+            print("[Step 1] ⚠  max = 0, normalizzazione disabilitata per questa run.")
+            norm_divisor = None
+
     for idx, frame in enumerate(tf.frames):
         print(f"\n[Step 1] Frame {idx + 1}/{len(tf.frames)}: {frame.stem}")
 
         src_image = Path(frame.file_path)
-        dst_image = images_out_dir / src_image.name
-        if src_image.exists():
-            shutil.copy2(src_image, dst_image)
+        if norm_divisor is not None:
+            dst_image = images_out_dir / (src_image.stem + ".exr")
+            if src_image.exists():
+                arr = _load_image_hw3_native(str(src_image)) / norm_divisor
+                get_writer(ImageFormat.OPENEXR).write(arr.astype(np.float32), str(dst_image))
+            else:
+                print(f"    ⚠  Immagine non trovata, skip: {src_image}")
         else:
-            print(f"    ⚠  Immagine non trovata, skip copia: {src_image}")
+            dst_image = images_out_dir / src_image.name
+            if src_image.exists():
+                shutil.copy2(src_image, dst_image)
+            else:
+                print(f"    ⚠  Immagine non trovata, skip copia: {src_image}")
 
         camera = _camera_from_matrix(frame.transform_matrix, intr.camera_angle_y, [W, H], optix_mod)
         depth_gen.set_camera(camera)
@@ -734,6 +797,13 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
     output_json["h"] = H
     output_json["w"] = W
     output_json["frames"] = output_frames
+
+    if norm_divisor is not None:
+        output_json["normalization"] = {
+            "max": float(norm_divisor),
+            "source": norm_source,
+            "skybox_path": rc.normalization_skybox_path or None,
+        }
 
     out_json_path = json_dir / "transforms_extended.json"
     with open(out_json_path, "w", encoding="utf-8") as fh:
@@ -936,19 +1006,10 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
                 and visibility_map is not None):
             print("[Step 3] Calcolo Color Texture…")
 
-            images_out_dir_ct = json_dir / "images"
-            os.makedirs(images_out_dir_ct, exist_ok=True)
-            # Images already copied by Step 1; copy only if src differs from dst
-            for frame in tf.frames:
-                src = Path(frame.file_path)
-                dst = images_out_dir_ct / src.name
-                if src.exists() and src.resolve() != dst.resolve():
-                    shutil.copy2(src, dst)
-
             optix_frames = []
             for i, frame in enumerate(tf.frames):
                 cam = all_cameras[i]
-                img_path = (images_out_dir_ct / Path(frame.file_path).name).as_posix()
+                img_path = frame.file_path  # path normalizzato da transforms_extended.json
                 img_flat = _load_image_as_vec3(img_path, intr.w, intr.h)
                 peak = _compute_peak(img_flat.reshape(intr.h, intr.w, 3),
                                      rc.color_texture_peak_percentile)
@@ -1150,7 +1211,7 @@ if __name__ == "__main__":
         render = RenderConfig(
             transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-            output_dir      = "output/sworshield_render_nerf_interactive_comparison",
+            output_dir      = "output/sworshield_render_nerf_interactive_comparison_normalize",
 
             render_depth    = True,
             render_position = False,  # Step 1 produces only depth+mask
@@ -1165,6 +1226,7 @@ if __name__ == "__main__":
             render_irradiance      = True,
             irradiance_format      = ImageFormat.OPENEXR,
             skybox_path            = f"{REPO}/Scenes/SwordShield/Blender/assets/hdrs/clouds-sunshine_b963efc0-83f3-4957-8725-34f73b8744ff/clouds-sunshine_2K_09c69240-8e00-4b23-896f-fcde6fd514cc.exr",
+            normalization_skybox_path= f"{REPO}/Scenes/SwordShield/Blender/assets/hdrs/clouds-sunshine_b963efc0-83f3-4957-8725-34f73b8744ff/clouds-sunshine_2K_09c69240-8e00-4b23-896f-fcde6fd514cc.exr",
             skybox_size            = [1024, 512],
             irradiance_sample_side = 512,
 
