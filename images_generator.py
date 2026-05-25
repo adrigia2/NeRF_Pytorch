@@ -908,13 +908,20 @@ def _load_depth_np(path: str) -> np.ndarray | None:
 def _step2b_render_train_images(cfg: PipelineConfig,
                                 transforms_extended_path: Path,
                                 ckpt_path: Path) -> None:
-    """Per ogni frame renderizza col NeRF e salva GT, Pred e GT|Pred sxs come PNG."""
+    """Per ogni frame renderizza col NeRF e salva GT, Pred e diff come EXR + PNG.
+
+    Gli output vengono scritti in una sottocartella denominata iter_<NNNNNN> all'interno
+    di nerf_render_images, così ogni stop del training interattivo produce una directory
+    separata senza sovrascrivere gli stop precedenti.
+    """
     import sys
+    import torch as _torch
     sys.path.insert(0, str(Path(__file__).parent))
     from nerf import load_checkpoint, render_image as nerf_render_image
 
     rc = cfg.render
 
+    iter_done = int(_torch.load(str(ckpt_path), map_location="cpu")["iter_done"])
     model_bundle, nerf_cfg = load_checkpoint(str(ckpt_path))
 
     tf   = load_transforms(str(transforms_extended_path))
@@ -923,11 +930,14 @@ def _step2b_render_train_images(cfg: PipelineConfig,
     with open(transforms_extended_path, encoding="utf-8") as fh:
         raw_frames = json.load(fh)["frames"]
 
-    base = Path(cfg.nerf_render_train_images_dir or
-                Path(rc.output_dir) / "nerf_render_images")
+    base_root = Path(cfg.nerf_render_train_images_dir or
+                     Path(rc.output_dir) / "nerf_render_images")
+    base = base_root / f"iter_{iter_done:06d}"
     base.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[Step 2b] Rendering {len(tf.frames)} frame con NeRF...")
+    exr_writer = get_writer(ImageFormat.OPENEXR)
+
+    print(f"\n[Step 2b] Rendering {len(tf.frames)} frame con NeRF (iter={iter_done})...")
     psnrs = []
     for i, (frame, raw_frame) in enumerate(zip(tf.frames, raw_frames)):
         gt_np  = _load_image_hw3_native(frame.file_path)
@@ -950,6 +960,11 @@ def _step2b_render_train_images(cfg: PipelineConfig,
         psnrs.append(psnr)
 
         stem = f"frame_{i:03d}"
+        # EXR: HDR float32, no clamp — preserva valori >1 e segno della differenza
+        exr_writer.write(gt_np,             (base / f"{stem}_gt.exr").as_posix())
+        exr_writer.write(pred_np,           (base / f"{stem}_pred.exr").as_posix())
+        exr_writer.write(pred_np - gt_np,   (base / f"{stem}_diff.exr").as_posix())
+        # PNG: anteprima visiva clampata a [0,1]
         _write_png_float(gt_np,   (base / f"{stem}_gt.png").as_posix())
         _write_png_float(pred_np, (base / f"{stem}_pred.png").as_posix())
         _write_sxs_comparison(gt_np, pred_np, psnr,
@@ -1211,11 +1226,10 @@ def run_pipeline(cfg: PipelineConfig) -> dict:
         while True:
             ckpt_path = _step2_train_nerf(cfg, transforms_extended)
 
-            if cfg.enable_nerf_render_train_images:
-                _step2b_render_train_images(cfg, transforms_extended, ckpt_path)
-                render_dir = cfg.nerf_render_train_images_dir or \
-                             str(Path(cfg.render.output_dir) / "nerf_render_images")
-                print(f"  Anteprime salvate in: {render_dir}")
+            _step2b_render_train_images(cfg, transforms_extended, ckpt_path)
+            render_dir = cfg.nerf_render_train_images_dir or \
+                         str(Path(cfg.render.output_dir) / "nerf_render_images")
+            print(f"  EXR/PNG salvati in: {render_dir}")
 
             if not cfg.nerf_interactive_loop:
                 break
@@ -1294,7 +1308,7 @@ if __name__ == "__main__":
             apply_scale      = False,
         ),
 
-        nerf_num_iters     = 10000,
+        nerf_num_iters     = 100000,
         nerf_batch_size    = 4096,
         nerf_lr            = 5e-4,
         nerf_display_every = 100,
