@@ -64,7 +64,7 @@ def sample_pdf(bins, weights, N_samples, det=False):
     return samples
 
 
-def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0.0, white_bkgd=False):
+def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0.0, white_bkgd=False, bg_color=None):
     """Convert raw NeRF output to RGB, depth and compositing weights.
 
     raw: (..., N_samples, 4) — [RGB, sigma] from network
@@ -95,7 +95,9 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0.0, white_bkgd=False):
     disp_map  = 1.0 / torch.clamp(
         depth_map / torch.clamp(acc_map, min=1e-10), min=1e-10)
 
-    if white_bkgd:
+    if bg_color is not None:
+        rgb_map = rgb_map + (1.0 - acc_map[..., None]) * bg_color
+    elif white_bkgd:
         rgb_map = rgb_map + (1.0 - acc_map[..., None])
 
     return rgb_map, disp_map, acc_map, weights, depth_map

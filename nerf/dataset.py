@@ -76,7 +76,8 @@ class NerfDataset:
     rays) and accessible via get_test_frame().
     """
 
-    def __init__(self, transforms_path: str, device, test_hold_idx: int = -1):
+    def __init__(self, transforms_path: str, device, test_hold_idx: int = -1,
+                 composite_white: bool = True):
         path = Path(transforms_path)
         base = path.parent
 
@@ -121,9 +122,10 @@ class NerfDataset:
             img = np.clip(_load_image_float(img_path), 0.0, None)  # allow HDR values > 1
             dep = _load_depth_exr(depth_path) if depth_path else None
 
-            # Composite onto white background — matches white_bkgd=True in volume rendering.
-            # Background pixels get GT=1.0; the network naturally produces white for empty rays.
-            if mask_path:
+            # When composite_white=True, replace bg pixels with white (matches white_bkgd=True).
+            # When composite_white=False (train_background mode), keep real environment pixels
+            # as GT for background rays — the sky MLP learns the actual environment.
+            if mask_path and composite_white:
                 mask = _load_mask_float(mask_path)
                 if mask is not None:
                     img = img * mask[..., None] + (1.0 - mask[..., None]) * 1.0
@@ -197,6 +199,23 @@ class NerfDataset:
         bi = self._bg_idx[torch.randint(0, self._bg_idx.numel(), (n_bg,), device=self.device)]
 
         fg = (self._rays_o[fi], self._rays_d[fi], self._rgb[fi], self._depths[fi])
+        bg = (self._rays_o[bi], self._rays_d[bi], self._rgb[bi])
+        return fg, bg
+
+    def sample_natural(self, batch_size: int):
+        """Uniform sample over all rays, split by depth into fg/bg (natural ratio).
+
+        Unlike sample_split, the fg/bg proportion mirrors the dataset distribution
+        (~5% fg for a masked object). Each call may yield a different ratio.
+        Returns fg=(rays_o, rays_d, rgb, depth), bg=(rays_o, rays_d, rgb).
+        Either group may be empty for small batch sizes.
+        """
+        idxs = torch.randint(0, self._n_rays, (batch_size,), device=self.device)
+        depths = self._depths[idxs]
+        fg_mask = depths > 1e-6
+        fi = idxs[fg_mask]
+        bi = idxs[~fg_mask]
+        fg = (self._rays_o[fi], self._rays_d[fi], self._rgb[fi], depths[fg_mask])
         bg = (self._rays_o[bi], self._rays_d[bi], self._rgb[bi])
         return fg, bg
 

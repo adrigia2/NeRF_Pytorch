@@ -38,4 +38,10 @@ class NerfConfig:
     depth_window_end: float = 0.5
     depth_window_samples: int = 32   # number of samples in the depth window (foreground rays)
     foreground_ratio: float = 0.8    # fraction of each training batch drawn from foreground rays
+    foreground_ratio_enabled: bool = True  # when False, use natural fg/bg ratio from dataset
     opacity_weight: float = 1.0      # weight of the foreground opacity loss (acc_fg → 1)
+
+    # Background sky MLP: learned directional environment (infinity skybox)
+    train_background: bool = True    # when True, a sky MLP learns the environment from bg pixels
+    sky_netdepth: int = 3
+    sky_netwidth: int = 128

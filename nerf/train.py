@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from .checkpoint import _build_models, save_checkpoint
 from .config import NerfConfig
 from .dataset import NerfDataset
-from .render import render_image, render_rays, render_rays_depth
+from .render import _eval_sky, render_image, render_rays, render_rays_depth
 
 
 def _rel_mse(pred, target, eps=1e-3):
@@ -32,11 +32,17 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  NeRF training on: {device}")
 
-    dataset = NerfDataset(transforms_path, device)
+    dataset = NerfDataset(transforms_path, device,
+                          composite_white=not cfg.train_background)
 
-    coarse, fine, embed_fn, embeddirs_fn = _build_models(cfg, device)
+    coarse, fine, embed_fn, embeddirs_fn, sky = _build_models(cfg, device)
+
+    sky_params = list(sky.parameters()) if sky is not None else []
     optimizer = torch.optim.Adam(
-        list(coarse.parameters()) + list(fine.parameters()),
+        [
+            {"params": list(coarse.parameters()) + list(fine.parameters())},
+            {"params": sky_params},
+        ],
         lr=lr, betas=(0.9, 0.999),
     )
 
@@ -46,7 +52,12 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
         saved = torch.load(str(ckpt), map_location=device)
         coarse.load_state_dict(saved["coarse_state"])
         fine.load_state_dict(saved["fine_state"])
-        optimizer.load_state_dict(saved["optimizer"])
+        if sky is not None and saved.get("sky_state") is not None:
+            sky.load_state_dict(saved["sky_state"])
+        try:
+            optimizer.load_state_dict(saved["optimizer"])
+        except (ValueError, KeyError):
+            print("  [warn] optimizer state skipped (param group mismatch; sky was added/removed)")
         iter_start = saved["iter_done"]
         print(f"  Ripreso da checkpoint: {ckpt}  (iter {iter_start})")
 
@@ -58,11 +69,12 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
     mse_window:      list[torch.Tensor] = []
     loss_fg_window:  list[torch.Tensor] = []
     loss_bgf_window: list[torch.Tensor] = []
-    loss_bgc_window: list[torch.Tensor] = []
     loss_opc_window: list[torch.Tensor] = []
 
     coarse.train()
     fine.train()
+    if sky is not None:
+        sky.train()
 
     for i in range(iter_start, iter_start + num_iters):
         new_lr = lr * (0.1 ** (i / decay_steps))
@@ -70,26 +82,51 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
             pg["lr"] = new_lr
 
         if cfg.depth_hint_enabled and dataset.has_depth_split:
-            fg, bg = dataset.sample_split(batch_size, cfg.foreground_ratio)
+            if cfg.foreground_ratio_enabled:
+                fg, bg = dataset.sample_split(batch_size, cfg.foreground_ratio)
+            else:
+                fg, bg = dataset.sample_natural(batch_size)
             fg_rays_o, fg_rays_d, fg_rgb, fg_depth = fg
             bg_rays_o, bg_rays_d, bg_rgb = bg
 
-            rgb_fg, acc_fg = render_rays_depth(fg_rays_o, fg_rays_d, fine,
-                                               embed_fn, embeddirs_fn, cfg, fg_depth,
-                                               perturb=True, return_acc=True)
-            rgb_bg_f, rgb_bg_c = render_rays(bg_rays_o, bg_rays_d, coarse, fine,
-                                             embed_fn, embeddirs_fn, cfg, perturb=True)
+            use_sky = cfg.train_background and sky is not None
+            n_fg = fg_rgb.shape[0]
+            n_bg = bg_rgb.shape[0]
+            loss = torch.tensor(0.0, device=device)
+            loss_fg = loss_bg = loss_opacity = None
 
-            loss_fg      = _rel_mse(rgb_fg,    fg_rgb)
-            loss_bg_f    = _rel_mse(rgb_bg_f,  bg_rgb)
-            loss_bg_c    = _rel_mse(rgb_bg_c,  bg_rgb)
-            loss_opacity = ((1.0 - acc_fg) ** 2).mean()
-            loss = loss_fg + loss_bg_f + loss_bg_c + cfg.opacity_weight * loss_opacity
+            if n_fg > 0:
+                if use_sky:
+                    fg_sky_col = _eval_sky(sky, embeddirs_fn, fg_rays_d)
+                    rgb_fg, acc_fg = render_rays_depth(
+                        fg_rays_o, fg_rays_d, fine, embed_fn, embeddirs_fn, cfg, fg_depth,
+                        perturb=True, return_acc=True, bg_color=fg_sky_col)
+                else:
+                    rgb_fg, acc_fg = render_rays_depth(
+                        fg_rays_o, fg_rays_d, fine, embed_fn, embeddirs_fn, cfg, fg_depth,
+                        perturb=True, return_acc=True)
+                loss_fg      = _rel_mse(rgb_fg, fg_rgb)
+                loss_opacity = ((1.0 - acc_fg) ** 2).mean()
+                loss = loss + loss_fg + cfg.opacity_weight * loss_opacity
 
-            n_fg, n_bg = fg_rgb.shape[0], bg_rgb.shape[0]
+            if n_bg > 0:
+                if use_sky:
+                    rgb_bg = _eval_sky(sky, embeddirs_fn, bg_rays_d)
+                    loss_bg = _rel_mse(rgb_bg, bg_rgb)
+                else:
+                    rgb_bg_f, rgb_bg_c = render_rays(bg_rays_o, bg_rays_d, coarse, fine,
+                                                     embed_fn, embeddirs_fn, cfg, perturb=True)
+                    loss_bg = _rel_mse(rgb_bg_f, bg_rgb) + _rel_mse(rgb_bg_c, bg_rgb)
+                loss = loss + loss_bg
+
             with torch.no_grad():
-                mse_val = (F.mse_loss(rgb_fg, fg_rgb) * n_fg
-                           + F.mse_loss(rgb_bg_f, bg_rgb) * n_bg) / (n_fg + n_bg)
+                mse_num = torch.tensor(0.0, device=device)
+                if n_fg > 0:
+                    mse_num = mse_num + F.mse_loss(rgb_fg, fg_rgb) * n_fg
+                if n_bg > 0:
+                    rgb_bg_ref = rgb_bg if use_sky else rgb_bg_f
+                    mse_num = mse_num + F.mse_loss(rgb_bg_ref, bg_rgb) * n_bg
+                mse_val = mse_num / max(n_fg + n_bg, 1)
         else:
             rays_o, rays_d, target_rgb = dataset.sample_batch(batch_size)
             rgb_fine, rgb_coarse = render_rays(
@@ -106,10 +143,12 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
         loss_window.append(loss.detach())
         mse_window.append(mse_val.detach())
         if cfg.depth_hint_enabled and dataset.has_depth_split:
-            loss_fg_window.append(loss_fg.detach())
-            loss_bgf_window.append(loss_bg_f.detach())
-            loss_bgc_window.append(loss_bg_c.detach())
-            loss_opc_window.append(loss_opacity.detach())
+            if loss_fg is not None:
+                loss_fg_window.append(loss_fg.detach())
+            if loss_bg is not None:
+                loss_bgf_window.append(loss_bg.detach())
+            if loss_opacity is not None:
+                loss_opc_window.append(loss_opacity.detach())
 
         if (i + 1) % display_every == 0 or i == iter_start + num_iters - 1:
             recent_loss = torch.stack(loss_window[-display_every:]).mean().item()
@@ -118,13 +157,15 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
             print(f"  iter {i + 1}  rel_loss={recent_loss:.4f}  PSNR≈{psnr:.2f} dB  lr={new_lr:.2e}")
 
             if cfg.depth_hint_enabled and dataset.has_depth_split and loss_fg_window:
-                l_fg  = torch.stack(loss_fg_window[-display_every:]).mean().item()
-                l_bgf = torch.stack(loss_bgf_window[-display_every:]).mean().item()
-                l_bgc = torch.stack(loss_bgc_window[-display_every:]).mean().item()
-                l_opc = torch.stack(loss_opc_window[-display_every:]).mean().item()
+                _use_sky = cfg.train_background and sky is not None
+                l_fg  = torch.stack(loss_fg_window[-display_every:]).mean().item() if loss_fg_window else float("nan")
+                l_bg  = torch.stack(loss_bgf_window[-display_every:]).mean().item() if loss_bgf_window else float("nan")
+                l_opc = torch.stack(loss_opc_window[-display_every:]).mean().item() if loss_opc_window else float("nan")
+                bg_tag = "loss_bg(sky)" if _use_sky else "loss_bg(vol)"
                 print(f"    [diag] loss_fg={l_fg:.4f}  loss_opacity={l_opc:.4f}  "
-                      f"loss_bg_f={l_bgf:.4f}  loss_bg_c={l_bgc:.4f}")
+                      f"{bg_tag}={l_bg:.4f}")
                 with torch.no_grad():
+                    # always use sample_split for the diagnostic probe (guarantees non-empty fg)
                     fg, _ = dataset.sample_split(min(512, batch_size), cfg.foreground_ratio)
                     _ro, _rd, _rgb_gt, _dep = fg
                     _rgb_pred, _acc = render_rays_depth(
@@ -134,19 +175,22 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
                           f"pred=[{_rgb_pred.min():.3f},{_rgb_pred.mean():.3f},{_rgb_pred.max():.3f}]  "
                           f"target=[{_rgb_gt.min():.3f},{_rgb_gt.mean():.3f},{_rgb_gt.max():.3f}]")
 
-            _save_preview(coarse, fine, embed_fn, embeddirs_fn, dataset, cfg, device,
+            _save_preview(coarse, fine, embed_fn, embeddirs_fn, sky, dataset, cfg, device,
                           out_dir / f"preview_iter_{i+1:06d}.png")
             coarse.train()
             fine.train()
+            if sky is not None:
+                sky.train()
 
-    save_checkpoint(ckpt_path, coarse, fine, optimizer, iter_start + num_iters, cfg)
+    save_checkpoint(ckpt_path, coarse, fine, optimizer, iter_start + num_iters, cfg,
+                    sky_model=sky)
     print(f"  Checkpoint salvato: {ckpt_path}")
 
 
-def _save_preview(coarse, fine, embed_fn, embeddirs_fn, dataset, cfg, device, path: Path):
+def _save_preview(coarse, fine, embed_fn, embeddirs_fn, sky, dataset, cfg, device, path: Path):
     from PIL import Image
     _, _, _, test_pose, test_dep = dataset.get_test_frame()
-    bundle = (coarse, fine, embed_fn, embeddirs_fn, device)
+    bundle = (coarse, fine, embed_fn, embeddirs_fn, device, sky)
     img = render_image(bundle, dataset.H, dataset.W, dataset.focal_x, test_pose, cfg,
                        focal_y=dataset.focal_y, target_depth=test_dep)
     Image.fromarray((np.clip(img, 0, 1) * 255).astype(np.uint8)).save(str(path))

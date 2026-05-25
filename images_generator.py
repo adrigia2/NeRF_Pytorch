@@ -588,12 +588,14 @@ class PipelineConfig:
 
     # Depth-hint training (Step 2) — attivo solo se run_step1 ha generato depth+mask
     nerf_depth_hint_enabled:   bool  = False
-    nerf_foreground_ratio:     float = 0.8   # frazione del batch dai raggi figura
+    nerf_foreground_ratio:         float = 0.8   # frazione del batch dai raggi figura
+    nerf_foreground_ratio_enabled: bool  = True  # False = ratio naturale del dataset (ignora la percentuale)
     nerf_depth_window_samples: int   = 32    # sample nella finestra per i raggi figura
     nerf_depth_window:         float = 0.5   # [t_hit - window, t_hit + window_end]
     nerf_depth_window_end:     float = 0.5
     nerf_opacity_weight:       float = 1.0   # peso della loss acc_fg→1 (0 = disattiva)
     nerf_raw_noise_std:        float = 0.0   # rumore pre-ReLU sulla densità (1.0 = training robusto)
+    nerf_train_background:     bool  = True  # allena sky MLP sui pixel bg; False = bg bianco classico
 
     # Render dei frame di training col NeRF allenato (post-Step 2)
     enable_nerf_render_train_images: bool = False
@@ -829,20 +831,25 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
     out_dir = Path(cfg.nerf_train_output_dir or Path(rc.output_dir) / "nerf_train")
 
     nerf_cfg = NerfConfig(
-        depth_hint_enabled   = cfg.nerf_depth_hint_enabled,
-        foreground_ratio     = cfg.nerf_foreground_ratio,
-        depth_window_samples = cfg.nerf_depth_window_samples,
-        depth_window         = cfg.nerf_depth_window,
-        depth_window_end     = cfg.nerf_depth_window_end,
-        opacity_weight       = cfg.nerf_opacity_weight,
-        raw_noise_std        = cfg.nerf_raw_noise_std,
+        depth_hint_enabled        = cfg.nerf_depth_hint_enabled,
+        foreground_ratio          = cfg.nerf_foreground_ratio,
+        foreground_ratio_enabled  = cfg.nerf_foreground_ratio_enabled,
+        depth_window_samples      = cfg.nerf_depth_window_samples,
+        depth_window              = cfg.nerf_depth_window,
+        depth_window_end          = cfg.nerf_depth_window_end,
+        opacity_weight            = cfg.nerf_opacity_weight,
+        raw_noise_std             = cfg.nerf_raw_noise_std,
+        train_background          = cfg.nerf_train_background,
     )
 
     print(f"[Step 2] Training NeRF — {cfg.nerf_num_iters} iter, ckpt → {ckpt}")
     if cfg.nerf_depth_hint_enabled:
-        print(f"[Step 2] Depth-hint mode: fg_ratio={cfg.nerf_foreground_ratio}, "
+        ratio_str = (f"fg_ratio={cfg.nerf_foreground_ratio}"
+                     if cfg.nerf_foreground_ratio_enabled else "fg_ratio=natural")
+        print(f"[Step 2] Depth-hint mode: {ratio_str}, "
               f"window_samples={cfg.nerf_depth_window_samples}, "
-              f"window=[t_hit-{cfg.nerf_depth_window}, t_hit+{cfg.nerf_depth_window_end}]")
+              f"window=[t_hit-{cfg.nerf_depth_window}, t_hit+{cfg.nerf_depth_window_end}], "
+              f"train_background={cfg.nerf_train_background}")
     nerf_train(
         str(transforms_extended_path), nerf_cfg,
         ckpt_path     = str(ckpt),
@@ -1250,7 +1257,7 @@ if __name__ == "__main__":
         render = RenderConfig(
             transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-            output_dir      = "output/sworshield_render_nerf_interactive_comparison_not_normalize2",
+            output_dir      = "output/sworshield_render_nerf_skybox",
 
             render_depth    = True,
             render_position = False,  # Step 1 produces only depth+mask
@@ -1297,13 +1304,15 @@ if __name__ == "__main__":
         nerf_interactive_loop           = True,
 
 
-        nerf_depth_hint_enabled   = True,
-        nerf_foreground_ratio     = 0.8,   # 80% raggi figura, 20% background
-        nerf_depth_window_samples = 32,    # sample nella finestra
-        nerf_depth_window         = 0.5,
-        nerf_depth_window_end     = 0.5,   # finestra simmetrica [t_hit-0.5, t_hit+0.5]
-        nerf_opacity_weight       = 1.0,   # supervisione opacità figura (acc_fg → 1)
-        nerf_raw_noise_std        = 1.0,   # rumore pre-ReLU per sbloccare la densità
+        nerf_depth_hint_enabled        = True,
+        nerf_foreground_ratio          = 0.8,   # usato solo se nerf_foreground_ratio_enabled=True
+        nerf_foreground_ratio_enabled  = False,  # False = ratio naturale del dataset
+        nerf_depth_window_samples      = 32,    # sample nella finestra
+        nerf_depth_window              = 0.5,
+        nerf_depth_window_end          = 0.5,   # finestra simmetrica [t_hit-0.5, t_hit+0.5]
+        nerf_opacity_weight            = 1.0,   # supervisione opacità figura (acc_fg → 1)
+        nerf_raw_noise_std             = 1.0,   # rumore pre-ReLU per sbloccare la densità
+        nerf_train_background          = True,  # sky MLP: apprende l'environment dai pixel bg
 
     )
 

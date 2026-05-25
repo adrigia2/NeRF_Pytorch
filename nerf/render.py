@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from .config import NerfConfig
 from .rays import get_rays_np, raw2outputs, sample_pdf
+
+
+def _eval_sky(sky, embeddirs_fn, rays_d: torch.Tensor) -> torch.Tensor:
+    """Evaluate the sky MLP for a batch of ray directions. Returns (N, 3) HDR RGB."""
+    dirs = rays_d / torch.norm(rays_d, dim=-1, keepdim=True).clamp(min=1e-10)
+    encoded = embeddirs_fn(dirs)
+    return sky(encoded)
 
 
 def _run_network(pts, viewdirs, model, embed_fn, embeddirs_fn, chunk):
@@ -76,11 +84,13 @@ def render_rays(rays_o, rays_d, coarse_model, fine_model, embed_fn, embeddirs_fn
 
 
 def render_rays_depth(rays_o, rays_d, fine_model, embed_fn, embeddirs_fn, cfg: NerfConfig,
-                      t_hit, *, near=None, far=None, perturb=True, return_acc=False):
+                      t_hit, *, near=None, far=None, perturb=True, return_acc=False,
+                      bg_color=None):
     """Single-pass render for foreground rays using OptiX depth as surface prior.
 
     Skips the coarse network entirely: samples depth_window_samples points in
     [t_hit - depth_window, t_hit + depth_window_end], runs only the fine network.
+    bg_color: (N, 3) tensor — composited where acc < 1 instead of white. Ignored when None.
     """
     device = rays_o.device
     N = rays_o.shape[0]
@@ -100,7 +110,10 @@ def render_rays_depth(rays_o, rays_d, fine_model, embed_fn, embeddirs_fn, cfg: N
 
     pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[:, :, None]
     raw = _run_network(pts, rays_d, fine_model, embed_fn, embeddirs_fn, cfg.chunk)
-    rgb, _, acc, _, _ = raw2outputs(raw, z_vals, rays_d, cfg.raw_noise_std, cfg.white_bkgd)
+    # use bg_color if provided, else fall back to white_bkgd flag
+    _bg = bg_color if bg_color is not None else None
+    _white = cfg.white_bkgd if bg_color is None else False
+    rgb, _, acc, _, _ = raw2outputs(raw, z_vals, rays_d, cfg.raw_noise_std, _white, bg_color=_bg)
     if return_acc:
         return rgb, acc
     return rgb
@@ -118,9 +131,10 @@ def render_image(model_bundle, H: int, W: int, focal_x: float, pose_4x4,
     target_depth: (H, W) depth map. When cfg.depth_hint_enabled is True and
         target_depth is provided, pixels with depth>0 are rendered via
         render_rays_depth (single-pass, fine network only); background pixels
-        (depth==0) use the traditional coarse+fine path.
+        (depth==0) use the sky MLP (if cfg.train_background) or the traditional
+        coarse+fine path.
     """
-    coarse, fine, embed_fn, embeddirs_fn, device = model_bundle
+    coarse, fine, embed_fn, embeddirs_fn, device, sky = model_bundle
 
     focal_y = focal_y if focal_y is not None else focal_x
     cx = cx if cx is not None else W / 2.0
@@ -149,6 +163,8 @@ def render_image(model_bundle, H: int, W: int, focal_x: float, pose_4x4,
 
     coarse.eval()
     fine.eval()
+    if sky is not None:
+        sky.eval()
     result_rgb = torch.zeros(N_all, 3, device=device)
 
     with torch.no_grad():
@@ -158,17 +174,25 @@ def render_image(model_bundle, H: int, W: int, focal_x: float, pose_4x4,
 
             for i in range(0, fg_idx.numel(), cfg.chunk):
                 idx = fg_idx[i:i + cfg.chunk]
+                bg_col = (_eval_sky(sky, embeddirs_fn, rays_d_all[idx])
+                          if sky is not None else None)
                 result_rgb[idx] = render_rays_depth(
                     rays_o_all[idx], rays_d_all[idx],
                     fine, embed_fn, embeddirs_fn, cfg,
-                    t_hit_all[idx], perturb=False)
+                    t_hit_all[idx], perturb=False, bg_color=bg_col)
 
-            for i in range(0, bg_idx.numel(), cfg.chunk):
-                idx = bg_idx[i:i + cfg.chunk]
-                rgb, _ = render_rays(rays_o_all[idx], rays_d_all[idx],
-                                     coarse, fine, embed_fn, embeddirs_fn,
-                                     cfg, perturb=False)
-                result_rgb[idx] = rgb
+            if sky is not None:
+                # background = sky MLP evaluated per direction
+                for i in range(0, bg_idx.numel(), cfg.chunk):
+                    idx = bg_idx[i:i + cfg.chunk]
+                    result_rgb[idx] = _eval_sky(sky, embeddirs_fn, rays_d_all[idx])
+            else:
+                for i in range(0, bg_idx.numel(), cfg.chunk):
+                    idx = bg_idx[i:i + cfg.chunk]
+                    rgb, _ = render_rays(rays_o_all[idx], rays_d_all[idx],
+                                         coarse, fine, embed_fn, embeddirs_fn,
+                                         cfg, perturb=False)
+                    result_rgb[idx] = rgb
         else:
             for i in range(0, N_all, cfg.chunk):
                 ro = rays_o_all[i:i + cfg.chunk]
@@ -189,7 +213,7 @@ def query_radiance(model_bundle, origins_np: np.ndarray, dirs_np: np.ndarray,
     t_hits_np:  (N,)  — OptiX hit distance; used only when cfg.depth_hint_enabled is True
     Returns:    (N, 3) float32 RGB colour per ray
     """
-    coarse, fine, embed_fn, embeddirs_fn, device = model_bundle
+    coarse, fine, embed_fn, embeddirs_fn, device, sky = model_bundle
 
     rays_o = torch.tensor(origins_np, device=device, dtype=torch.float32)
     rays_d = torch.tensor(dirs_np,    device=device, dtype=torch.float32)
@@ -203,6 +227,8 @@ def query_radiance(model_bundle, origins_np: np.ndarray, dirs_np: np.ndarray,
 
     coarse.eval()
     fine.eval()
+    if sky is not None:
+        sky.eval()
     results = []
     with torch.no_grad():
         for i in range(0, rays_o.shape[0], cfg.chunk):
