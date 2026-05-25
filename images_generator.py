@@ -496,9 +496,10 @@ class RenderConfig:
     model_path: str
     output_dir: str
 
-    # Normalizzazione HDR delle immagini sorgente (Step 1)
-    normalize_images: bool = True
-    normalization_skybox_path: str = ""  # se vuoto → max calcolato dalle immagini sorgente
+    # Normalizzazione HDR delle immagini sorgente (Step 1).
+    # Divisore = skybox.max() se skybox_path è impostato, altrimenti max sulle immagini sorgente.
+    # Lo skybox normalizzato viene salvato come skybox_normalized.exr e usato in Step 3.
+    normalize_images: bool = False
 
     # Cosa renderizzare
     render_depth:    bool = True
@@ -549,16 +550,12 @@ class RenderConfig:
     precompute_indirect: bool = False
     indirect_sample_side: int = 64       # N → N×N campioni per texel (separato da irradiance)
     indirect_tile_size: int = 1024       # texel per tile GPU (bilancia memoria/VRAM)
-    indirect_nerf_cache_path: str = ""   # path al .pkl del modello NeRF (default: auto-detect)
-    indirect_nerf_num_encoding_functions: int = 6
-    indirect_nerf_filter_size: int = 128
-    indirect_nerf_depth_samples: int = 64  # campioni volumetrici lungo ogni raggio occluso
-    indirect_nerf_depth_window: float = 0.15
-    indirect_nerf_depth_window_end: float = 0.0   # 0.0 = ultimo sample esattamente sulla superficie (fisicamente corretto)
+    indirect_nerf_cache_path: str = ""   # path al checkpoint NeRF (default: auto-detect)
     indirect_format: ImageFormat = ImageFormat.OPENEXR
-
-    # NeRF training
-    nerf_hdr_mode: bool = True             # predice radiance lineare HDR (softplus output, Reinhard loss)
+    # Depth hints: se True concentra i sample attorno al t_hit OptiX invece di stratified puro
+    indirect_depth_hint_enabled: bool = False
+    indirect_depth_window: float = 0.5
+    indirect_depth_window_end: float = 0.0
 
     # Albedo (color_texture / irradiance) — modello Lambertiano ρ = π · L / E
     render_albedo: bool = False
@@ -571,7 +568,7 @@ class PipelineConfig:
     """Orchestratore a tre step toggle-abili.
 
     Step 1: genera depth+mask+immagini+transforms_extended.json (minimo per NeRF).
-    Step 2: allena il NeRF (nerf_module.train) e salva il checkpoint.
+    Step 2: allena il NeRF (nerf/train.py) e salva il checkpoint.
     Step 3: esegue IUM/visibility/color_texture/irradiance/indirect/albedo.
     """
     run_step1: bool = True
@@ -580,24 +577,30 @@ class PipelineConfig:
 
     render: RenderConfig = field(default_factory=RenderConfig)
 
-    # Parametri di nerf_module.train (Step 2)
+    # Parametri di nerf/train.py (Step 2)
     nerf_num_iters:        int   = 10000
     nerf_batch_size:       int   = 4096
-    nerf_mask_bias:        float = 0.5
-    nerf_lr:               float = 5e-3
+    nerf_lr:               float = 5e-4
     nerf_display_every:    int   = 100
     nerf_seed:             int   = 9458
-    nerf_ckpt_path:        str   = ""  # default: <output_dir>/model/tinynerf_model_cache.pkl
+    nerf_ckpt_path:        str   = ""  # default: <output_dir>/model/nerf_model_cache.pt
     nerf_train_output_dir: str   = ""  # default: <output_dir>/nerf_train
+
+    # Depth-hint training (Step 2) — attivo solo se run_step1 ha generato depth+mask
+    nerf_depth_hint_enabled:   bool  = False
+    nerf_foreground_ratio:     float = 0.8   # frazione del batch dai raggi figura
+    nerf_depth_window_samples: int   = 32    # sample nella finestra per i raggi figura
+    nerf_depth_window:         float = 0.5   # [t_hit - window, t_hit + window_end]
+    nerf_depth_window_end:     float = 0.5
+    nerf_opacity_weight:       float = 1.0   # peso della loss acc_fg→1 (0 = disattiva)
+    nerf_raw_noise_std:        float = 0.0   # rumore pre-ReLU sulla densità (1.0 = training robusto)
 
     # Render dei frame di training col NeRF allenato (post-Step 2)
     enable_nerf_render_train_images: bool = False
     nerf_render_train_images_dir:    str  = ""  # default: <output_dir>/nerf_render_images
 
-    # Viewer interattivo (Step 2 → viewer → Step 3)
-    enable_nerf_viewer:            bool            = False
-    nerf_viewer_idle_size:         tuple[int, int] = (160, 120)  # risoluzione a camera ferma
-    nerf_viewer_interactive_size:  tuple[int, int] = (80, 60)    # risoluzione durante movimento
+    # Se True, chiede all'utente di continuare il training al termine di ogni round
+    nerf_interactive_loop: bool = True
 
 
 def _precompute_indirect_irradiance(
@@ -613,32 +616,26 @@ def _precompute_indirect_irradiance(
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
-    from nerf_module import load_checkpoint, query_radiance, NerfConfig as _NerfCfg
+    from nerf import load_checkpoint, query_radiance
     import OptixProgrammablePasses as optix
 
     # ── Carica il modello NeRF dal cache ──────────────────────────────────────
     cache_path = cfg.indirect_nerf_cache_path
     if not cache_path:
-        cache_path = os.path.join(os.path.dirname(cfg.output_dir),
-                                  "output", "model", "tinynerf_model_cache.pkl")
+        cache_path = os.path.join(cfg.output_dir, "model", "nerf_model_cache.pt")
     if not os.path.exists(cache_path):
         raise FileNotFoundError(
             f"NeRF model cache non trovato: {cache_path}\n"
-            "Imposta indirect_nerf_cache_path oppure allenare prima NeRF."
+            "Imposta indirect_nerf_cache_path oppure eseguire prima Step 2."
         )
 
     import torch
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    nerf_model, _, _, loaded_cfg = load_checkpoint(cache_path, device)
-    # Override depth sampling params from RenderConfig
-    nerf_cfg = _NerfCfg(
-        num_encoding_functions=cfg.indirect_nerf_num_encoding_functions,
-        filter_size=cfg.indirect_nerf_filter_size,
-        depth_window=cfg.indirect_nerf_depth_window,
-        depth_window_end=cfg.indirect_nerf_depth_window_end,
-        depth_samples_per_ray=cfg.indirect_nerf_depth_samples,
-        hdr_mode=cfg.nerf_hdr_mode,
-    )
+    model_bundle, nerf_cfg = load_checkpoint(cache_path, device)
+    if cfg.indirect_depth_hint_enabled:
+        nerf_cfg.depth_hint_enabled = True
+        nerf_cfg.depth_window       = cfg.indirect_depth_window
+        nerf_cfg.depth_window_end   = cfg.indirect_depth_window_end
     print(f"✓ NeRF model caricato da: {cache_path}")
 
     # ── Pass OptiX tile-by-tile ───────────────────────────────────────────────
@@ -675,7 +672,7 @@ def _precompute_indirect_irradiance(
         origins_np = (ium_positions_np[global_idx]
                       + ium_normals_np[global_idx] * eps)
 
-        colors = query_radiance(nerf_model, origins_np, dirs_np, t_hit_np, nerf_cfg)
+        colors = query_radiance(model_bundle, origins_np, dirs_np, nerf_cfg, t_hits_np=t_hit_np)
 
         np.add.at(irr_indirect, global_idx,
                   colors * cos_np[:, None].astype(np.float64))
@@ -725,12 +722,19 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
     # ── Calcolo divisore di normalizzazione HDR ───────────────────────────────
     norm_divisor: float | None = None
     norm_source: str | None = None
+    sky_norm_path: str | None = None  # path allo skybox normalizzato salvato
     if rc.normalize_images:
-        if rc.normalization_skybox_path:
-            sky = _load_image_hw3_native(rc.normalization_skybox_path)
-            norm_divisor = float(sky.max())
+        if rc.skybox_path:
+            sky_raw = _load_image_hw3_native(rc.skybox_path)
+            norm_divisor = float(sky_raw.max())
             norm_source = "skybox"
             print(f"[Step 1] Normalizzazione: skybox → max={norm_divisor:.6f}")
+            # Salva skybox normalizzato — usato da Step 3 per coerenza radiometrica
+            sky_normalized = (sky_raw / norm_divisor).astype(np.float32)
+            sky_norm_path = (json_dir / "skybox_normalized.exr").as_posix()
+            get_writer(ImageFormat.OPENEXR).write(sky_normalized, sky_norm_path)
+            sky_norm_path = _as_relative_to(sky_norm_path, json_dir_str)
+            print(f"[Step 1] Skybox normalizzata salvata: {(json_dir / sky_norm_path).resolve()}")
         else:
             running_max = 0.0
             print("[Step 1] Normalizzazione: scansione immagini per trovare il max globale…")
@@ -802,7 +806,8 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
         output_json["normalization"] = {
             "max": float(norm_divisor),
             "source": norm_source,
-            "skybox_path": rc.normalization_skybox_path or None,
+            "skybox_path": rc.skybox_path or None,
+            "normalized_skybox_path": sky_norm_path,
         }
 
     out_json_path = json_dir / "transforms_extended.json"
@@ -813,107 +818,140 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
 
 
 def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Path:
-    """Allena il NeRF usando nerf_module.train() e restituisce il path del checkpoint."""
+    """Allena il NeRF (vanilla bmild coarse+fine) e restituisce il path del checkpoint."""
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
-    import torch
-    from nerf_module import NerfConfig, NerfDataset, train as nerf_train
+    from nerf import NerfConfig, train as nerf_train
 
-    rc = cfg.render
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    nerf_cfg = NerfConfig(
-        num_encoding_functions=rc.indirect_nerf_num_encoding_functions,
-        filter_size=rc.indirect_nerf_filter_size,
-        depth_window=rc.indirect_nerf_depth_window,
-        depth_window_end=rc.indirect_nerf_depth_window_end,
-        depth_samples_per_ray=rc.indirect_nerf_depth_samples,
-        hdr_mode=rc.nerf_hdr_mode,
-    )
-
-    print(f"[Step 2] Caricamento dataset: {transforms_extended_path}")
-    dataset = NerfDataset(str(transforms_extended_path), device=device,
-                          hdr_mode=rc.nerf_hdr_mode)
-
+    rc   = cfg.render
     ckpt = Path(cfg.nerf_ckpt_path or
-                Path(rc.output_dir) / "model" / "tinynerf_model_cache.pkl")
+                Path(rc.output_dir) / "model" / "nerf_model_cache.pt")
     out_dir = Path(cfg.nerf_train_output_dir or Path(rc.output_dir) / "nerf_train")
 
+    nerf_cfg = NerfConfig(
+        depth_hint_enabled   = cfg.nerf_depth_hint_enabled,
+        foreground_ratio     = cfg.nerf_foreground_ratio,
+        depth_window_samples = cfg.nerf_depth_window_samples,
+        depth_window         = cfg.nerf_depth_window,
+        depth_window_end     = cfg.nerf_depth_window_end,
+        opacity_weight       = cfg.nerf_opacity_weight,
+        raw_noise_std        = cfg.nerf_raw_noise_std,
+    )
+
     print(f"[Step 2] Training NeRF — {cfg.nerf_num_iters} iter, ckpt → {ckpt}")
+    if cfg.nerf_depth_hint_enabled:
+        print(f"[Step 2] Depth-hint mode: fg_ratio={cfg.nerf_foreground_ratio}, "
+              f"window_samples={cfg.nerf_depth_window_samples}, "
+              f"window=[t_hit-{cfg.nerf_depth_window}, t_hit+{cfg.nerf_depth_window_end}]")
     nerf_train(
-        dataset, nerf_cfg,
+        str(transforms_extended_path), nerf_cfg,
+        ckpt_path     = str(ckpt),
+        output_dir    = str(out_dir),
         num_iters     = cfg.nerf_num_iters,
         batch_size    = cfg.nerf_batch_size,
-        mask_bias     = cfg.nerf_mask_bias,
         lr            = cfg.nerf_lr,
-        ckpt_path     = str(ckpt),
-        display_every = cfg.nerf_display_every,
-        output_dir    = str(out_dir),
-        on_step       = None,
         seed          = cfg.nerf_seed,
+        display_every = cfg.nerf_display_every,
     )
     print(f"[Step 2] Training completato. Checkpoint: {ckpt}")
     return ckpt
 
 
+def _write_png_float(arr: np.ndarray, path: str) -> None:
+    """Salva array float32 [0,1] come PNG uint8."""
+    from PIL import Image
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8)).save(path)
+
+
+def _write_sxs_comparison(gt_np: np.ndarray, pred_np: np.ndarray,
+                           psnr: float, path: str, label: str = "") -> None:
+    """Salva side-by-side GT | Pred con PSNR in testa come PNG."""
+    from PIL import Image, ImageDraw
+    H, W   = gt_np.shape[:2]
+    title_h = 24
+    canvas  = np.zeros((H + title_h, W * 2, 3), dtype=np.uint8)
+    canvas[title_h:, :W] = (np.clip(gt_np,   0, 1) * 255).astype(np.uint8)
+    canvas[title_h:, W:] = (np.clip(pred_np,  0, 1) * 255).astype(np.uint8)
+    img  = Image.fromarray(canvas)
+    draw = ImageDraw.Draw(img)
+    draw.text((W // 4,       4), f"GT  {label}",              fill=(220, 220, 220))
+    draw.text((W + W // 4,   4), f"Pred  PSNR={psnr:.2f} dB", fill=(220, 220, 220))
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    img.save(path)
+
+
+def _load_depth_np(path: str) -> np.ndarray | None:
+    """Carica depth EXR come (H, W) float32; ritorna None in caso di errore."""
+    try:
+        import OpenEXR, Imath
+        exr = OpenEXR.InputFile(path)
+        dw  = exr.header()["dataWindow"]
+        w   = dw.max.x - dw.min.x + 1
+        h   = dw.max.y - dw.min.y + 1
+        pt  = Imath.PixelType(Imath.PixelType.FLOAT)
+        key = next(iter(exr.header()["channels"]))
+        ch  = np.frombuffer(exr.channel(key, pt), dtype=np.float32).reshape(h, w)
+        return np.where(ch >= 1e10, 0.0, ch).astype(np.float32)
+    except Exception as e:
+        print(f"    ⚠  Impossibile caricare depth {path}: {e}")
+        return None
+
+
 def _step2b_render_train_images(cfg: PipelineConfig,
                                 transforms_extended_path: Path,
                                 ckpt_path: Path) -> None:
-    """Per ogni frame di training: renderizza col NeRF e salva render + |GT−Pred| come EXR."""
+    """Per ogni frame renderizza col NeRF e salva GT, Pred e GT|Pred sxs come PNG."""
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
-    import torch
-    import torch.nn.functional as F
-    from nerf_module import load_checkpoint, NerfDataset, render_image as nerf_render_image
+    from nerf import load_checkpoint, render_image as nerf_render_image
 
     rc = cfg.render
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model, _, _, nerf_cfg = load_checkpoint(str(ckpt_path), device)
-    model.eval()
+    model_bundle, nerf_cfg = load_checkpoint(str(ckpt_path))
 
-    dataset = NerfDataset(str(transforms_extended_path), device=device,
-                          hdr_mode=rc.nerf_hdr_mode)
+    tf   = load_transforms(str(transforms_extended_path))
+    intr = tf.intrinsics
+
+    with open(transforms_extended_path, encoding="utf-8") as fh:
+        raw_frames = json.load(fh)["frames"]
 
     base = Path(cfg.nerf_render_train_images_dir or
                 Path(rc.output_dir) / "nerf_render_images")
-    render_dir = base / "render"
-    diff_dir   = base / "difference"
-    render_dir.mkdir(parents=True, exist_ok=True)
-    diff_dir.mkdir(parents=True, exist_ok=True)
+    base.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[Step 2b] Rendering {dataset.num_frames} frame di training con NeRF...")
-    _eps = 1e-3
+    print(f"\n[Step 2b] Rendering {len(tf.frames)} frame con NeRF...")
     psnrs = []
-    for i in range(dataset.num_frames):
-        gt, pose, dep, _ = dataset.get_frame(i)
+    for i, (frame, raw_frame) in enumerate(zip(tf.frames, raw_frames)):
+        gt_np  = _load_image_hw3_native(frame.file_path)
+        pose   = np.array(frame.transform_matrix, dtype=np.float32)
 
-        pred, _, _ = nerf_render_image(
-            dataset.H, dataset.W, dataset.focal, pose, model, nerf_cfg,
-            target_depth=dep, randomize=False, focal_y=dataset.focal_y,
+        dep_np = None
+        if nerf_cfg.depth_hint_enabled:
+            dep_str = raw_frame.get("depth_path", "")
+            if dep_str:
+                dep_full = (dep_str if Path(dep_str).is_absolute()
+                            else (Path(transforms_extended_path).parent / dep_str).resolve().as_posix())
+                dep_np = _load_depth_np(dep_full)
+
+        pred_np = nerf_render_image(
+            model_bundle, intr.h, intr.w, intr.fl_x, pose, nerf_cfg,
+            focal_y=intr.fl_y, cx=intr.cx, cy=intr.cy, target_depth=dep_np,
         )
 
-        pred_np = pred.detach().cpu().numpy().astype(np.float32)
-        gt_np   = gt.detach().cpu().numpy().astype(np.float32)
-        diff_np = np.abs(gt_np - pred_np)
-
-        render_path = (render_dir / f"frame_{i:03d}.exr").resolve().as_posix()
-        diff_path   = (diff_dir  / f"frame_{i:03d}.exr").resolve().as_posix()
-        _save_layer(pred_np, render_path, ImageFormat.OPENEXR, DataLayer.IRRADIANCE)
-        _save_layer(diff_np, diff_path,   ImageFormat.OPENEXR, DataLayer.IRRADIANCE)
-
-        if rc.nerf_hdr_mode:
-            psnr = -10.0 * np.log10(
-                np.mean((np.log(pred_np.clip(0) + _eps)
-                         - np.log(gt_np.clip(0) + _eps)) ** 2) + 1e-10)
-        else:
-            psnr = -10.0 * np.log10(np.mean((pred_np - gt_np) ** 2) + 1e-10)
+        psnr = -10.0 * np.log10(np.mean((pred_np - gt_np) ** 2) + 1e-10)
         psnrs.append(psnr)
 
-        if (i + 1) % max(1, dataset.num_frames // 10) == 0 or i == dataset.num_frames - 1:
-            print(f"  [Step 2b] {i + 1}/{dataset.num_frames}  PSNR={psnr:.2f} dB")
+        stem = f"frame_{i:03d}"
+        _write_png_float(gt_np,   (base / f"{stem}_gt.png").as_posix())
+        _write_png_float(pred_np, (base / f"{stem}_pred.png").as_posix())
+        _write_sxs_comparison(gt_np, pred_np, psnr,
+                               (base / f"{stem}_sxs.png").as_posix(), f"frame {i}")
 
-    print(f"[Step 2b] Completato — PSNR medio={np.mean(psnrs):.2f} dB  "
-          f"(render → {render_dir}  diff → {diff_dir})")
+        if (i + 1) % max(1, len(tf.frames) // 5) == 0 or i == len(tf.frames) - 1:
+            print(f"  [Step 2b] {i+1}/{len(tf.frames)}  PSNR={psnr:.2f} dB")
+
+    print(f"[Step 2b] Completato — PSNR medio={np.mean(psnrs):.2f} dB → {base}")
 
 
 def _step3_posttrain_assets(cfg: PipelineConfig,
@@ -1062,7 +1100,14 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
             print(f"[Step 3] Calcolo Irradiance "
                   f"({rc.irradiance_sample_side}×{rc.irradiance_sample_side} samples)…")
             sky_w, sky_h = rc.skybox_size[0], rc.skybox_size[1]
-            skybox_flat = _load_image_as_vec3(rc.skybox_path, sky_w, sky_h)
+            # Usa lo skybox normalizzato dal JSON se disponibile (stessa scala di color+NeRF)
+            norm_sky_rel = output_json.get("normalization", {}).get("normalized_skybox_path", "")
+            if norm_sky_rel:
+                norm_sky_abs = (json_dir / norm_sky_rel).resolve().as_posix()
+                skybox_src = norm_sky_abs if Path(norm_sky_abs).exists() else rc.skybox_path
+            else:
+                skybox_src = rc.skybox_path
+            skybox_flat = _load_image_as_vec3(skybox_src, sky_w, sky_h)
             irr_gen = optix_mod.IrradianceGenerator()
             irr_gen.set_traversable(model)
             irr_gen.set_inputs(ium_res, skybox_flat, [sky_w, sky_h],
@@ -1125,7 +1170,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict:
     """Orchestratore a tre step. Ogni step può essere abilitato/disabilitato.
 
     Step 1 (run_step1): depth+mask per frame + copia immagini + transforms_extended.json minimo.
-    Step 2 (run_step2): training NeRF via nerf_module.train(), salva checkpoint.
+    Step 2 (run_step2): training NeRF via nerf/train.py, salva checkpoint.
     Step 3 (run_step3): IUM/visibility/color_texture/irradiance/indirect/albedo.
     """
     import OptixProgrammablePasses as optix
@@ -1153,43 +1198,37 @@ def run_pipeline(cfg: PipelineConfig) -> dict:
             )
 
     ckpt_path = Path(cfg.nerf_ckpt_path or
-                     Path(cfg.render.output_dir) / "model" / "tinynerf_model_cache.pkl")
+                     Path(cfg.render.output_dir) / "model" / "nerf_model_cache.pt")
 
     if cfg.run_step2:
-        ckpt_path = _step2_train_nerf(cfg, transforms_extended)
+        while True:
+            ckpt_path = _step2_train_nerf(cfg, transforms_extended)
+
+            if cfg.enable_nerf_render_train_images:
+                _step2b_render_train_images(cfg, transforms_extended, ckpt_path)
+                render_dir = cfg.nerf_render_train_images_dir or \
+                             str(Path(cfg.render.output_dir) / "nerf_render_images")
+                print(f"  Anteprime salvate in: {render_dir}")
+
+            if not cfg.nerf_interactive_loop:
+                break
+            try:
+                ans = input("\nContinuare il training? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if ans != "y":
+                break
+
     elif cfg.run_step3 and cfg.render.precompute_indirect and not ckpt_path.exists():
         raise FileNotFoundError(
             f"Step 2 disabilitato ma il checkpoint NeRF non esiste: {ckpt_path}\n"
             "Attivare run_step2=True oppure fornire nerf_ckpt_path valido."
         )
 
-    if cfg.run_step2 and cfg.enable_nerf_render_train_images:
-        _step2b_render_train_images(cfg, transforms_extended, ckpt_path)
-
-    if cfg.run_step2 and cfg.enable_nerf_viewer:
-        from nerf_viewer import launch_viewer
-        while True:
-            print("\n[Viewer] Apertura viewer interattivo NeRF…")
-            res = launch_viewer(
-                ckpt_path=str(ckpt_path),
-                transforms_json=str(transforms_extended),
-                idle_render_size=cfg.nerf_viewer_idle_size,
-                interactive_render_size=cfg.nerf_viewer_interactive_size,
-            )
-            if res.action == "continue":
-                cfg.nerf_num_iters += res.extra_iters
-                print(f"[Viewer] Riprendo training per {res.extra_iters} iterazioni aggiuntive "
-                      f"(target totale: {cfg.nerf_num_iters})")
-                ckpt_path = _step2_train_nerf(cfg, transforms_extended)
-                continue
-            elif res.action == "abort":
-                print("[Viewer] Annullato dall'utente — pipeline interrotta.")
-                return {}
-            break  # action == "proceed"
-
     if cfg.run_step3:
         if cfg.render.precompute_indirect and not cfg.render.indirect_nerf_cache_path:
             cfg.render.indirect_nerf_cache_path = str(ckpt_path)
+
         return _step3_posttrain_assets(cfg, transforms_extended, optix)
 
     with open(transforms_extended, encoding="utf-8") as fh:
@@ -1211,7 +1250,7 @@ if __name__ == "__main__":
         render = RenderConfig(
             transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-            output_dir      = "output/sworshield_render_nerf_interactive_comparison_normalize",
+            output_dir      = "output/sworshield_render_nerf_interactive_comparison_not_normalize2",
 
             render_depth    = True,
             render_position = False,  # Step 1 produces only depth+mask
@@ -1226,39 +1265,45 @@ if __name__ == "__main__":
             render_irradiance      = True,
             irradiance_format      = ImageFormat.OPENEXR,
             skybox_path            = f"{REPO}/Scenes/SwordShield/Blender/assets/hdrs/clouds-sunshine_b963efc0-83f3-4957-8725-34f73b8744ff/clouds-sunshine_2K_09c69240-8e00-4b23-896f-fcde6fd514cc.exr",
-            normalization_skybox_path= f"{REPO}/Scenes/SwordShield/Blender/assets/hdrs/clouds-sunshine_b963efc0-83f3-4957-8725-34f73b8744ff/clouds-sunshine_2K_09c69240-8e00-4b23-896f-fcde6fd514cc.exr",
             skybox_size            = [1024, 512],
             irradiance_sample_side = 512,
 
-            precompute_indirect = True,
-            indirect_sample_side = 64,
-            indirect_tile_size   = 1024,
+            precompute_indirect           = True,
+            indirect_sample_side          = 64,
+            indirect_tile_size            = 1024,
+            indirect_depth_hint_enabled   = False,
 
             render_albedo = True,
             albedo_format = ImageFormat.OPENEXR,
             albedo_eps    = 1e-3,
 
-            depth_format      = ImageFormat.OPENEXR,
-            mask_format       = ImageFormat.PNG,
-            ium_format        = ImageFormat.OPENEXR,
-            visibility_format = ImageFormat.OPENEXR,
+            depth_format         = ImageFormat.OPENEXR,
+            mask_format          = ImageFormat.PNG,
+            ium_format           = ImageFormat.OPENEXR,
+            visibility_format    = ImageFormat.OPENEXR,
             color_texture_format = ImageFormat.OPENEXR,
-
-            indirect_nerf_depth_samples = 8,
 
             ium_texture_size = [512, 512],
             apply_scale      = False,
         ),
 
-        nerf_num_iters    = 10000,
-        nerf_batch_size   = 4096,
-        nerf_mask_bias    = 0.5,
-        nerf_lr           = 5e-3,
+        nerf_num_iters     = 10000,
+        nerf_batch_size    = 4096,
+        nerf_lr            = 5e-4,
         nerf_display_every = 100,
-        nerf_seed         = 9458,
+        nerf_seed          = 9458,
 
-        enable_nerf_render_train_images=True,
-        enable_nerf_viewer=True,
+        enable_nerf_render_train_images = True,
+        nerf_interactive_loop           = True,
+
+
+        nerf_depth_hint_enabled   = True,
+        nerf_foreground_ratio     = 0.8,   # 80% raggi figura, 20% background
+        nerf_depth_window_samples = 32,    # sample nella finestra
+        nerf_depth_window         = 0.5,
+        nerf_depth_window_end     = 0.5,   # finestra simmetrica [t_hit-0.5, t_hit+0.5]
+        nerf_opacity_weight       = 1.0,   # supervisione opacità figura (acc_fg → 1)
+        nerf_raw_noise_std        = 1.0,   # rumore pre-ReLU per sbloccare la densità
 
     )
 
