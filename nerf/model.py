@@ -9,28 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class SkyModel(nn.Module):
-    """Directional sky MLP: maps encoded view direction → HDR RGB.
-
-    Replaces the white background constant with a learned environment.
-    Input must be pre-encoded with the same embeddirs_fn used by the main NeRF.
-    View directions must be normalised before encoding.
-    """
-
-    def __init__(self, input_ch_views: int, D: int = 3, W: int = 128):
-        super().__init__()
-        layers: list[nn.Module] = []
-        in_ch = input_ch_views
-        for _ in range(D):
-            layers += [nn.Linear(in_ch, W), nn.ReLU(inplace=True)]
-            in_ch = W
-        layers.append(nn.Linear(W, 3))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, dirs_encoded):
-        return F.softplus(self.net(dirs_encoded))
-
-
 class NeRF(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4,
                  skips=(4,), use_viewdirs=False):

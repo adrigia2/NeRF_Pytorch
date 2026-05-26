@@ -530,6 +530,12 @@ class RenderConfig:
     color_texture_format: ImageFormat = ImageFormat.OPENEXR
     # Percentile usato per calcolare il peak (default 95° = scarta il top 5% più luminoso)
     color_texture_peak_percentile: float = 100.0
+    # Sorgente immagine per la color/camera texture (tutte le prospettive).
+    # "gt"   → immagini ground-truth (default storico)
+    # "nerf" → pred EXR salvati dallo Step 2b in nerf_render_images/iter_*/
+    color_texture_image_source: str = "gt"
+    # Iterazione Step 2b da cui leggere i pred NeRF. -1 = usa l'ultima disponibile.
+    color_texture_nerf_iter: int = -1
 
     # Debug output
     debug_camera_texture: bool = False   # salva side-by-side camera image vs camera_texture
@@ -586,16 +592,16 @@ class PipelineConfig:
     nerf_ckpt_path:        str   = ""  # default: <output_dir>/model/nerf_model_cache.pt
     nerf_train_output_dir: str   = ""  # default: <output_dir>/nerf_train
 
-    # Depth-hint training (Step 2) — attivo solo se run_step1 ha generato depth+mask
-    nerf_depth_hint_enabled:   bool  = False
-    nerf_foreground_ratio:         float = 0.8   # frazione del batch dai raggi figura
-    nerf_foreground_ratio_enabled: bool  = True  # False = ratio naturale del dataset (ignora la percentuale)
-    nerf_depth_window_samples: int   = 32    # sample nella finestra per i raggi figura
+    # Depth-guided training (Step 2) — richiede depth+mask dallo Step 1
+    nerf_depth_window_samples: int   = 32    # sample nella finestra mesh per i raggi figura
     nerf_depth_window:         float = 0.5   # [t_hit - window, t_hit + window_end]
     nerf_depth_window_end:     float = 0.5
-    nerf_opacity_weight:       float = 1.0   # peso della loss acc_fg→1 (0 = disattiva)
-    nerf_raw_noise_std:        float = 0.0   # rumore pre-ReLU sulla densità (1.0 = training robusto)
-    nerf_train_background:     bool  = True  # allena sky MLP sui pixel bg; False = bg bianco classico
+    nerf_opacity_weight:       float = 1.0   # peso della loss opacità (fg e bg)
+    nerf_raw_noise_std:        float = 0.0   # rumore pre-ReLU sulla densità
+    nerf_bg_radius_mult:       float = 6.0   # raggio sfera bg = bg_radius_mult × max_side
+    nerf_bg_depth_window:      float = 2.0   # finestra bg [R - window, R + window_end]
+    nerf_bg_depth_window_end:  float = 2.0
+    nerf_bg_depth_window_samples: int = 32
 
     # Render dei frame di training col NeRF allenato (post-Step 2)
     enable_nerf_render_train_images: bool = False
@@ -635,9 +641,8 @@ def _precompute_indirect_irradiance(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_bundle, nerf_cfg = load_checkpoint(cache_path, device)
     if cfg.indirect_depth_hint_enabled:
-        nerf_cfg.depth_hint_enabled = True
-        nerf_cfg.depth_window       = cfg.indirect_depth_window
-        nerf_cfg.depth_window_end   = cfg.indirect_depth_window_end
+        nerf_cfg.depth_window     = cfg.indirect_depth_window
+        nerf_cfg.depth_window_end = cfg.indirect_depth_window_end
     print(f"✓ NeRF model caricato da: {cache_path}")
 
     # ── Pass OptiX tile-by-tile ───────────────────────────────────────────────
@@ -689,6 +694,28 @@ def _precompute_indirect_irradiance(
     _save_layer(irr_indirect_arr, indirect_path, cfg.indirect_format,
                 DataLayer.IRRADIANCE_INDIRECT)
     print(f"✓ irradiance_indirect salvato: {indirect_path}")
+
+
+def _find_nerf_pred_dir(base_root: Path, iter_sel: int) -> "Path | None":
+    """Restituisce la sottocartella iter_* con l'iterazione richiesta (o la massima)."""
+    if not base_root.is_dir():
+        return None
+    candidates = {}
+    for d in base_root.iterdir():
+        if d.is_dir() and d.name.startswith("iter_"):
+            try:
+                candidates[int(d.name[5:])] = d
+            except ValueError:
+                pass
+    if not candidates:
+        return None
+    if iter_sel == -1:
+        return candidates[max(candidates)]
+    return candidates.get(iter_sel)
+
+
+def _nerf_pred_path(pred_dir: Path, idx: int) -> Path:
+    return pred_dir / f"frame_{idx:03d}_pred.exr"
 
 
 def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
@@ -831,25 +858,20 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
     out_dir = Path(cfg.nerf_train_output_dir or Path(rc.output_dir) / "nerf_train")
 
     nerf_cfg = NerfConfig(
-        depth_hint_enabled        = cfg.nerf_depth_hint_enabled,
-        foreground_ratio          = cfg.nerf_foreground_ratio,
-        foreground_ratio_enabled  = cfg.nerf_foreground_ratio_enabled,
         depth_window_samples      = cfg.nerf_depth_window_samples,
         depth_window              = cfg.nerf_depth_window,
         depth_window_end          = cfg.nerf_depth_window_end,
         opacity_weight            = cfg.nerf_opacity_weight,
         raw_noise_std             = cfg.nerf_raw_noise_std,
-        train_background          = cfg.nerf_train_background,
+        bg_radius_mult            = cfg.nerf_bg_radius_mult,
+        bg_depth_window           = cfg.nerf_bg_depth_window,
+        bg_depth_window_end       = cfg.nerf_bg_depth_window_end,
+        bg_depth_window_samples   = cfg.nerf_bg_depth_window_samples,
     )
 
-    print(f"[Step 2] Training NeRF — {cfg.nerf_num_iters} iter, ckpt → {ckpt}")
-    if cfg.nerf_depth_hint_enabled:
-        ratio_str = (f"fg_ratio={cfg.nerf_foreground_ratio}"
-                     if cfg.nerf_foreground_ratio_enabled else "fg_ratio=natural")
-        print(f"[Step 2] Depth-hint mode: {ratio_str}, "
-              f"window_samples={cfg.nerf_depth_window_samples}, "
-              f"window=[t_hit-{cfg.nerf_depth_window}, t_hit+{cfg.nerf_depth_window_end}], "
-              f"train_background={cfg.nerf_train_background}")
+    print(f"[Step 2] Training NeRF (depth-guided) — {cfg.nerf_num_iters} iter, ckpt → {ckpt}")
+    print(f"[Step 2] campionamento naturale, mesh_window=[t-{cfg.nerf_depth_window}, t+{cfg.nerf_depth_window_end}], "
+          f"bg_radius_mult={cfg.nerf_bg_radius_mult}")
     nerf_train(
         str(transforms_extended_path), nerf_cfg,
         ckpt_path     = str(ckpt),
@@ -905,6 +927,79 @@ def _load_depth_np(path: str) -> np.ndarray | None:
         return None
 
 
+def _load_mask_bool(path: str) -> np.ndarray | None:
+    """Carica una maschera PNG come (H, W) bool (True = figura). None se fallisce."""
+    try:
+        from PIL import Image
+        arr = np.array(Image.open(path).convert("L"), dtype=np.float32) / 255.0
+        return arr > 0.5
+    except Exception as e:
+        print(f"    ⚠  Impossibile caricare mask {path}: {e}")
+        return None
+
+
+# Fasce di luminanza GT (lineare HDR) usate per i grafici errore-per-luminanza.
+_LUMA_BINS = [(0.0, 0.02), (0.02, 0.05), (0.05, 0.2), (0.2, 1.0), (1.0, 5.0), (5.0, np.inf)]
+
+
+def _write_error_luminance_plot(gt_np: np.ndarray, pred_np: np.ndarray,
+                                 sel: np.ndarray | None, path: str, title: str) -> None:
+    """Grafico a barre dell'errore raggruppato per fascia di luminanza GT.
+
+    sel: maschera booleana (H, W) dei pixel da includere; None = tutta l'immagine.
+    Mostra, per ogni fascia: |pred-gt| medio assoluto (asse sinistro) ed errore
+    relativo medio (asse destro), col numero di pixel per fascia.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("    ⚠  matplotlib non disponibile: grafico errore saltato")
+        return
+
+    gl   = gt_np.mean(-1)
+    diff = np.abs(pred_np - gt_np).mean(-1)
+    if sel is None:
+        sel = np.ones(gl.shape, dtype=bool)
+
+    labels, abs_means, rel_means, counts = [], [], [], []
+    for lo, hi in _LUMA_BINS:
+        b = sel & (gl >= lo) & (gl < hi)
+        n = int(b.sum())
+        labels.append(f">{lo:g}" if not np.isfinite(hi) else f"{lo:g}–{hi:g}")
+        counts.append(n)
+        if n == 0:
+            abs_means.append(0.0); rel_means.append(0.0)
+        else:
+            abs_means.append(float(diff[b].mean()))
+            rel_means.append(float((diff[b] / (gl[b] + 1e-3)).mean()))
+
+    x = np.arange(len(_LUMA_BINS))
+    fig, ax1 = plt.subplots(figsize=(8, 4.5))
+    ax1.bar(x - 0.2, abs_means, width=0.4, color="#4C72B0")
+    ax1.set_ylabel("Mean |pred − gt| (absolute)", color="#4C72B0")
+    ax1.tick_params(axis="y", labelcolor="#4C72B0")
+    ax1.set_xlabel("GT luminance bin (linear HDR)")
+    ax1.set_xticks(x); ax1.set_xticklabels(labels, rotation=30, ha="right")
+
+    ax2 = ax1.twinx()
+    ax2.bar(x + 0.2, rel_means, width=0.4, color="#C44E52")
+    ax2.set_ylabel("Mean relative error", color="#C44E52")
+    ax2.tick_params(axis="y", labelcolor="#C44E52")
+
+    ymax = max(abs_means) if any(abs_means) else 1.0
+    for xi, c in zip(x, counts):
+        ax1.text(xi, ymax * 0.01, f"n={c}", ha="center", va="bottom",
+                 fontsize=7, rotation=90, color="gray")
+
+    ax1.set_title(title)
+    fig.tight_layout()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
 def _step2b_render_train_images(cfg: PipelineConfig,
                                 transforms_extended_path: Path,
                                 ckpt_path: Path) -> None:
@@ -944,12 +1039,18 @@ def _step2b_render_train_images(cfg: PipelineConfig,
         pose   = np.array(frame.transform_matrix, dtype=np.float32)
 
         dep_np = None
-        if nerf_cfg.depth_hint_enabled:
-            dep_str = raw_frame.get("depth_path", "")
-            if dep_str:
-                dep_full = (dep_str if Path(dep_str).is_absolute()
-                            else (Path(transforms_extended_path).parent / dep_str).resolve().as_posix())
-                dep_np = _load_depth_np(dep_full)
+        dep_str = raw_frame.get("depth_path", "")
+        if dep_str:
+            dep_full = (dep_str if Path(dep_str).is_absolute()
+                        else (Path(transforms_extended_path).parent / dep_str).resolve().as_posix())
+            dep_np = _load_depth_np(dep_full)
+
+        mask_bool = None
+        mask_str = raw_frame.get("mask_path", "")
+        if mask_str:
+            mask_full = (mask_str if Path(mask_str).is_absolute()
+                         else (Path(transforms_extended_path).parent / mask_str).resolve().as_posix())
+            mask_bool = _load_mask_bool(mask_full)
 
         pred_np = nerf_render_image(
             model_bundle, intr.h, intr.w, intr.fl_x, pose, nerf_cfg,
@@ -969,6 +1070,17 @@ def _step2b_render_train_images(cfg: PipelineConfig,
         _write_png_float(pred_np, (base / f"{stem}_pred.png").as_posix())
         _write_sxs_comparison(gt_np, pred_np, psnr,
                                (base / f"{stem}_sxs.png").as_posix(), f"frame {i}")
+
+        # Error-by-luminance plots: full image + figure only (mask)
+        _write_error_luminance_plot(
+            gt_np, pred_np, None,
+            (base / f"{stem}_errplot_general.png").as_posix(),
+            f"frame {i} — error by luminance (full image)")
+        if mask_bool is not None and mask_bool.shape == gt_np.shape[:2]:
+            _write_error_luminance_plot(
+                gt_np, pred_np, mask_bool,
+                (base / f"{stem}_errplot_figure.png").as_posix(),
+                f"frame {i} — error by luminance (figure)")
 
         if (i + 1) % max(1, len(tf.frames) // 5) == 0 or i == len(tf.frames) - 1:
             print(f"  [Step 2b] {i+1}/{len(tf.frames)}  PSNR={psnr:.2f} dB")
@@ -1066,10 +1178,26 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
                 and visibility_map is not None):
             print("[Step 3] Calcolo Color Texture…")
 
+            nerf_pred_dir = None
+            if rc.color_texture_image_source == "nerf":
+                base_root = Path(cfg.nerf_render_train_images_dir or
+                                 json_dir / "nerf_render_images")
+                nerf_pred_dir = _find_nerf_pred_dir(base_root, rc.color_texture_nerf_iter)
+                if nerf_pred_dir is None:
+                    print("    ⚠  Nessuna cartella pred NeRF trovata → uso immagini GT")
+                else:
+                    print(f"[Step 3] Color texture da pred NeRF: {nerf_pred_dir}")
+
             optix_frames = []
             for i, frame in enumerate(tf.frames):
                 cam = all_cameras[i]
-                img_path = frame.file_path  # path normalizzato da transforms_extended.json
+                img_path = frame.file_path
+                if nerf_pred_dir is not None:
+                    pred_path = _nerf_pred_path(nerf_pred_dir, i)
+                    if pred_path.exists():
+                        img_path = pred_path.as_posix()
+                    else:
+                        print(f"    ⚠  pred NeRF mancante per frame {i} ({pred_path.name}), uso GT")
                 img_flat = _load_image_as_vec3(img_path, intr.w, intr.h)
                 peak = _compute_peak(img_flat.reshape(intr.h, intr.w, 3),
                                      rc.color_texture_peak_percentile)
@@ -1268,10 +1396,11 @@ if __name__ == "__main__":
         run_step2 = True,
         run_step3 = True,
 
+
         render = RenderConfig(
             transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-            output_dir      = "output/sworshield_render_nerf_skybox",
+            output_dir      = "output/sworshield_render_nerf_instead_of_gt2",
 
             render_depth    = True,
             render_position = False,  # Step 1 produces only depth+mask
@@ -1306,10 +1435,13 @@ if __name__ == "__main__":
 
             ium_texture_size = [512, 512],
             apply_scale      = False,
+
+            color_texture_image_source = "nerf",  # "nerf" | "gt"
+
         ),
 
         nerf_num_iters     = 100000,
-        nerf_batch_size    = 4096,
+        nerf_batch_size    = 4096*4,
         nerf_lr            = 5e-4,
         nerf_display_every = 100,
         nerf_seed          = 9458,
@@ -1318,15 +1450,16 @@ if __name__ == "__main__":
         nerf_interactive_loop           = True,
 
 
-        nerf_depth_hint_enabled        = True,
-        nerf_foreground_ratio          = 0.8,   # usato solo se nerf_foreground_ratio_enabled=True
-        nerf_foreground_ratio_enabled  = False,  # False = ratio naturale del dataset
-        nerf_depth_window_samples      = 32,    # sample nella finestra
-        nerf_depth_window              = 0.5,
-        nerf_depth_window_end          = 0.5,   # finestra simmetrica [t_hit-0.5, t_hit+0.5]
-        nerf_opacity_weight            = 1.0,   # supervisione opacità figura (acc_fg → 1)
-        nerf_raw_noise_std             = 1.0,   # rumore pre-ReLU per sbloccare la densità
-        nerf_train_background          = True,  # sky MLP: apprende l'environment dai pixel bg
+
+        nerf_depth_window_samples      = 8,
+        nerf_depth_window              = 0.3,
+        nerf_depth_window_end          = 0.3,
+        nerf_opacity_weight            = 1.0,
+        nerf_raw_noise_std             = 1.0,
+        nerf_bg_radius_mult            = 6.0,
+        nerf_bg_depth_window           = 0.3,
+        nerf_bg_depth_window_end       = 0.3,
+        nerf_bg_depth_window_samples   = 8,
 
     )
 

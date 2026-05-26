@@ -122,9 +122,8 @@ class NerfDataset:
             img = np.clip(_load_image_float(img_path), 0.0, None)  # allow HDR values > 1
             dep = _load_depth_exr(depth_path) if depth_path else None
 
-            # When composite_white=True, replace bg pixels with white (matches white_bkgd=True).
-            # When composite_white=False (train_background mode), keep real environment pixels
-            # as GT for background rays — the sky MLP learns the actual environment.
+            # When composite_white=True, blend bg pixels to white before storing as GT.
+            # When composite_white=False, keep real environment pixels as GT for background rays.
             if mask_path and composite_white:
                 mask = _load_mask_float(mask_path)
                 if mask is not None:
@@ -185,23 +184,6 @@ class NerfDataset:
                 and self._fg_idx.numel() > 0
                 and self._bg_idx.numel() > 0)
 
-    def sample_split(self, batch_size: int, fg_ratio: float):
-        """Sample a batch split between foreground (depth-hint) and background rays.
-
-        Returns:
-            fg: (rays_o, rays_d, rgb, depth) tensors for foreground rays
-            bg: (rays_o, rays_d, rgb) tensors for background rays
-        """
-        n_fg = round(batch_size * fg_ratio)
-        n_bg = batch_size - n_fg
-
-        fi = self._fg_idx[torch.randint(0, self._fg_idx.numel(), (n_fg,), device=self.device)]
-        bi = self._bg_idx[torch.randint(0, self._bg_idx.numel(), (n_bg,), device=self.device)]
-
-        fg = (self._rays_o[fi], self._rays_d[fi], self._rgb[fi], self._depths[fi])
-        bg = (self._rays_o[bi], self._rays_d[bi], self._rgb[bi])
-        return fg, bg
-
     def sample_natural(self, batch_size: int):
         """Uniform sample over all rays, split by depth into fg/bg (natural ratio).
 
@@ -223,6 +205,22 @@ class NerfDataset:
         """Returns (rays_o_np, rays_d_np, rgb_np, pose_3x4, dep_hw) for the held-out view."""
         return (self._test_rays_o, self._test_rays_d,
                 self._test_rgb, self._test_pose, self._test_dep)
+
+    def compute_scene_bounds(self):
+        """Compute the world-space AABB of foreground hit points and return centre + max side.
+
+        Hit points are p = rays_o + t_mesh * rays_d for all foreground rays.
+        Returns (center, max_side) as CPU float tensors of shape (3,) and scalar.
+        """
+        if self._depths is None or self._fg_idx.numel() == 0:
+            raise RuntimeError("No foreground rays with depth — cannot compute scene bounds.")
+        pts = (self._rays_o[self._fg_idx] +
+               self._depths[self._fg_idx, None] * self._rays_d[self._fg_idx])
+        p_min = pts.min(0).values
+        p_max = pts.max(0).values
+        center   = (p_min + p_max) * 0.5
+        max_side = (p_max - p_min).max()
+        return center, max_side
 
     def get_frame_meta(self, i: int) -> dict:
         return self._frames_meta[i]

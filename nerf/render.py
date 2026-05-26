@@ -5,14 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from .config import NerfConfig
-from .rays import get_rays_np, raw2outputs, sample_pdf
-
-
-def _eval_sky(sky, embeddirs_fn, rays_d: torch.Tensor) -> torch.Tensor:
-    """Evaluate the sky MLP for a batch of ray directions. Returns (N, 3) HDR RGB."""
-    dirs = rays_d / torch.norm(rays_d, dim=-1, keepdim=True).clamp(min=1e-10)
-    encoded = embeddirs_fn(dirs)
-    return sky(encoded)
+from .rays import get_rays_np, raw2outputs
 
 
 def _run_network(pts, viewdirs, model, embed_fn, embeddirs_fn, chunk):
@@ -31,92 +24,76 @@ def _run_network(pts, viewdirs, model, embed_fn, embeddirs_fn, chunk):
     return torch.cat(out_chunks, 0).reshape(N, S, -1)
 
 
-def render_rays(rays_o, rays_d, coarse_model, fine_model, embed_fn, embeddirs_fn,
-                cfg: NerfConfig, *, near=None, far=None, perturb=True, target_depth=None):
-    """Render a batch of rays with coarse + fine hierarchical sampling.
-
-    target_depth: (N_rays,) tensor — only used when cfg.depth_hint_enabled is True.
-    Returns: rgb_fine (N, 3), rgb_coarse (N, 3)
-    """
-    device = rays_o.device
-    N = rays_o.shape[0]
-    _near = near if near is not None else cfg.near
-    _far  = far  if far  is not None else cfg.far
-
-    # ── Coarse: stratified sampling ──────────────────────────────────────────
-    t = torch.linspace(0., 1., cfg.N_samples, device=device)
-    z_coarse = _near * (1. - t) + _far * t
-    z_coarse = z_coarse.expand(N, cfg.N_samples)
-
-    if perturb:
-        mids  = 0.5 * (z_coarse[:, 1:] + z_coarse[:, :-1])
-        upper = torch.cat([mids, z_coarse[:, -1:]], -1)
-        lower = torch.cat([z_coarse[:, :1], mids],  -1)
-        z_coarse = lower + (upper - lower) * torch.rand_like(z_coarse)
-
-    pts = rays_o[:, None, :] + rays_d[:, None, :] * z_coarse[:, :, None]
-    raw_c = _run_network(pts, rays_d, coarse_model, embed_fn, embeddirs_fn, cfg.chunk)
-    rgb_c, _, _, weights, _ = raw2outputs(raw_c, z_coarse, rays_d,
-                                          cfg.raw_noise_std, cfg.white_bkgd)
-
-    if cfg.N_importance == 0:
-        return rgb_c, rgb_c
-
-    # ── Fine: hierarchical sampling (or depth-hint window) ───────────────────
-    z_mid = 0.5 * (z_coarse[:, 1:] + z_coarse[:, :-1])
-
-    if cfg.depth_hint_enabled and target_depth is not None:
-        t_hit  = target_depth.to(device)
-        t_low  = (t_hit - cfg.depth_window).clamp(min=_near)
-        t_high = (t_hit + cfg.depth_window_end).clamp(max=_far)
-        u      = torch.rand(N, cfg.N_importance, device=device)
-        z_fine = t_low[:, None] + (t_high - t_low)[:, None] * u
-    else:
-        z_fine = sample_pdf(z_mid, weights[:, 1:-1], cfg.N_importance, det=not perturb)
-        z_fine = z_fine.detach()
-
-    z_vals, _ = torch.sort(torch.cat([z_coarse, z_fine], -1), -1)
-    pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[:, :, None]
-    raw_f = _run_network(pts, rays_d, fine_model, embed_fn, embeddirs_fn, cfg.chunk)
-    rgb_f, _, _, _, _ = raw2outputs(raw_f, z_vals, rays_d, cfg.raw_noise_std, cfg.white_bkgd)
-
-    return rgb_f, rgb_c
-
-
-def render_rays_depth(rays_o, rays_d, fine_model, embed_fn, embeddirs_fn, cfg: NerfConfig,
+def render_rays_depth(rays_o, rays_d, model, embed_fn, embeddirs_fn, cfg: NerfConfig,
                       t_hit, *, near=None, far=None, perturb=True, return_acc=False,
-                      bg_color=None):
-    """Single-pass render for foreground rays using OptiX depth as surface prior.
+                      bg_color=None,
+                      window=None, window_end=None, n_samples=None):
+    """Single-pass render for a batch of rays using a known surface distance t_hit.
 
-    Skips the coarse network entirely: samples depth_window_samples points in
-    [t_hit - depth_window, t_hit + depth_window_end], runs only the fine network.
-    bg_color: (N, 3) tensor — composited where acc < 1 instead of white. Ignored when None.
+    Samples n_samples points in [t_hit - window, t_hit + window_end].
+    If window/window_end/n_samples are None, the cfg foreground defaults are used.
+    bg_color: (N, 3) composited where acc < 1 instead of black. Ignored when None.
+    Returns rgb (N, 3), and acc (N,) when return_acc=True.
     """
     device = rays_o.device
     N = rays_o.shape[0]
     _near = near if near is not None else cfg.near
     _far  = far  if far  is not None else cfg.far
-    n     = cfg.depth_window_samples
+    _win      = window    if window    is not None else cfg.depth_window
+    _win_end  = window_end if window_end is not None else cfg.depth_window_end
+    _n        = n_samples  if n_samples  is not None else cfg.depth_window_samples
 
-    t_low  = (t_hit.to(device) - cfg.depth_window).clamp(min=_near)
-    t_high = (t_hit.to(device) + cfg.depth_window_end).clamp(max=_far)
+    t_low  = (t_hit.to(device) - _win).clamp(min=_near)
+    t_high = (t_hit.to(device) + _win_end).clamp(max=_far)
 
     if perturb:
-        u = torch.rand(N, n, device=device)
+        u = torch.rand(N, _n, device=device)
     else:
-        u = torch.linspace(0., 1., n, device=device).expand(N, n)
+        u = torch.linspace(0., 1., _n, device=device).expand(N, _n)
 
     z_vals, _ = torch.sort(t_low[:, None] + (t_high - t_low)[:, None] * u, dim=-1)
 
     pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[:, :, None]
-    raw = _run_network(pts, rays_d, fine_model, embed_fn, embeddirs_fn, cfg.chunk)
-    # use bg_color if provided, else fall back to white_bkgd flag
-    _bg = bg_color if bg_color is not None else None
-    _white = cfg.white_bkgd if bg_color is None else False
-    rgb, _, acc, _, _ = raw2outputs(raw, z_vals, rays_d, cfg.raw_noise_std, _white, bg_color=_bg)
+    raw = _run_network(pts, rays_d, model, embed_fn, embeddirs_fn, cfg.chunk)
+    rgb, _, acc, _, _ = raw2outputs(raw, z_vals, rays_d, cfg.raw_noise_std,
+                                    bg_color=bg_color)
     if return_acc:
         return rgb, acc
     return rgb
+
+
+def render_bg(dirs, center: torch.Tensor, sphere_radius: float,
+              model, embed_fn, embeddirs_fn, cfg: NerfConfig,
+              *, perturb=True, return_acc=False):
+    """Render background rays as a spherical shell centred at `center`.
+
+    Each ray is re-anchored at the scene centre and marched outward:
+        p(z) = center + z * normalize(dir),  z around sphere_radius
+
+    This makes the environment a purely directional function (no parallax between
+    views), automatically consistent across novel views.
+
+    Returns rgb (N, 3), and acc (N,) when return_acc=True.
+    """
+    N = dirs.shape[0]
+    device = dirs.device
+
+    dirs_n = F.normalize(dirs, dim=-1)
+    # Origin = centre broadcast to (N, 3); t_hit = sphere radius for all rays
+    origins = center.unsqueeze(0).expand(N, 3)
+    t_hit   = torch.full((N,), sphere_radius, device=device, dtype=torch.float32)
+
+    return render_rays_depth(
+        origins, dirs_n, model, embed_fn, embeddirs_fn, cfg,
+        t_hit,
+        near=cfg.near,
+        far=sphere_radius + cfg.bg_depth_window_end + 1.0,
+        perturb=perturb,
+        return_acc=return_acc,
+        window=cfg.bg_depth_window,
+        window_end=cfg.bg_depth_window_end,
+        n_samples=cfg.bg_depth_window_samples,
+    )
 
 
 def render_image(model_bundle, H: int, W: int, focal_x: float, pose_4x4,
@@ -128,13 +105,11 @@ def render_image(model_bundle, H: int, W: int, focal_x: float, pose_4x4,
     """Render a full image. Returns (H, W, 3) float32 numpy array.
 
     pose_4x4: 4×4 or 3×4 camera-to-world matrix (numpy or tensor).
-    target_depth: (H, W) depth map. When cfg.depth_hint_enabled is True and
-        target_depth is provided, pixels with depth>0 are rendered via
-        render_rays_depth (single-pass, fine network only); background pixels
-        (depth==0) use the sky MLP (if cfg.train_background) or the traditional
-        coarse+fine path.
+    target_depth: (H, W) depth map from OptiX. Pixels with depth>0 are foreground
+        (rendered with mesh window); pixels with depth==0 are background (rendered
+        as the spherical shell from the scene centre).
     """
-    coarse, fine, embed_fn, embeddirs_fn, device, sky = model_bundle
+    model, embed_fn, embeddirs_fn, device, center, sphere_radius = model_bundle
 
     focal_y = focal_y if focal_y is not None else focal_x
     cx = cx if cx is not None else W / 2.0
@@ -152,54 +127,35 @@ def render_image(model_bundle, H: int, W: int, focal_x: float, pose_4x4,
     rays_d_all = torch.tensor(rays_d_np.reshape(-1, 3), device=device)
     N_all = rays_o_all.shape[0]
 
-    t_hit_all = None
-    fg_mask   = None
-    if cfg.depth_hint_enabled and target_depth is not None:
-        if isinstance(target_depth, np.ndarray):
-            t_hit_all = torch.tensor(target_depth.reshape(-1), device=device, dtype=torch.float32)
-        else:
-            t_hit_all = target_depth.reshape(-1).to(device)
-        fg_mask = t_hit_all > 1e-6  # True = ray hit geometry
+    if target_depth is None:
+        raise ValueError("render_image requires target_depth (OptiX depth map).")
 
-    coarse.eval()
-    fine.eval()
-    if sky is not None:
-        sky.eval()
+    if isinstance(target_depth, np.ndarray):
+        t_hit_all = torch.tensor(target_depth.reshape(-1), device=device, dtype=torch.float32)
+    else:
+        t_hit_all = target_depth.reshape(-1).to(device)
+
+    fg_mask = t_hit_all > 1e-6
+
+    model.eval()
     result_rgb = torch.zeros(N_all, 3, device=device)
 
     with torch.no_grad():
-        if fg_mask is not None and fg_mask.any():
-            fg_idx = fg_mask.nonzero(as_tuple=True)[0]
-            bg_idx = (~fg_mask).nonzero(as_tuple=True)[0]
+        fg_idx = fg_mask.nonzero(as_tuple=True)[0]
+        bg_idx = (~fg_mask).nonzero(as_tuple=True)[0]
 
-            for i in range(0, fg_idx.numel(), cfg.chunk):
-                idx = fg_idx[i:i + cfg.chunk]
-                bg_col = (_eval_sky(sky, embeddirs_fn, rays_d_all[idx])
-                          if sky is not None else None)
-                result_rgb[idx] = render_rays_depth(
-                    rays_o_all[idx], rays_d_all[idx],
-                    fine, embed_fn, embeddirs_fn, cfg,
-                    t_hit_all[idx], perturb=False, bg_color=bg_col)
+        for i in range(0, fg_idx.numel(), cfg.chunk):
+            idx = fg_idx[i:i + cfg.chunk]
+            result_rgb[idx] = render_rays_depth(
+                rays_o_all[idx], rays_d_all[idx],
+                model, embed_fn, embeddirs_fn, cfg,
+                t_hit_all[idx], perturb=False)
 
-            if sky is not None:
-                # background = sky MLP evaluated per direction
-                for i in range(0, bg_idx.numel(), cfg.chunk):
-                    idx = bg_idx[i:i + cfg.chunk]
-                    result_rgb[idx] = _eval_sky(sky, embeddirs_fn, rays_d_all[idx])
-            else:
-                for i in range(0, bg_idx.numel(), cfg.chunk):
-                    idx = bg_idx[i:i + cfg.chunk]
-                    rgb, _ = render_rays(rays_o_all[idx], rays_d_all[idx],
-                                         coarse, fine, embed_fn, embeddirs_fn,
-                                         cfg, perturb=False)
-                    result_rgb[idx] = rgb
-        else:
-            for i in range(0, N_all, cfg.chunk):
-                ro = rays_o_all[i:i + cfg.chunk]
-                rd = rays_d_all[i:i + cfg.chunk]
-                rgb, _ = render_rays(ro, rd, coarse, fine, embed_fn, embeddirs_fn,
-                                     cfg, perturb=False)
-                result_rgb[i:i + cfg.chunk] = rgb
+        for i in range(0, bg_idx.numel(), cfg.chunk):
+            idx = bg_idx[i:i + cfg.chunk]
+            result_rgb[idx] = render_bg(
+                rays_d_all[idx], center, sphere_radius,
+                model, embed_fn, embeddirs_fn, cfg, perturb=False)
 
     return result_rgb.reshape(H, W, 3).cpu().numpy().astype(np.float32)
 
@@ -208,35 +164,52 @@ def query_radiance(model_bundle, origins_np: np.ndarray, dirs_np: np.ndarray,
                    cfg: NerfConfig, *, t_hits_np: np.ndarray | None = None) -> np.ndarray:
     """Query NeRF radiance for secondary rays (indirect irradiance pass).
 
-    origins_np: (N, 3) — ray origins, typically surface point + eps·normal
+    origins_np: (N, 3) — ray origins (surface point + eps·normal)
     dirs_np:    (N, 3) — hemisphere sample directions
-    t_hits_np:  (N,)  — OptiX hit distance; used only when cfg.depth_hint_enabled is True
+    t_hits_np:  (N,)  — OptiX hit distance; rays with t_hit>0 use the mesh window,
+                         rays that miss geometry use the spherical shell from centre.
     Returns:    (N, 3) float32 RGB colour per ray
     """
-    coarse, fine, embed_fn, embeddirs_fn, device, sky = model_bundle
+    model, embed_fn, embeddirs_fn, device, center, sphere_radius = model_bundle
 
     rays_o = torch.tensor(origins_np, device=device, dtype=torch.float32)
     rays_d = torch.tensor(dirs_np,    device=device, dtype=torch.float32)
 
     t_hit = None
-    if t_hits_np is not None and cfg.depth_hint_enabled:
+    if t_hits_np is not None:
         t_hit = torch.tensor(t_hits_np, device=device, dtype=torch.float32)
 
-    # Secondary rays start on the surface — use a small near to not skip nearby geometry
-    secondary_near = 0.01
-
-    coarse.eval()
-    fine.eval()
-    if sky is not None:
-        sky.eval()
+    model.eval()
     results = []
     with torch.no_grad():
         for i in range(0, rays_o.shape[0], cfg.chunk):
-            ro = rays_o[i:i + cfg.chunk]
-            rd = rays_d[i:i + cfg.chunk]
-            td = t_hit[i:i + cfg.chunk] if t_hit is not None else None
-            rgb, _ = render_rays(ro, rd, coarse, fine, embed_fn, embeddirs_fn,
-                                  cfg, near=secondary_near, perturb=False, target_depth=td)
-            results.append(rgb)
+            ro  = rays_o[i:i + cfg.chunk]
+            rd  = rays_d[i:i + cfg.chunk]
+            th  = t_hit[i:i + cfg.chunk] if t_hit is not None else None
+
+            if th is not None:
+                fg_mask = th > 1e-6
+                chunk_rgb = torch.zeros(ro.shape[0], 3, device=device)
+
+                fg_idx = fg_mask.nonzero(as_tuple=True)[0]
+                bg_idx = (~fg_mask).nonzero(as_tuple=True)[0]
+
+                if fg_idx.numel() > 0:
+                    chunk_rgb[fg_idx] = render_rays_depth(
+                        ro[fg_idx], rd[fg_idx],
+                        model, embed_fn, embeddirs_fn, cfg,
+                        th[fg_idx], near=0.01, perturb=False)
+
+                if bg_idx.numel() > 0:
+                    chunk_rgb[bg_idx] = render_bg(
+                        rd[bg_idx], center, sphere_radius,
+                        model, embed_fn, embeddirs_fn, cfg, perturb=False)
+            else:
+                # No hit info: treat all as background
+                chunk_rgb = render_bg(
+                    rd, center, sphere_radius,
+                    model, embed_fn, embeddirs_fn, cfg, perturb=False)
+
+            results.append(chunk_rgb)
 
     return torch.cat(results, 0).cpu().numpy().astype(np.float32)

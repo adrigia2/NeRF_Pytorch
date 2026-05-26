@@ -2,7 +2,7 @@
 # Original file: run_nerf_helpers.py
 # Commit: 63a5a630c9abd62b0f21c08703d0ac2ea7d4b9dd
 # License: MIT
-# Modifications: extracted get_rays_np, sample_pdf; added raw2outputs (ported from run_nerf.py);
+# Modifications: extracted get_rays_np; added raw2outputs (ported from run_nerf.py);
 #   removed ndc_rays (unused for object-centric scenes).
 
 import numpy as np
@@ -29,42 +29,7 @@ def get_rays_np(H, W, K, c2w):
     return rays_o.astype(np.float32), rays_d.astype(np.float32)
 
 
-def sample_pdf(bins, weights, N_samples, det=False):
-    """Hierarchical importance sampling via CDF inversion.
-
-    bins: (N_rays, N_mid) — midpoints between coarse z_vals
-    weights: (N_rays, N_mid) — coarse alpha-compositing weights
-    Returns: (N_rays, N_samples) sampled z values.
-    """
-    weights = weights + 1e-5  # prevent NaNs from zero weights
-    pdf = weights / torch.sum(weights, -1, keepdim=True)
-    cdf = torch.cumsum(pdf, -1)
-    cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)
-
-    if det:
-        u = torch.linspace(0., 1., steps=N_samples, device=bins.device)
-        u = u.expand(list(cdf.shape[:-1]) + [N_samples])
-    else:
-        u = torch.rand(list(cdf.shape[:-1]) + [N_samples], device=bins.device)
-
-    u = u.contiguous()
-    inds = torch.searchsorted(cdf, u, right=True)
-    below = torch.clamp(inds - 1, min=0)
-    above = torch.clamp(inds, max=cdf.shape[-1] - 1)
-    inds_g = torch.stack([below, above], -1)
-
-    matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
-    cdf_g  = torch.gather(cdf.unsqueeze(1).expand(matched_shape),  2, inds_g)
-    bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
-
-    denom = cdf_g[..., 1] - cdf_g[..., 0]
-    denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
-    t = (u - cdf_g[..., 0]) / denom
-    samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
-    return samples
-
-
-def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0.0, white_bkgd=False, bg_color=None):
+def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0.0, bg_color=None):
     """Convert raw NeRF output to RGB, depth and compositing weights.
 
     raw: (..., N_samples, 4) — [RGB, sigma] from network
@@ -97,7 +62,5 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0.0, white_bkgd=False, bg_col
 
     if bg_color is not None:
         rgb_map = rgb_map + (1.0 - acc_map[..., None]) * bg_color
-    elif white_bkgd:
-        rgb_map = rgb_map + (1.0 - acc_map[..., None])
 
     return rgb_map, disp_map, acc_map, weights, depth_map

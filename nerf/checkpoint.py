@@ -7,14 +7,13 @@ import torch
 
 from .config import NerfConfig
 from .encoding import get_embedder
-from .model import NeRF, SkyModel
+from .model import NeRF
 
 
 def _build_models(cfg: NerfConfig, device):
-    """Instantiate coarse + fine NeRF models, their embedders, and the optional sky MLP.
+    """Instantiate the single NeRF model and its embedders.
 
-    Returns (coarse, fine, embed_fn, embeddirs_fn, sky) where sky is None when
-    cfg.train_background is False or use_viewdirs is False.
+    Returns (model, embed_fn, embeddirs_fn).
     """
     embed_fn, input_ch = get_embedder(cfg.multires)
     if cfg.use_viewdirs:
@@ -22,31 +21,24 @@ def _build_models(cfg: NerfConfig, device):
     else:
         embeddirs_fn, input_ch_views = None, 0
 
-    coarse = NeRF(D=cfg.netdepth, W=cfg.netwidth, input_ch=input_ch,
-                  input_ch_views=input_ch_views, skips=list(cfg.skips),
-                  use_viewdirs=cfg.use_viewdirs).to(device)
-    fine   = NeRF(D=cfg.netdepth, W=cfg.netwidth, input_ch=input_ch,
-                  input_ch_views=input_ch_views, skips=list(cfg.skips),
-                  use_viewdirs=cfg.use_viewdirs).to(device)
+    model = NeRF(D=cfg.netdepth, W=cfg.netwidth, input_ch=input_ch,
+                 input_ch_views=input_ch_views, skips=list(cfg.skips),
+                 use_viewdirs=cfg.use_viewdirs).to(device)
 
-    sky = None
-    if cfg.train_background and embeddirs_fn is not None:
-        sky = SkyModel(input_ch_views=input_ch_views,
-                       D=cfg.sky_netdepth, W=cfg.sky_netwidth).to(device)
-
-    return coarse, fine, embed_fn, embeddirs_fn, sky
+    return model, embed_fn, embeddirs_fn
 
 
-def save_checkpoint(path: str, coarse_model, fine_model, optimizer,
-                    iter_done: int, cfg: NerfConfig, sky_model=None) -> None:
+def save_checkpoint(path: str, model, optimizer, iter_done: int, cfg: NerfConfig,
+                    scene_center=None, sphere_radius: float = 0.0) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
+    center_list = scene_center.tolist() if scene_center is not None else [0.0, 0.0, 0.0]
     torch.save({
-        "coarse_state": coarse_model.state_dict(),
-        "fine_state":   fine_model.state_dict(),
-        "sky_state":    sky_model.state_dict() if sky_model is not None else None,
-        "optimizer":    optimizer.state_dict(),
-        "iter_done":    iter_done,
-        "config":       {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)},
+        "model_state":    model.state_dict(),
+        "optimizer":      optimizer.state_dict(),
+        "iter_done":      iter_done,
+        "config":         {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)},
+        "scene_center":   center_list,
+        "sphere_radius":  float(sphere_radius),
     }, path)
 
 
@@ -54,7 +46,7 @@ def load_checkpoint(path: str, device=None):
     """Load a saved NeRF checkpoint.
 
     Returns:
-        model_bundle: (coarse_model, fine_model, embed_fn, embeddirs_fn, device, sky)
+        model_bundle: (model, embed_fn, embeddirs_fn, device, scene_center, sphere_radius)
         cfg: NerfConfig reconstructed from the saved config dict
     """
     if device is None:
@@ -65,14 +57,12 @@ def load_checkpoint(path: str, device=None):
     valid_keys = {f.name for f in dataclasses.fields(NerfConfig)}
     cfg = NerfConfig(**{k: v for k, v in cfg_dict.items() if k in valid_keys})
 
-    coarse, fine, embed_fn, embeddirs_fn, sky = _build_models(cfg, device)
-    coarse.load_state_dict(ckpt["coarse_state"])
-    fine.load_state_dict(ckpt["fine_state"])
-    if sky is not None and ckpt.get("sky_state") is not None:
-        sky.load_state_dict(ckpt["sky_state"])
-    coarse.eval()
-    fine.eval()
-    if sky is not None:
-        sky.eval()
+    model, embed_fn, embeddirs_fn = _build_models(cfg, device)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
 
-    return (coarse, fine, embed_fn, embeddirs_fn, device, sky), cfg
+    center = torch.tensor(ckpt.get("scene_center", [0.0, 0.0, 0.0]),
+                          device=device, dtype=torch.float32)
+    radius = float(ckpt.get("sphere_radius", 0.0))
+
+    return (model, embed_fn, embeddirs_fn, device, center, radius), cfg
