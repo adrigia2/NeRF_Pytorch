@@ -602,6 +602,7 @@ class PipelineConfig:
     nerf_bg_depth_window:      float = 2.0   # finestra bg [R - window, R + window_end]
     nerf_bg_depth_window_end:  float = 2.0
     nerf_bg_depth_window_samples: int = 32
+    nerf_profile_iters: int = 0         # per-fase timing sincronizzato per i primi N iter (0=off)
 
     # Render dei frame di training col NeRF allenato (post-Step 2)
     enable_nerf_render_train_images: bool = False
@@ -867,6 +868,7 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
         bg_depth_window           = cfg.nerf_bg_depth_window,
         bg_depth_window_end       = cfg.nerf_bg_depth_window_end,
         bg_depth_window_samples   = cfg.nerf_bg_depth_window_samples,
+        profile_iters             = cfg.nerf_profile_iters,
     )
 
     print(f"[Step 2] Training NeRF (depth-guided) — {cfg.nerf_num_iters} iter, ckpt → {ckpt}")
@@ -1460,6 +1462,8 @@ if __name__ == "__main__":
         nerf_bg_depth_window           = 0.3,
         nerf_bg_depth_window_end       = 0.3,
         nerf_bg_depth_window_samples   = 8,
+
+        nerf_profile_iters = 500,
 
     )
 
