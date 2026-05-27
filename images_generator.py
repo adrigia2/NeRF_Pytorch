@@ -1402,7 +1402,7 @@ if __name__ == "__main__":
         render = RenderConfig(
             transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-            output_dir      = "output/sworshield_render_nerf_instead_of_gt2",
+            output_dir      = "output/sworshield_render_nerf_instead_of_gt3",
 
             render_depth    = True,
             render_position = False,  # Step 1 produces only depth+mask
@@ -1442,8 +1442,8 @@ if __name__ == "__main__":
 
         ),
 
-        nerf_num_iters     = 100000,
-        nerf_batch_size    = 4096*4,
+        nerf_num_iters     = 50000,
+        nerf_batch_size    = 4096*12,
         nerf_lr            = 5e-4,
         nerf_display_every = 100,
         nerf_seed          = 9458,
@@ -1453,15 +1453,15 @@ if __name__ == "__main__":
 
 
 
-        nerf_depth_window_samples      = 8,
+        nerf_depth_window_samples      = 4,
         nerf_depth_window              = 0.3,
         nerf_depth_window_end          = 0.3,
         nerf_opacity_weight            = 1.0,
         nerf_raw_noise_std             = 1.0,
-        nerf_bg_radius_mult            = 6.0,
+        nerf_bg_radius_mult            = 3.0,
         nerf_bg_depth_window           = 0.3,
         nerf_bg_depth_window_end       = 0.3,
-        nerf_bg_depth_window_samples   = 8,
+        nerf_bg_depth_window_samples   = 4,
 
         nerf_profile_iters = 500,
 

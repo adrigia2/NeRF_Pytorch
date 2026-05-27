@@ -226,7 +226,7 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
                           f"pred=[{_rgb_pred.min():.3f},{_rgb_pred.mean():.3f},{_rgb_pred.max():.3f}]  "
                           f"target=[{_rgb_gt.min():.3f},{_rgb_gt.mean():.3f},{_rgb_gt.max():.3f}]")
 
-            _save_preview(model_bundle, dataset, cfg, out_dir / f"preview_iter_{i+1:06d}.png")
+            _save_preview(model_bundle, dataset, cfg, out_dir / f"preview_iter_{i+1:06d}.exr")
             model.train()
 
     save_checkpoint(ckpt_path, model, optimizer, iter_start + num_iters, cfg,
@@ -235,10 +235,17 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
 
 
 def _save_preview(model_bundle, dataset: NerfDataset, cfg: NerfConfig, path: Path):
-    from PIL import Image
+    import OpenEXR, Imath
     model = model_bundle[0]
     _, _, _, test_pose, test_dep = dataset.get_test_frame()
     model.eval()
     img = render_image(model_bundle, dataset.H, dataset.W, dataset.focal_x, test_pose, cfg,
                        focal_y=dataset.focal_y, target_depth=test_dep)
-    Image.fromarray((np.clip(img, 0, 1) * 255).astype(np.uint8)).save(str(path))
+    img = np.ascontiguousarray(img.astype(np.float32))
+    h, w, _ = img.shape
+    pt = Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
+    header = OpenEXR.Header(w, h)
+    header["channels"] = {"R": pt, "G": pt, "B": pt}
+    f = OpenEXR.OutputFile(str(path), header)
+    f.writePixels({"R": img[..., 0].tobytes(), "G": img[..., 1].tobytes(), "B": img[..., 2].tobytes()})
+    f.close()
