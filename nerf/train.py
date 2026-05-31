@@ -17,6 +17,9 @@ def _rel_mse(pred, target, eps=1e-3):
     """Relative MSE: weights each pixel by its predicted intensity."""
     return (((pred - target) ** 2) / (pred.detach() ** 2 + eps)).mean()
 
+def _mse(pred, target):
+    return ((pred - target) ** 2).mean()
+
 
 def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: str,
           num_iters: int, batch_size: int, lr: float, seed: int,

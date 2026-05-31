@@ -25,7 +25,7 @@ def _run_network(pts, viewdirs, model, embed_fn, embeddirs_fn, chunk):
 
 
 def render_rays_depth(rays_o, rays_d, model, embed_fn, embeddirs_fn, cfg: NerfConfig,
-                      t_hit, *, near=None, far=None, perturb=True, return_acc=False,
+                      t_hit, *, near=None, far=None, perturb=False, return_acc=False,
                       bg_color=None,
                       window=None, window_end=None, n_samples=None):
     """Single-pass render for a batch of rays using a known surface distance t_hit.
@@ -64,7 +64,7 @@ def render_rays_depth(rays_o, rays_d, model, embed_fn, embeddirs_fn, cfg: NerfCo
 
 def render_bg(dirs, center: torch.Tensor, sphere_radius: float,
               model, embed_fn, embeddirs_fn, cfg: NerfConfig,
-              *, perturb=True, return_acc=False):
+              *, perturb=False, return_acc=False):
     """Render background rays as a spherical shell centred at `center`.
 
     Each ray is re-anchored at the scene centre and marched outward:
