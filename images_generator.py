@@ -869,6 +869,7 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
         bg_depth_window_end       = cfg.nerf_bg_depth_window_end,
         bg_depth_window_samples   = cfg.nerf_bg_depth_window_samples,
         profile_iters             = cfg.nerf_profile_iters,
+        use_hdr_activation       = True,
     )
 
     print(f"[Step 2] Training NeRF (depth-guided) — {cfg.nerf_num_iters} iter, ckpt → {ckpt}")
@@ -1402,7 +1403,7 @@ if __name__ == "__main__":
         render = RenderConfig(
             transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-            output_dir      = "output/sworshield_render_no_perturb_rel_mse_high_batch_size",
+            output_dir      = "output/sworshield_render_no_perturb_rel_mse_high_batch_size_exp_fix_only_exponential_and_loss",
 
             render_depth    = True,
             render_position = True,  # Step 1 produces only depth+mask
@@ -1439,6 +1440,7 @@ if __name__ == "__main__":
             apply_scale      = False,
 
             color_texture_image_source = "nerf",  # "nerf" | "gt"
+            
 
         ),
 

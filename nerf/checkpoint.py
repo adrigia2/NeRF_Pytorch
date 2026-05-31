@@ -25,6 +25,10 @@ def _build_models(cfg: NerfConfig, device):
                  input_ch_views=input_ch_views, skips=list(cfg.skips),
                  use_viewdirs=cfg.use_viewdirs).to(device)
 
+    if cfg.use_hdr_activation and cfg.use_viewdirs:
+        with torch.no_grad():
+            torch.nn.init.constant_(model.rgb_linear.bias, cfg.hdr_init_bias)
+
     return model, embed_fn, embeddirs_fn
 
 

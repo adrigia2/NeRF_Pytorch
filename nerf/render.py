@@ -56,7 +56,8 @@ def render_rays_depth(rays_o, rays_d, model, embed_fn, embeddirs_fn, cfg: NerfCo
     pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[:, :, None]
     raw = _run_network(pts, rays_d, model, embed_fn, embeddirs_fn, cfg.chunk)
     rgb, _, acc, _, _ = raw2outputs(raw, z_vals, rays_d, cfg.raw_noise_std,
-                                    bg_color=bg_color)
+                                    bg_color=bg_color,
+                                    hdr_activation=cfg.use_hdr_activation)
     if return_acc:
         return rgb, acc
     return rgb

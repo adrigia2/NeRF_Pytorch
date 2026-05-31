@@ -77,12 +77,8 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
     out_dir.mkdir(parents=True, exist_ok=True)
 
     decay_steps = cfg.lrate_decay * 1000
-    loss_window:        list[torch.Tensor] = []
-    mse_window:         list[torch.Tensor] = []
-    loss_fg_window:     list[torch.Tensor] = []
-    loss_bg_window:     list[torch.Tensor] = []
-    loss_opc_fg_window: list[torch.Tensor] = []
-    loss_opc_bg_window: list[torch.Tensor] = []
+    loss_window: list[torch.Tensor] = []
+    mse_window:  list[torch.Tensor] = []
 
     # ── profiling state ──────────────────────────────────────────────────────
     use_cuda      = device.type == "cuda"
@@ -119,40 +115,41 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
         bg_rays_o, bg_rays_d, bg_rgb = bg
         n_fg = fg_rgb.shape[0]
         n_bg = bg_rgb.shape[0]
-        loss = torch.tensor(0.0, device=device)
-        loss_fg = loss_bg = loss_opc_fg = loss_opc_bg = None
+        rgb_parts: list[torch.Tensor] = []
+        gt_parts:  list[torch.Tensor] = []
 
-        # ── fg render + loss ─────────────────────────────────────────────────
+        # ── fg render ────────────────────────────────────────────────────────
         if _profiling: _sync(); _t0 = time.perf_counter()
         if n_fg > 0:
-            rgb_fg, acc_fg = render_rays_depth(
+            rgb_fg = render_rays_depth(
                 fg_rays_o, fg_rays_d, model, embed_fn, embeddirs_fn, cfg,
-                fg_depth, perturb=True, return_acc=True)
-            loss_fg     = _rel_mse(rgb_fg, fg_rgb)
-            loss_opc_fg = ((1.0 - acc_fg) ** 2).mean()
-            loss = loss + loss_fg + cfg.opacity_weight * loss_opc_fg
+                fg_depth, perturb=True)
+            rgb_parts.append(rgb_fg)
+            gt_parts.append(fg_rgb)
         if _profiling: _sync(); _prof["fg"] += time.perf_counter() - _t0
 
-        # ── bg render + loss ─────────────────────────────────────────────────
+        # ── bg render ────────────────────────────────────────────────────────
         if _profiling: _sync(); _t0 = time.perf_counter()
         if n_bg > 0:
-            rgb_bg, acc_bg = render_bg(
+            rgb_bg = render_bg(
                 bg_rays_d, center, sphere_radius,
                 model, embed_fn, embeddirs_fn, cfg,
-                perturb=True, return_acc=True)
-            loss_bg     = _rel_mse(rgb_bg, bg_rgb)
-            loss_opc_bg = ((1.0 - acc_bg) ** 2).mean()
-            loss = loss + loss_bg + cfg.opacity_weight * loss_opc_bg
+                perturb=True)
+            rgb_parts.append(rgb_bg)
+            gt_parts.append(bg_rgb)
         if _profiling: _sync(); _prof["bg"] += time.perf_counter() - _t0
 
-        # ── per-ray MSE for PSNR (no grad) ───────────────────────────────────
+        # ── loss unico ───────────────────────────────────────────────────────
+        rgb_pred = torch.cat(rgb_parts, dim=0)
+        rgb_gt   = torch.cat(gt_parts,  dim=0)
+        if cfg.use_hdr_activation:
+            loss = F.l1_loss(rgb_pred, rgb_gt)
+        else:
+            loss = _rel_mse(rgb_pred, rgb_gt)
+
+        # ── per-ray MSE per PSNR (no grad) ───────────────────────────────────
         with torch.no_grad():
-            mse_num = torch.tensor(0.0, device=device)
-            if n_fg > 0:
-                mse_num = mse_num + F.mse_loss(rgb_fg, fg_rgb) * n_fg
-            if n_bg > 0:
-                mse_num = mse_num + F.mse_loss(rgb_bg, bg_rgb) * n_bg
-            mse_val = mse_num / max(n_fg + n_bg, 1)
+            mse_val = F.mse_loss(rgb_pred, rgb_gt)
 
         # ── backward ─────────────────────────────────────────────────────────
         if _profiling: _sync(); _t0 = time.perf_counter()
@@ -168,10 +165,6 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
         # ── accumulators ──────────────────────────────────────────────────────
         loss_window.append(loss.detach())
         mse_window.append(mse_val.detach())
-        if loss_fg      is not None: loss_fg_window.append(loss_fg.detach())
-        if loss_bg      is not None: loss_bg_window.append(loss_bg.detach())
-        if loss_opc_fg  is not None: loss_opc_fg_window.append(loss_opc_fg.detach())
-        if loss_opc_bg  is not None: loss_opc_bg_window.append(loss_opc_bg.detach())
 
         _iter_times.append(time.perf_counter() - _t_iter)
         if _profiling:
@@ -209,14 +202,9 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
             win_times   = _iter_times[-display_every:]
             iters_per_s = len(win_times) / max(sum(win_times), 1e-9)
             rays_per_s  = batch_size * iters_per_s
-            print(f"  iter {i + 1}  rel_loss={recent_loss:.4f}  PSNR≈{psnr:.2f} dB  "
+            loss_name = "l1_loss" if cfg.use_hdr_activation else "rel_loss"
+            print(f"  iter {i + 1}  {loss_name}={recent_loss:.4f}  PSNR≈{psnr:.2f} dB  "
                   f"lr={new_lr:.2e}  {iters_per_s:.1f} it/s  {rays_per_s/1e3:.0f}k rays/s")
-
-            def _mean(lst): return torch.stack(lst[-display_every:]).mean().item() if lst else float("nan")
-            print(f"    [diag] loss_fg={_mean(loss_fg_window):.4f}  "
-                  f"opc_fg={_mean(loss_opc_fg_window):.4f}  "
-                  f"loss_bg={_mean(loss_bg_window):.4f}  "
-                  f"opc_bg={_mean(loss_opc_bg_window):.4f}")
 
             with torch.no_grad():
                 fg_probe, _ = dataset.sample_natural(min(512, batch_size))

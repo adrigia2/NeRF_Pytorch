@@ -20,6 +20,14 @@ class NerfConfig:
     far: float = 20.0          # overwritten at runtime from sphere radius
     perturb: bool = True
     raw_noise_std: float = 0.0
+    # HDR mode: torch.exp activation on RGB + L1 loss instead of softplus + rel_MSE.
+    # Better fidelity on highlights; mirrors NeILFMLP/pbrnerf.
+    # Note: checkpoints saved with use_hdr_activation=False are NOT compatible with True (different weight scales).
+    use_hdr_activation: bool = False
+    # Initial bias of rgb_linear when use_hdr_activation=True.
+    # exp(hdr_init_bias) ≈ rgb output at iter 0; choose ~log(scene_target_mean).
+    # -3 → exp(-3)≈0.05; -5 → exp(-5)≈0.007. Required to avoid exp dead-zone collapse.
+    hdr_init_bias: float = -3.0
 
     # Rendering chunking
     chunk: int = 1024 * 32
@@ -32,7 +40,7 @@ class NerfConfig:
     depth_window: float = 0.5        # samples span [t_hit - window, t_hit + window_end]
     depth_window_end: float = 0.5
     depth_window_samples: int = 32
-    opacity_weight: float = 1.0      # weight of opacity loss for both fg and bg
+    opacity_weight: float = 1.0      # deprecated: no longer used (unified loss, no opacity term)
 
     # Background sphere-shell window (origin = scene centre, t_hit = sphere radius)
     bg_radius_mult: float = 6.0      # sphere radius = bg_radius_mult × max bbox side
