@@ -93,8 +93,53 @@ def render_bg(dirs, center: torch.Tensor, sphere_radius: float,
         return_acc=return_acc,
         window=cfg.bg_depth_window,
         window_end=cfg.bg_depth_window_end,
-        n_samples=cfg.bg_depth_window_samples,
+        n_samples=cfg.depth_window_samples,
     )
+
+
+def render_unified(rays_o, rays_d, depths, in_mask, model, embed_fn, embeddirs_fn,
+                   cfg: NerfConfig, center: torch.Tensor, sphere_radius: float,
+                   *, perturb=False, return_acc=False):
+    """Single fixed-shape render for both fg (mesh hit) and bg (sphere shell) rays.
+
+    in_mask=True  → fg: use ray origin + t_hit from depths, mesh depth window.
+    in_mask=False → bg: use scene center as origin, normalized direction, t_hit=sphere_radius.
+    All intermediate tensors have shape (N, depth_window_samples, ...) — constant across iters.
+    Requires cfg.depth_window_samples for both fg and bg (use the same value).
+    """
+    device = rays_o.device
+    N = rays_o.shape[0]
+    n_s = cfg.depth_window_samples
+    sphere_r = torch.full((N,), sphere_radius, device=device, dtype=torch.float32)
+
+    rays_d_n   = F.normalize(rays_d, dim=-1)
+    eff_origin = torch.where(in_mask[:, None], rays_o, center.unsqueeze(0).expand(N, 3))
+    eff_dir    = torch.where(in_mask[:, None], rays_d, rays_d_n)
+    eff_t_hit  = torch.where(in_mask, depths, sphere_r)
+
+    win_lo = torch.where(in_mask,
+                         torch.full_like(depths, cfg.depth_window),
+                         torch.full_like(depths, cfg.bg_depth_window))
+    win_hi = torch.where(in_mask,
+                         torch.full_like(depths, cfg.depth_window_end),
+                         torch.full_like(depths, cfg.bg_depth_window_end))
+
+    t_low  = (eff_t_hit - win_lo).clamp(min=cfg.near)
+    t_high = (eff_t_hit + win_hi).clamp(max=cfg.far)
+
+    if perturb:
+        u = torch.rand(N, n_s, device=device)
+    else:
+        u = torch.linspace(0., 1., n_s, device=device).expand(N, n_s)
+
+    z_vals, _ = torch.sort(t_low[:, None] + (t_high - t_low)[:, None] * u, dim=-1)
+    pts = eff_origin[:, None, :] + eff_dir[:, None, :] * z_vals[:, :, None]
+    raw = _run_network(pts, eff_dir, model, embed_fn, embeddirs_fn, cfg.chunk)
+    rgb, _, acc, _, _ = raw2outputs(raw, z_vals, eff_dir, cfg.raw_noise_std,
+                                    hdr_activation=cfg.use_hdr_activation)
+    if return_acc:
+        return rgb, acc
+    return rgb
 
 
 def render_image(model_bundle, H: int, W: int, focal_x: float, pose_4x4,

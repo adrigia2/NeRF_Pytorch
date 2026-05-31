@@ -46,7 +46,5 @@ class NerfConfig:
     bg_radius_mult: float = 6.0      # sphere radius = bg_radius_mult × max bbox side
     bg_depth_window: float = 2.0     # wider window than mesh (shell is far away)
     bg_depth_window_end: float = 2.0
-    bg_depth_window_samples: int = 32
-
     # Profiling: per-phase synchronized timing for the first N iters (0 = off)
     profile_iters: int = 0

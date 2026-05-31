@@ -601,7 +601,6 @@ class PipelineConfig:
     nerf_bg_radius_mult:       float = 6.0   # raggio sfera bg = bg_radius_mult × max_side
     nerf_bg_depth_window:      float = 2.0   # finestra bg [R - window, R + window_end]
     nerf_bg_depth_window_end:  float = 2.0
-    nerf_bg_depth_window_samples: int = 32
     nerf_profile_iters: int = 0         # per-fase timing sincronizzato per i primi N iter (0=off)
 
     # Render dei frame di training col NeRF allenato (post-Step 2)
@@ -867,7 +866,6 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
         bg_radius_mult            = cfg.nerf_bg_radius_mult,
         bg_depth_window           = cfg.nerf_bg_depth_window,
         bg_depth_window_end       = cfg.nerf_bg_depth_window_end,
-        bg_depth_window_samples   = cfg.nerf_bg_depth_window_samples,
         profile_iters             = cfg.nerf_profile_iters,
         use_hdr_activation       = False,
     )
@@ -1377,6 +1375,15 @@ def run_pipeline(cfg: PipelineConfig) -> dict:
             "Attivare run_step2=True oppure fornire nerf_ckpt_path valido."
         )
 
+    # Libera la VRAM del training NeRF prima che OptiX allochi i buffer Step 3
+    import gc
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
     if cfg.run_step3:
         if cfg.render.precompute_indirect and not cfg.render.indirect_nerf_cache_path:
             cfg.render.indirect_nerf_cache_path = str(ckpt_path)
@@ -1403,7 +1410,7 @@ if __name__ == "__main__":
         render = RenderConfig(
             transforms_path = f"{REPO}/Scenes/TableAndOther/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/TableAndOther/Models/TableAndOther.obj",
-            output_dir      = "D:/tesi_output/tableandother_render_no_perturb_rel_mse_high_batch_size_exp_fix_only_exponential_and_loss",
+            output_dir      = "D:/tesi_output/tableandother_render_no_perturb_rel_mse_high_batch_size_no_exponential",
 
             render_depth    = True,
             render_position = True,  # Step 1 produces only depth+mask
@@ -1439,12 +1446,12 @@ if __name__ == "__main__":
             ium_texture_size = [512, 512],
             apply_scale      = False,
 
-            color_texture_image_source = "nerf",  # "nerf" | "gt"
+            color_texture_image_source = "gt",  # "nerf" | "gt"
             
 
         ),
 
-        nerf_num_iters     = 5000,
+        nerf_num_iters     = 20000,
         nerf_batch_size    = 4096*24,
         nerf_lr            = 5e-4,
         nerf_display_every = 100,
@@ -1463,7 +1470,6 @@ if __name__ == "__main__":
         nerf_bg_radius_mult            = 3.0,
         nerf_bg_depth_window           = 0.1,
         nerf_bg_depth_window_end       = 0.1,
-        nerf_bg_depth_window_samples   = 4,
 
         nerf_profile_iters = 0,
 

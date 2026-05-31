@@ -185,21 +185,17 @@ class NerfDataset:
                 and self._bg_idx.numel() > 0)
 
     def sample_natural(self, batch_size: int):
-        """Uniform sample over all rays, split by depth into fg/bg (natural ratio).
+        """Uniform sample over all rays. Returns a single fixed-shape batch.
 
-        Unlike sample_split, the fg/bg proportion mirrors the dataset distribution
-        (~5% fg for a masked object). Each call may yield a different ratio.
-        Returns fg=(rays_o, rays_d, rgb, depth), bg=(rays_o, rays_d, rgb).
-        Either group may be empty for small batch sizes.
+        Returns (rays_o, rays_d, rgb, depths, in_mask) all of shape (batch_size, ...).
+        in_mask is True for foreground rays (mesh hit, depth > 0).
+        depths is 0 for background rays.
         """
-        idxs = torch.randint(0, self._n_rays, (batch_size,), device=self.device)
-        depths = self._depths[idxs]
-        fg_mask = depths > 1e-6
-        fi = idxs[fg_mask]
-        bi = idxs[~fg_mask]
-        fg = (self._rays_o[fi], self._rays_d[fi], self._rgb[fi], depths[fg_mask])
-        bg = (self._rays_o[bi], self._rays_d[bi], self._rgb[bi])
-        return fg, bg
+        idxs    = torch.randint(0, self._n_rays, (batch_size,), device=self.device)
+        depths  = self._depths[idxs]
+        in_mask = depths > 1e-6
+        return (self._rays_o[idxs], self._rays_d[idxs],
+                self._rgb[idxs], depths, in_mask)
 
     def get_test_frame(self):
         """Returns (rays_o_np, rays_d_np, rgb_np, pose_3x4, dep_hw) for the held-out view."""

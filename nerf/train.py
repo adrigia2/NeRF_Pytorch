@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +11,7 @@ import torch.nn.functional as F
 from .checkpoint import _build_models, save_checkpoint
 from .config import NerfConfig
 from .dataset import NerfDataset
-from .render import render_bg, render_image, render_rays_depth
+from .render import render_image, render_rays_depth, render_unified
 
 
 def _rel_mse(pred, target, eps=1e-3):
@@ -26,9 +27,7 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
           display_every: int) -> None:
     """Train a single-network depth-guided NeRF from transforms_extended.json.
 
-    Foreground rays (mesh hit) use render_rays_depth with the mesh window.
-    Background rays use render_bg (spherical shell anchored at scene centre).
-    Both branches apply an opacity loss to encourage opaque surfaces.
+    Uses render_unified with a single fixed-shape batch (fg+bg together via in_mask).
     Saves a checkpoint to ckpt_path; resumes if it already exists.
     """
     torch.manual_seed(seed)
@@ -77,15 +76,15 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
     out_dir.mkdir(parents=True, exist_ok=True)
 
     decay_steps = cfg.lrate_decay * 1000
-    loss_window: list[torch.Tensor] = []
-    mse_window:  list[torch.Tensor] = []
+    loss_window: deque[torch.Tensor] = deque(maxlen=display_every)
+    mse_window:  deque[torch.Tensor] = deque(maxlen=display_every)
 
     # ── profiling state ──────────────────────────────────────────────────────
     use_cuda      = device.type == "cuda"
     _prof_active  = cfg.profile_iters > 0
-    _prof         = {"sample": 0.0, "fg": 0.0, "bg": 0.0, "bwd": 0.0, "opt": 0.0}
+    _prof         = {"sample": 0.0, "render": 0.0, "bwd": 0.0, "opt": 0.0}
     _prof_n       = 0
-    _iter_times:  list[float] = []      # wall time per iter (no extra sync)
+    _iter_times:  deque[float] = deque(maxlen=display_every)
 
     if _prof_active:
         dev_name = torch.cuda.get_device_name(0) if use_cuda else "CPU"
@@ -106,42 +105,20 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
         for pg in optimizer.param_groups:
             pg["lr"] = new_lr
 
-        # ── sample ──────────────────────────────────────────────────────────
+        # ── sample (batch unificato, shape fissa) ───────────────────────────
         if _profiling: _sync(); _t0 = time.perf_counter()
-        fg, bg = dataset.sample_natural(batch_size)
+        rays_o, rays_d, rgb_gt, depths, in_mask = dataset.sample_natural(batch_size)
         if _profiling: _sync(); _prof["sample"] += time.perf_counter() - _t0
 
-        fg_rays_o, fg_rays_d, fg_rgb, fg_depth = fg
-        bg_rays_o, bg_rays_d, bg_rgb = bg
-        n_fg = fg_rgb.shape[0]
-        n_bg = bg_rgb.shape[0]
-        rgb_parts: list[torch.Tensor] = []
-        gt_parts:  list[torch.Tensor] = []
-
-        # ── fg render ────────────────────────────────────────────────────────
+        # ── render unificato fg+bg ───────────────────────────────────────────
         if _profiling: _sync(); _t0 = time.perf_counter()
-        if n_fg > 0:
-            rgb_fg = render_rays_depth(
-                fg_rays_o, fg_rays_d, model, embed_fn, embeddirs_fn, cfg,
-                fg_depth, perturb=True)
-            rgb_parts.append(rgb_fg)
-            gt_parts.append(fg_rgb)
-        if _profiling: _sync(); _prof["fg"] += time.perf_counter() - _t0
+        rgb_pred = render_unified(
+            rays_o, rays_d, depths, in_mask,
+            model, embed_fn, embeddirs_fn, cfg, center, sphere_radius,
+            perturb=True)
+        if _profiling: _sync(); _prof["render"] += time.perf_counter() - _t0
 
-        # ── bg render ────────────────────────────────────────────────────────
-        if _profiling: _sync(); _t0 = time.perf_counter()
-        if n_bg > 0:
-            rgb_bg = render_bg(
-                bg_rays_d, center, sphere_radius,
-                model, embed_fn, embeddirs_fn, cfg,
-                perturb=True)
-            rgb_parts.append(rgb_bg)
-            gt_parts.append(bg_rgb)
-        if _profiling: _sync(); _prof["bg"] += time.perf_counter() - _t0
-
-        # ── loss unico ───────────────────────────────────────────────────────
-        rgb_pred = torch.cat(rgb_parts, dim=0)
-        rgb_gt   = torch.cat(gt_parts,  dim=0)
+        # ── loss ─────────────────────────────────────────────────────────────
         if cfg.use_hdr_activation:
             loss = F.l1_loss(rgb_pred, rgb_gt)
         else:
@@ -175,9 +152,8 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
             total_s   = sum(_iter_times[:_prof_n])
             total_syn = sum(_prof.values())
             rays_s    = batch_size * _prof_n / max(total_s, 1e-9)
-            fg_samp   = cfg.depth_window_samples
-            bg_samp   = cfg.bg_depth_window_samples
-            pts_s     = (n_fg * fg_samp + n_bg * bg_samp) * _prof_n / max(total_s, 1e-9)
+            n_samp    = cfg.depth_window_samples
+            pts_s     = batch_size * n_samp * _prof_n / max(total_s, 1e-9)
             if use_cuda:
                 mem_mb = torch.cuda.max_memory_allocated(device) / 1024**2
                 print(f"  [prof] peak GPU mem: {mem_mb:.0f} MB")
@@ -185,7 +161,7 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
                   f"iter={1000*total_s/_prof_n:.2f} ms  "
                   f"({1000*total_syn/_prof_n:.2f} ms with sync)")
             print(f"  [prof]  rays/s={rays_s:.0f}  pts/s={pts_s:.0f}  "
-                  f"(fg={n_fg} × {fg_samp}  bg={n_bg} × {bg_samp})")
+                  f"(batch={batch_size} × {n_samp} samples)")
             hdr = f"  [prof]  {'phase':<8}  {'ms/iter':>8}  {'%':>6}"
             print(hdr)
             for k, v in _prof.items():
@@ -195,11 +171,11 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
 
         # ── display ───────────────────────────────────────────────────────────
         if (i + 1) % display_every == 0 or i == iter_start + num_iters - 1:
-            recent_loss = torch.stack(loss_window[-display_every:]).mean().item()
-            recent_mse  = torch.stack(mse_window[-display_every:]).mean().item()
+            recent_loss = torch.stack(list(loss_window)).mean().item()
+            recent_mse  = torch.stack(list(mse_window)).mean().item()
             psnr = -10.0 * np.log10(recent_mse + 1e-10)
 
-            win_times   = _iter_times[-display_every:]
+            win_times   = list(_iter_times)
             iters_per_s = len(win_times) / max(sum(win_times), 1e-9)
             rays_per_s  = batch_size * iters_per_s
             loss_name = "l1_loss" if cfg.use_hdr_activation else "rel_loss"
@@ -207,17 +183,19 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
                   f"lr={new_lr:.2e}  {iters_per_s:.1f} it/s  {rays_per_s/1e3:.0f}k rays/s")
 
             with torch.no_grad():
-                fg_probe, _ = dataset.sample_natural(min(512, batch_size))
-                _ro, _rd, _rgb_gt, _dep = fg_probe
-                if _rgb_gt.shape[0] > 0:
-                    _rgb_pred, _acc = render_rays_depth(
-                        _ro, _rd, model, embed_fn, embeddirs_fn, cfg,
-                        _dep, perturb=False, return_acc=True)
-                    print(f"    [diag] acc_fg={_acc.mean():.4f}  "
-                          f"pred=[{_rgb_pred.min():.3f},{_rgb_pred.mean():.3f},{_rgb_pred.max():.3f}]  "
-                          f"target=[{_rgb_gt.min():.3f},{_rgb_gt.mean():.3f},{_rgb_gt.max():.3f}]")
+                _ro, _rd, _rgb_gt, _dep, _msk = dataset.sample_natural(min(512, batch_size))
+                _rgb_pred, _acc = render_unified(
+                    _ro, _rd, _dep, _msk,
+                    model, embed_fn, embeddirs_fn, cfg, center, sphere_radius,
+                    perturb=False, return_acc=True)
+                acc_fg = _acc[_msk].mean() if _msk.any() else _acc.mean()
+                print(f"    [diag] acc_fg={acc_fg:.4f}  "
+                      f"pred=[{_rgb_pred.min():.3f},{_rgb_pred.mean():.3f},{_rgb_pred.max():.3f}]  "
+                      f"target=[{_rgb_gt.min():.3f},{_rgb_gt.mean():.3f},{_rgb_gt.max():.3f}]")
 
             _save_preview(model_bundle, dataset, cfg, out_dir / f"preview_iter_{i+1:06d}.exr")
+            if use_cuda:
+                torch.cuda.empty_cache()
             model.train()
 
     save_checkpoint(ckpt_path, model, optimizer, iter_start + num_iters, cfg,
