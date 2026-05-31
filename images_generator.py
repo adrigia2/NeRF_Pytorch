@@ -869,7 +869,7 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
         bg_depth_window_end       = cfg.nerf_bg_depth_window_end,
         bg_depth_window_samples   = cfg.nerf_bg_depth_window_samples,
         profile_iters             = cfg.nerf_profile_iters,
-        use_hdr_activation       = True,
+        use_hdr_activation       = False,
     )
 
     print(f"[Step 2] Training NeRF (depth-guided) — {cfg.nerf_num_iters} iter, ckpt → {ckpt}")
@@ -1401,9 +1401,9 @@ if __name__ == "__main__":
 
 
         render = RenderConfig(
-            transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
-            model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-            output_dir      = "output/sworshield_render_no_perturb_rel_mse_high_batch_size_exp_fix_only_exponential_and_loss",
+            transforms_path = f"{REPO}/Scenes/TableAndOther/NerfOpenEXR/transforms.json",
+            model_path      = f"{REPO}/Scenes/TableAndOther/Models/TableAndOther.obj",
+            output_dir      = "D:/tesi_output/tableandother_render_no_perturb_rel_mse_high_batch_size_exp_fix_only_exponential_and_loss",
 
             render_depth    = True,
             render_position = True,  # Step 1 produces only depth+mask
@@ -1417,7 +1417,7 @@ if __name__ == "__main__":
 
             render_irradiance      = True,
             irradiance_format      = ImageFormat.OPENEXR,
-            skybox_path            = f"{REPO}/Scenes/SwordShield/Blender/assets/hdrs/clouds-sunshine_b963efc0-83f3-4957-8725-34f73b8744ff/clouds-sunshine_2K_09c69240-8e00-4b23-896f-fcde6fd514cc.exr",
+            skybox_path            = f"{REPO}/Scenes/TableAndOther/Blender/assets/hdri/pav_studio_03_4k.exr",
             skybox_size            = [1024, 512],
             irradiance_sample_side = 512,
 
