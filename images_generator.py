@@ -780,23 +780,41 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
             print("[Step 1] ⚠  max = 0, normalizzazione disabilitata per questa run.")
             norm_divisor = None
 
+    hist_dir = images_out_dir / "histograms"
+    hist_edges: np.ndarray | None = None
+    hist_counts: np.ndarray | None = None   # shape (256, 3)
+
     for idx, frame in enumerate(tf.frames):
         print(f"\n[Step 1] Frame {idx + 1}/{len(tf.frames)}: {frame.stem}")
 
         src_image = Path(frame.file_path)
+        arr: np.ndarray | None = None
         if norm_divisor is not None:
             dst_image = images_out_dir / (src_image.stem + ".exr")
             if src_image.exists():
-                arr = _load_image_hw3_native(str(src_image)) / norm_divisor
-                get_writer(ImageFormat.OPENEXR).write(arr.astype(np.float32), str(dst_image))
+                arr = (_load_image_hw3_native(str(src_image)) / norm_divisor).astype(np.float32)
+                get_writer(ImageFormat.OPENEXR).write(arr, str(dst_image))
             else:
                 print(f"    ⚠  Immagine non trovata, skip: {src_image}")
         else:
             dst_image = images_out_dir / src_image.name
             if src_image.exists():
                 shutil.copy2(src_image, dst_image)
+                arr = _load_image_hw3_native(str(dst_image)).astype(np.float32)
             else:
                 print(f"    ⚠  Immagine non trovata, skip copia: {src_image}")
+
+        if arr is not None:
+            _write_rgb_histogram(arr, str(hist_dir / f"{src_image.stem}_hist.png"),
+                                 f"frame {idx} — {src_image.stem}")
+            if hist_edges is None:
+                xmax = max(float(np.percentile(arr, 99.5)), 1e-6)
+                hist_edges = np.linspace(0.0, xmax, 257)
+                hist_counts = np.zeros((256, 3), dtype=np.int64)
+            flat = arr.reshape(-1, 3)
+            for ch in range(3):
+                c, _ = np.histogram(flat[:, ch], bins=hist_edges)
+                hist_counts[:, ch] += c
 
         camera = _camera_from_matrix(frame.transform_matrix, intr.camera_angle_y, [W, H], optix_mod)
         depth_gen.set_camera(camera)
@@ -823,6 +841,11 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
         frame_entry["mask_path"] = _as_relative_to(out_path, json_dir_str)
 
         output_frames.append(frame_entry)
+
+    if hist_counts is not None:
+        _write_rgb_histogram_from_counts(hist_counts, hist_edges,
+                                         str(hist_dir / "all_frames_hist.png"),
+                                         "All frames — RGB histogram")
 
     output_json: dict = {**tf.raw}
     output_json["fl_x"] = float(intr.fl_x)
@@ -909,6 +932,91 @@ def _write_sxs_comparison(gt_np: np.ndarray, pred_np: np.ndarray,
     draw.text((W + W // 4,   4), f"Pred  PSNR={psnr:.2f} dB", fill=(220, 220, 220))
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     img.save(path)
+
+
+_RGB_HIST_COLORS = [("R", "#E63946"), ("G", "#2A9D8F"), ("B", "#457B9D")]
+
+
+def _write_rgb_histogram(arr_hw3: np.ndarray, path: str, title: str) -> None:
+    """Save RGB histogram of a (H, W, 3) float32 array as PNG. HDR-aware (no clamp to 1)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("    ⚠  matplotlib non disponibile: istogramma saltato")
+        return
+    flat = arr_hw3.reshape(-1, 3).astype(np.float32)
+    xmax = max(float(np.percentile(flat, 99.5)), 1e-6)
+    edges = np.linspace(0.0, xmax, 257)
+    fig, ax = plt.subplots(figsize=(7, 3.5))
+    for ch, (label, color) in enumerate(_RGB_HIST_COLORS):
+        counts, _ = np.histogram(flat[:, ch], bins=edges)
+        ax.stairs(counts, edges, fill=True, alpha=0.55, color=color, label=label)
+    ax.set_xlabel("pixel value (linear HDR)")
+    ax.set_ylabel("pixel count")
+    ax.set_title(title)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
+def _write_rgb_histogram_from_counts(counts_n3: np.ndarray, edges: np.ndarray,
+                                      path: str, title: str) -> None:
+    """Plot RGB histogram from pre-accumulated counts (N_bins, 3) and bin edges (N_bins+1,)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    fig, ax = plt.subplots(figsize=(7, 3.5))
+    for ch, (label, color) in enumerate(_RGB_HIST_COLORS):
+        ax.stairs(counts_n3[:, ch], edges, fill=True, alpha=0.55, color=color, label=label)
+    ax.set_xlabel("pixel value (linear HDR)")
+    ax.set_ylabel("pixel count")
+    ax.set_title(title)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
+def _write_rgb_hist_comparison(pred_hw3: np.ndarray, gt_hw3: np.ndarray,
+                                path: str, stem: str) -> None:
+    """Save a two-panel PNG: pred histogram (top) and GT histogram (bottom), shared x axis."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("    ⚠  matplotlib non disponibile: istogramma saltato")
+        return
+    pred_flat = pred_hw3.reshape(-1, 3).astype(np.float32)
+    gt_flat   = gt_hw3.reshape(-1, 3).astype(np.float32)
+    xmax = max(float(np.percentile(pred_flat, 99.5)),
+               float(np.percentile(gt_flat, 99.5)), 1e-6)
+    edges = np.linspace(0.0, xmax, 257)
+    fig, (ax_pred, ax_gt) = plt.subplots(2, 1, figsize=(7, 6), sharex=True)
+    for ch, (label, color) in enumerate(_RGB_HIST_COLORS):
+        c_pred, _ = np.histogram(pred_flat[:, ch], bins=edges)
+        ax_pred.stairs(c_pred, edges, fill=True, alpha=0.55, color=color, label=label)
+        c_gt, _ = np.histogram(gt_flat[:, ch], bins=edges)
+        ax_gt.stairs(c_gt, edges, fill=True, alpha=0.55, color=color, label=label)
+    ax_pred.set_ylabel("pixel count")
+    ax_pred.set_title(f"{stem} — Pred")
+    ax_pred.legend(loc="upper right")
+    ax_gt.set_xlabel("pixel value (linear HDR)")
+    ax_gt.set_ylabel("pixel count")
+    ax_gt.set_title(f"{stem} — GT")
+    ax_gt.legend(loc="upper right")
+    fig.tight_layout()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
 
 
 def _load_depth_np(path: str) -> np.ndarray | None:
@@ -1072,16 +1180,9 @@ def _step2b_render_train_images(cfg: PipelineConfig,
         _write_sxs_comparison(gt_np, pred_np, psnr,
                                (base / f"{stem}_sxs.png").as_posix(), f"frame {i}")
 
-        # Error-by-luminance plots: full image + figure only (mask)
-        _write_error_luminance_plot(
-            gt_np, pred_np, None,
-            (base / f"{stem}_errplot_general.png").as_posix(),
-            f"frame {i} — error by luminance (full image)")
-        if mask_bool is not None and mask_bool.shape == gt_np.shape[:2]:
-            _write_error_luminance_plot(
-                gt_np, pred_np, mask_bool,
-                (base / f"{stem}_errplot_figure.png").as_posix(),
-                f"frame {i} — error by luminance (figure)")
+        # RGB histogram comparison: pred (top) vs GT (bottom)
+        _write_rgb_hist_comparison(pred_np, gt_np,
+                                   (base / f"{stem}_rgb_hist.png").as_posix(), stem)
 
         if (i + 1) % max(1, len(tf.frames) // 5) == 0 or i == len(tf.frames) - 1:
             print(f"  [Step 2b] {i+1}/{len(tf.frames)}  PSNR={psnr:.2f} dB")
@@ -1410,7 +1511,7 @@ if __name__ == "__main__":
         render = RenderConfig(
             transforms_path = f"{REPO}/Scenes/TableAndOther/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/TableAndOther/Models/TableAndOther.obj",
-            output_dir      = "D:/tesi_output/tableandother_render_no_perturb_rel_mse_high_batch_size_no_exponential",
+            output_dir      = "D:/tesi_output/tableandother_render_no_perturb_rel_mse_high_batch_size_no_exponential_check_normal",
 
             render_depth    = True,
             render_position = True,  # Step 1 produces only depth+mask
@@ -1451,14 +1552,14 @@ if __name__ == "__main__":
 
         ),
 
-        nerf_num_iters     = 20000,
+        nerf_num_iters     = 30000,
         nerf_batch_size    = 4096*24,
         nerf_lr            = 5e-4,
         nerf_display_every = 100,
         nerf_seed          = 9458,
 
         enable_nerf_render_train_images = True,
-        nerf_interactive_loop           = True,
+        nerf_interactive_loop           = False,
 
 
 
