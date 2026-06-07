@@ -427,12 +427,67 @@ def _get_or_create_default_material() -> bpy.types.Material:
 UV_LAYER_NAME = "BakeUV"
 
 
-def _smart_uv_project(obj: bpy.types.Object, view_layer: bpy.types.ViewLayer, cfg: BakeConfig) -> str:
-    """Crea un nuovo UV layer dedicato (non sovrascrive eventuali UV originali),
-    lo rende attivo e vi proietta un atlas non sovrapposto via Smart UV Project."""
+def _prepare_bake_uv_per_object(obj: bpy.types.Object, view_layer: bpy.types.ViewLayer, cfg: BakeConfig) -> None:
+    """Prepara il layer BakeUV su un singolo oggetto duplicato, prima del join.
+
+    - Se l'oggetto ha già UV: copia la UV attiva in BakeUV (preserva la
+      proiezione originale — niente nuovi tagli/isole).
+    - Se l'oggetto non ha UV (primitivo): crea BakeUV via Smart UV Project
+      sull'oggetto singolo (molto più controllabile che sull'intera mesh joinata).
+
+    In entrambi i casi BakeUV viene impostato come active e active_render così,
+    dopo il join, il layer BakeUV della mesh unita conterrà già i dati corretti
+    per ciascun oggetto e serve solo un Pack Islands finale.
+    """
     mesh = obj.data
-    uv_layer = mesh.uv_layers.new(name=UV_LAYER_NAME)
-    mesh.uv_layers.active = uv_layer
+
+    if mesh.uv_layers:
+        # Oggetto con UV: copia la UV attiva in BakeUV.
+        # active_render resta sull'UV originale → le texture del materiale vengono
+        # campionate con la UV originale durante il bake.
+        # active diventa BakeUV → i pixel del bake vengono SCRITTI su BakeUV.
+        src = mesh.uv_layers.active
+        src.active_render = True  # esplicito: mantieni l'originale per il sampling
+        dst = mesh.uv_layers.new(name=UV_LAYER_NAME)
+        for s, d in zip(src.data, dst.data):
+            d.uv = s.uv[:]
+        mesh.uv_layers.active = dst
+        # dst.active_render rimane False: BakeUV è solo il target di scrittura
+    else:
+        # Primitivo senza UV: Smart UV Project sul singolo oggetto.
+        # BakeUV è l'unico layer disponibile → è sia active che active_render.
+        dst = mesh.uv_layers.new(name=UV_LAYER_NAME)
+        mesh.uv_layers.active = dst
+        dst.active_render = True
+
+        bpy.ops.object.select_all(action="DESELECT")
+        obj.select_set(True)
+        view_layer.objects.active = obj
+
+        bpy.ops.object.mode_set(mode="EDIT")
+        try:
+            bpy.ops.mesh.select_all(action="SELECT")
+            bpy.ops.uv.smart_project(
+                island_margin=cfg.uv_island_margin,
+                angle_limit=math.radians(cfg.uv_angle_limit),
+            )
+        finally:
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+
+def _pack_bake_uv(obj: bpy.types.Object, view_layer: bpy.types.ViewLayer, cfg: BakeConfig) -> str:
+    """Dopo il join, esegue Pack Islands su BakeUV per far stare tutte le isole
+    in [0,1] senza sovrapposizioni, preservando la forma di ogni isola."""
+    mesh = obj.data
+    if UV_LAYER_NAME in mesh.uv_layers:
+        bake_uv = mesh.uv_layers[UV_LAYER_NAME]
+        mesh.uv_layers.active = bake_uv  # target di SCRITTURA del bake
+        # active_render deve stare sull'UV originale (non BakeUV) così le texture
+        # del materiale vengono campionate correttamente durante il bake.
+        for uv in mesh.uv_layers:
+            if uv.name != UV_LAYER_NAME:
+                uv.active_render = True  # esclusivo: azzera active_render sugli altri
+                break
 
     bpy.ops.object.select_all(action="DESELECT")
     obj.select_set(True)
@@ -441,10 +496,7 @@ def _smart_uv_project(obj: bpy.types.Object, view_layer: bpy.types.ViewLayer, cf
     bpy.ops.object.mode_set(mode="EDIT")
     try:
         bpy.ops.mesh.select_all(action="SELECT")
-        bpy.ops.uv.smart_project(
-            island_margin=cfg.uv_island_margin,
-            angle_limit=math.radians(cfg.uv_angle_limit),
-        )
+        bpy.ops.uv.pack_islands(margin=cfg.uv_island_margin)
     finally:
         bpy.ops.object.mode_set(mode="OBJECT")
 
@@ -620,9 +672,11 @@ def run(cfg: BakeConfig) -> Dict[str, Tuple[bpy.types.Image, str]]:
         raise RuntimeError("Nessun oggetto MESH nella scena corrente.")
 
     duplicates = _duplicate_objects(source_objects, view_layer, cfg)
+    for dup in duplicates:
+        _prepare_bake_uv_per_object(dup, view_layer, cfg)
     merged = _join_objects(duplicates, view_layer, cfg)
     _ensure_default_material(merged)
-    uv_layer_name = _smart_uv_project(merged, view_layer, cfg)
+    uv_layer_name = _pack_bake_uv(merged, view_layer, cfg)
 
     baked_images = _bake_all(merged, cfg, scene)
     material = _build_material(cfg, baked_images)
