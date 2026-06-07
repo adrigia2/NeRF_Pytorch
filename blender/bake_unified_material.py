@@ -20,8 +20,11 @@ Uso (tre modalità equivalenti — stessa pipeline `BakeConfig` + `run`):
        col pulsante "Bake Unified Material" (i valori restano salvati nel .blend,
        così non serve reimpostarli ad ogni Run Script).
     B) Add-on: installabile da Preferences → Add-ons → Install... (vedi `bl_info`).
-    C) Da codice: `run(BakeConfig(output_dir=..., ...))`, per pipeline
-       automatizzate (vedi `BakeConfig` per l'elenco completo dei parametri).
+    C) Da codice: `baked, new_scene = run(BakeConfig(output_dir=..., ...))`,
+       per pipeline automatizzate. Se si vuole salvare il .blend:
+           `_save_blend(cfg, new_scene)`
+       (quando si usa da Text Editor, non annidato in un operatore, è sicuro
+       farlo subito dopo run(); l'operatore UI lo fa invece via timer differito).
 """
 
 bl_info = {
@@ -85,6 +88,7 @@ class TextureFormat(Enum):
 # ──────────────────────────────────────────────────────────────────────────────
 
 _DEFAULT_CHANNELS = {"base_color": True, "metallic": True, "roughness": True, "normal": True}
+_SWIZZLE_AXES = ('POS_X', 'NEG_X', 'POS_Y', 'NEG_Y', 'POS_Z', 'NEG_Z')
 _DEFAULT_RESOLUTIONS = {
     "base_color": (4096, 4096),
     "metallic": (2048, 2048),
@@ -112,6 +116,11 @@ class BakeConfig:
 
     # Spazio delle coordinate per la normal map: 'TANGENT' | 'OBJECT'.
     normal_space: str = "TANGENT"
+    # Swizzle degli assi della normal map (quale asse/segno va in R, G, B).
+    # Valori validi: 'POS_X' | 'NEG_X' | 'POS_Y' | 'NEG_Y' | 'POS_Z' | 'NEG_Z'.
+    normal_r: str = "POS_X"
+    normal_g: str = "POS_Y"
+    normal_b: str = "POS_Z"
 
     # Formato/colordepth di default; override opzionali per canale.
     tex_format: TextureFormat = TextureFormat.OPEN_EXR
@@ -133,6 +142,9 @@ class BakeConfig:
     uv_angle_limit: float = 66.0
 
     apply_modifiers: bool = True
+    # Applica rotation/scale/location alle copie prima del join: necessario per
+    # avere normali object-space nel frame mondo invece che nel frame locale.
+    apply_transform: bool = True
     device: str = "GPU"  # 'GPU' | 'CPU'
 
     # World / environment map.
@@ -147,18 +159,14 @@ class BakeConfig:
             raise ValueError(f"normal_space deve essere 'TANGENT' o 'OBJECT', non {self.normal_space!r}")
         if self.device not in ("GPU", "CPU"):
             raise ValueError(f"device deve essere 'GPU' o 'CPU', non {self.device!r}")
+        for attr, val in (("normal_r", self.normal_r), ("normal_g", self.normal_g), ("normal_b", self.normal_b)):
+            if val not in _SWIZZLE_AXES:
+                raise ValueError(f"{attr} deve essere uno di {_SWIZZLE_AXES}, non {val!r}")
 
 
 def _format_for_channel(cfg: BakeConfig, channel: str) -> TextureFormat:
     return cfg.format_overrides.get(channel, cfg.tex_format)
 
-
-def _color_depth_for_channel(cfg: BakeConfig, channel: str) -> str:
-    if channel in cfg.color_depth_overrides:
-        return cfg.color_depth_overrides[channel]
-    if cfg.color_depth is not None:
-        return cfg.color_depth
-    return _format_for_channel(cfg, channel).default_color_depth()
 
 
 def _colorspace_for_channel(channel: str, fmt: TextureFormat) -> str:
@@ -234,28 +242,32 @@ def _new_target_image(name: str, width: int, height: int, fmt: TextureFormat, co
     return image
 
 
-def _save_image(image: bpy.types.Image, path: str, fmt: TextureFormat, color_depth: str, scene: bpy.types.Scene) -> None:
-    """Salva `image` su disco nel formato/profondità richiesti.
+def _save_image(image: bpy.types.Image, path: str, fmt: TextureFormat) -> None:
+    """Salva `image` su disco nel formato richiesto.
 
-    Si passa per `image.save_render()` con le `image_settings` della scena
-    (temporaneamente riconfigurate e ripristinate) perché è l'unico percorso
-    dell'API che applica davvero `color_depth` — l'`Image` datablock non lo
-    espone direttamente per `Image.save()`.
+    Usa `image.save()` invece di `image.save_render()`: `save_render` applica il
+    view transform attivo della scena (Filmic, AgX, ecc.) ai pixel del bake,
+    corrompendo i dati raw — le curve di tone mapping non-lineari cambiano la
+    direzione dei vettori normali e alterano i valori scalari di roughness/metallic.
+    `image.save()` scrive i pixel as-is, senza alcuna trasformazione di colore,
+    ed è la scelta corretta per tutti i canali di bake (dati non-display).
+
+    Nota sul bit-depth: `image.save()` usa il buffer nativo dell'immagine.
+    Le immagini create con `float_buffer=True` (EXR) vengono salvate a 32-bit float;
+    quelle create con `float_buffer=False` (PNG) a 8-bit. Il parametro `color_depth`
+    di `BakeConfig` non ha effetto su questo percorso di salvataggio.
     """
     directory = os.path.dirname(path)
     if directory and not os.path.isdir(directory):
         os.makedirs(directory, exist_ok=True)
 
-    settings = scene.render.image_settings
-    prev_format, prev_depth = settings.file_format, settings.color_depth
-    try:
-        settings.file_format = fmt.file_format
-        settings.color_depth = color_depth
-        image.filepath_raw = path
-        image.file_format = fmt.file_format
-        image.save_render(path, scene=scene)
-    finally:
-        settings.file_format, settings.color_depth = prev_format, prev_depth
+    image.filepath_raw = path
+    image.file_format = fmt.file_format
+    image.save()
+    # Transita da GENERATED a FILE: così quando il .blend viene riaperto
+    # Blender carica l'immagine dal file su disco invece di ricrearla vuota.
+    image.source = 'FILE'
+    image.reload()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -387,6 +399,22 @@ def _duplicate_objects(source_objects: List[bpy.types.Object], view_layer: bpy.t
     return duplicates
 
 
+def _apply_transforms(duplicates: List[bpy.types.Object], view_layer: bpy.types.ViewLayer) -> None:
+    """Applica rotation/scale/location a tutte le copie.
+
+    Le normali in spazio OBJECT sono espresse nel frame locale dell'oggetto: se
+    un oggetto ha una rotazione non applicata (es. 180° su Z), le normali escono
+    ruotate allo stesso modo. Applicare i transform allinea object space al mondo,
+    così il bake restituisce normali prevedibili indipendentemente dalla posa degli
+    oggetti nella scena. Le copie sono single-user (`linked=False`), quindi
+    transform_apply non tocca le mesh originali."""
+    bpy.ops.object.select_all(action="DESELECT")
+    for obj in duplicates:
+        obj.select_set(True)
+    view_layer.objects.active = duplicates[0]
+    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+
+
 def _join_objects(duplicates: List[bpy.types.Object], view_layer: bpy.types.ViewLayer, cfg: BakeConfig) -> bpy.types.Object:
     bpy.ops.object.select_all(action="DESELECT")
     for obj in duplicates:
@@ -482,12 +510,19 @@ def _pack_bake_uv(obj: bpy.types.Object, view_layer: bpy.types.ViewLayer, cfg: B
     if UV_LAYER_NAME in mesh.uv_layers:
         bake_uv = mesh.uv_layers[UV_LAYER_NAME]
         mesh.uv_layers.active = bake_uv  # target di SCRITTURA del bake
-        # active_render deve stare sull'UV originale (non BakeUV) così le texture
-        # del materiale vengono campionate correttamente durante il bake.
-        for uv in mesh.uv_layers:
-            if uv.name != UV_LAYER_NAME:
-                uv.active_render = True  # esclusivo: azzera active_render sugli altri
-                break
+        # active_render deve restare sul layer sorgente impostato da
+        # _prepare_bake_uv_per_object (tramite src.active_render = True).
+        # Forziamo il fallback solo se BakeUV è inavvertitamente active_render
+        # (join può azzerare/rimescolarne lo stato) o se nessun altro layer lo ha:
+        # in entrambi i casi scegliamo il primo layer non-BakeUV disponibile.
+        needs_render_uv = bake_uv.active_render or not any(
+            uv.active_render for uv in mesh.uv_layers if uv.name != UV_LAYER_NAME
+        )
+        if needs_render_uv:
+            for uv in mesh.uv_layers:
+                if uv.name != UV_LAYER_NAME:
+                    uv.active_render = True  # esclusivo: azzera bake_uv automaticamente
+                    break
 
     bpy.ops.object.select_all(action="DESELECT")
     obj.select_set(True)
@@ -496,14 +531,14 @@ def _pack_bake_uv(obj: bpy.types.Object, view_layer: bpy.types.ViewLayer, cfg: B
     bpy.ops.object.mode_set(mode="EDIT")
     try:
         bpy.ops.mesh.select_all(action="SELECT")
-        bpy.ops.uv.pack_islands(margin=cfg.uv_island_margin)
+        bpy.ops.uv.pack_islands(margin=cfg.uv_island_margin, rotate=False)
     finally:
         bpy.ops.object.mode_set(mode="OBJECT")
 
     return UV_LAYER_NAME
 
 
-def _bake_all(obj: bpy.types.Object, cfg: BakeConfig, scene: bpy.types.Scene) -> Dict[str, Tuple[bpy.types.Image, str]]:
+def _bake_all(obj: bpy.types.Object, cfg: BakeConfig) -> Dict[str, Tuple[bpy.types.Image, str]]:
     """Esegue il bake di ogni canale abilitato e lo salva su disco.
     Ritorna {canale: (image, path)}."""
     # Deduplicato: dopo il join più slot possono puntare allo stesso materiale
@@ -548,13 +583,26 @@ def _bake_all(obj: bpy.types.Object, cfg: BakeConfig, scene: bpy.types.Scene) ->
             elif channel == "metallic":
                 _bake_emission(materials, "Metallic")
             elif channel == "normal":
-                _bake_native("NORMAL", normal_space=cfg.normal_space)
+                # normal_r/g/b vanno passati DIRETTAMENTE all'operatore come kwargs:
+                # impostarli su scene.render.bake viene ignorato da bpy.ops.object.bake
+                # eseguito da script (l'operatore usa i propri default per i kwarg mancanti).
+                _bake_native(
+                    "NORMAL",
+                    normal_space=cfg.normal_space,
+                    normal_r=cfg.normal_r,
+                    normal_g=cfg.normal_g,
+                    normal_b=cfg.normal_b,
+                )
         finally:
             _cleanup_bake_nodes(bake_nodes)
 
-        depth = _color_depth_for_channel(cfg, channel)
         path = os.path.join(cfg.output_dir, f"{image_name}{fmt.extension}")
-        _save_image(image, path, fmt, depth, scene)
+        _save_image(image, path, fmt)
+        # reload() in _save_image legge il colorspace dal file EXR (lin_rec709_scene)
+        # sovrascrivendo quello corretto (Non-Color per roughness/metallic/normal).
+        # Ripristinarlo subito così il nodo Image Texture nel materiale bakato
+        # non applica trasformazioni di colore ai canali dati.
+        image.colorspace_settings.name = colorspace
         baked[channel] = (image, path)
 
     return baked
@@ -563,8 +611,139 @@ def _bake_all(obj: bpy.types.Object, cfg: BakeConfig, scene: bpy.types.Scene) ->
 _CHANNEL_SOCKET = {"base_color": "Base Color", "metallic": "Metallic", "roughness": "Roughness"}
 _CHANNEL_Y = {"base_color": 300, "metallic": 100, "roughness": -100, "normal": -300}
 
+_DEFAULT_MAT_NAME = "_BakeDefaultMaterial_"
 
-def _build_material(cfg: BakeConfig, baked_images: Dict[str, Tuple[bpy.types.Image, str]]) -> bpy.types.Material:
+
+def _pick_reference_material(obj: bpy.types.Object) -> Optional[bpy.types.Material]:
+    """Ritorna il materiale sorgente assegnato al maggior numero di facce su `obj`.
+
+    Dopo il join, più slot possono puntare allo stesso datablock: si conta per
+    datablock, non per indice di slot. Il materiale di default neutro
+    `_BakeDefaultMaterial_` (inserito da `_ensure_default_material` per le facce
+    senza materiale) viene escluso: non porta impostazioni significative.
+
+    Ritorna `None` se non ci sono materiali reali o se l'oggetto non ha facce.
+    """
+    slots = obj.material_slots
+    if not slots:
+        return None
+
+    face_count: Dict[bpy.types.Material, int] = {}
+    for poly in obj.data.polygons:
+        idx = poly.material_index
+        if idx >= len(slots):
+            continue
+        mat = slots[idx].material
+        if mat is None or mat.name == _DEFAULT_MAT_NAME:
+            continue
+        face_count[mat] = face_count.get(mat, 0) + 1
+
+    if not face_count:
+        return None
+    return max(face_count, key=lambda m: face_count[m])
+
+
+def _copy_material_settings(src: bpy.types.Material, dst: bpy.types.Material) -> None:
+    """Copia un set curato di impostazioni del datablock da `src` a `dst`.
+
+    Usa hasattr + try/except su ogni attributo così è robusto tra versioni di
+    Blender (4.2 EEVEE-Next vs versioni precedenti, dove alcuni campi cambiano
+    nome o spariscono). I campi scelti influenzano il render in Cycles oppure
+    la coerenza del viewport display:
+
+    Ombre & culling (incidono su ombre e shading):
+        use_backface_culling, use_backface_culling_shadow, use_transparent_shadow
+
+    Displacement (geometria/bump renderizzata):
+        displacement_method  (Blender 4.1+, top-level)
+        cycles.displacement_method  (versioni precedenti)
+
+    Trasparenza / render method:
+        surface_render_method, use_raytrace_refraction, refraction_depth  (4.2+)
+        blend_method, shadow_method, use_screen_refraction, alpha_threshold (pre-4.2)
+
+    Render passes:
+        pass_index
+
+    Viewport Display (coerenza nella lista materiali / solid mode):
+        diffuse_color, metallic, roughness, line_color, line_priority,
+        show_transparent_back
+
+    Cycles volume/emission sampling:
+        cycles.emission_sampling / cycles.sample_as_light
+        cycles.homogeneous_volume, cycles.volume_sampling,
+        cycles.volume_interpolation, cycles.volume_step_rate
+    """
+    # Attributi flat (top-level)
+    _FLAT_ATTRS = (
+        # ombre & culling
+        "use_backface_culling",
+        "use_backface_culling_shadow",
+        "use_transparent_shadow",
+        # displacement (Blender 4.1+)
+        "displacement_method",
+        # trasparenza / render method (4.2 EEVEE-Next)
+        "surface_render_method",
+        "use_raytrace_refraction",
+        "refraction_depth",
+        # trasparenza / render method (pre-4.2)
+        "blend_method",
+        "shadow_method",
+        "use_screen_refraction",
+        "alpha_threshold",
+        # render passes
+        "pass_index",
+    )
+    for attr in _FLAT_ATTRS:
+        if hasattr(src, attr) and hasattr(dst, attr):
+            try:
+                setattr(dst, attr, getattr(src, attr))
+            except (AttributeError, TypeError):
+                pass
+
+    # Viewport Display (sotto-oggetto)
+    _DISPLAY_ATTRS = (
+        "diffuse_color",
+        "metallic",
+        "roughness",
+        "line_color",
+        "line_priority",
+        "show_transparent_back",
+    )
+    src_vd = getattr(src, "diffuse_color", None)  # proxy: se non esiste, skip tutto
+    if src_vd is not None:
+        for attr in _DISPLAY_ATTRS:
+            if hasattr(src, attr) and hasattr(dst, attr):
+                try:
+                    setattr(dst, attr, getattr(src, attr))
+                except (AttributeError, TypeError):
+                    pass
+
+    # Cycles (sotto-oggetto cycles)
+    _CYCLES_ATTRS = (
+        # displacement (versioni precedenti a 4.1)
+        "displacement_method",
+        # emission sampling
+        "emission_sampling",
+        "sample_as_light",
+        # volume
+        "homogeneous_volume",
+        "volume_sampling",
+        "volume_interpolation",
+        "volume_step_rate",
+    )
+    src_cy = getattr(src, "cycles", None)
+    dst_cy = getattr(dst, "cycles", None)
+    if src_cy is not None and dst_cy is not None:
+        for attr in _CYCLES_ATTRS:
+            if hasattr(src_cy, attr) and hasattr(dst_cy, attr):
+                try:
+                    setattr(dst_cy, attr, getattr(src_cy, attr))
+                except (AttributeError, TypeError):
+                    pass
+
+
+def _build_material(cfg: BakeConfig, baked_images: Dict[str, Tuple[bpy.types.Image, str]], ref_material: Optional[bpy.types.Material] = None) -> bpy.types.Material:
     """Crea il materiale unificato: Principled BSDF alimentato dalle texture
     appena bakate (normal → Normal Map node con lo `space` configurato)."""
     mat = bpy.data.materials.new(name=cfg.merged_material_name)
@@ -585,13 +764,47 @@ def _build_material(cfg: BakeConfig, baked_images: Dict[str, Tuple[bpy.types.Ima
         tex_node.location = (-600, _CHANNEL_Y.get(channel, 0))
 
         if channel == "normal":
-            normal_map = nodes.new("ShaderNodeNormalMap")
-            normal_map.space = cfg.normal_space
-            normal_map.location = (-300, _CHANNEL_Y[channel])
-            links.new(tex_node.outputs["Color"], normal_map.inputs["Color"])
-            links.new(normal_map.outputs["Normal"], principled.inputs["Normal"])
+            # Il pass NORMAL di Cycles scrive valori già codificati in [0,1]
+            # (flat tangente = (0.5, 0.5, 1.0)), indipendentemente dal bit-depth
+            # o dal formato (PNG 8-bit, EXR float 32-bit). La codifica ×0.5+0.5
+            # avviene nel pass stesso, NON nel colorspace dell'immagine — comportamento
+            # consistente con la documentazione Cycles e con le implementazioni
+            # pubbliche di riferimento (addon_bake_groups, SimpleBake, ecc.).
+            if cfg.normal_space == "OBJECT":
+                # OBJECT space: i valori bakati sono in [0,1] → decodificare con
+                # ×2−1 per riportarli in [-1,1], poi normalizzare.
+                # Con apply_transform attivo object space = world space dopo il join:
+                # NON usare VectorTransform(Object→World) che userebbe la matrice di
+                # BakedMesh al render (potenziale rotazione residua dopo join/scene
+                # transfer → swap di assi). Il collegamento diretto con decode+normalize
+                # è corretto e robusto.
+                decode = nodes.new("ShaderNodeVectorMath")
+                decode.operation = 'MULTIPLY_ADD'
+                decode.inputs[1].default_value = (2.0, 2.0, 2.0)    # × 2
+                decode.inputs[2].default_value = (-1.0, -1.0, -1.0)  # − 1  →  [−1, 1]
+                decode.location = (-450, _CHANNEL_Y[channel])
+                links.new(tex_node.outputs["Color"], decode.inputs[0])
+
+                normalize = nodes.new("ShaderNodeVectorMath")
+                normalize.operation = 'NORMALIZE'
+                normalize.location = (-300, _CHANNEL_Y[channel])
+                links.new(decode.outputs["Vector"], normalize.inputs[0])
+                links.new(normalize.outputs["Vector"], principled.inputs["Normal"])
+            else:
+                # TANGENT space: collegare direttamente al nodo Normal Map.
+                # Il nodo applica internamente ×2−1 per decodificare i valori [0,1]
+                # bakati → nessun remap aggiuntivo necessario (aggiungerlo
+                # ri-codificherebbe dati già in [0,1], producendo normali sbagliate).
+                normal_map = nodes.new("ShaderNodeNormalMap")
+                normal_map.space = 'TANGENT'
+                normal_map.location = (-300, _CHANNEL_Y[channel])
+                links.new(tex_node.outputs["Color"], normal_map.inputs["Color"])
+                links.new(normal_map.outputs["Normal"], principled.inputs["Normal"])
         else:
             links.new(tex_node.outputs["Color"], principled.inputs[_CHANNEL_SOCKET[channel]])
+
+    if ref_material is not None:
+        _copy_material_settings(ref_material, mat)
 
     return mat
 
@@ -601,6 +814,16 @@ def _assemble_scene(cfg: BakeConfig, merged_obj: bpy.types.Object, material: bpy
     gli assegna come UNICO materiale quello unificato e attiva l'UV di bake.
     Se `cfg.copy_world` è True, condivide il World della scena sorgente (HDRI /
     environment map) con la nuova scena."""
+    # Prima dell'unlink: azzerare l'attivo e la selezione in ogni view_layer della
+    # scena sorgente che punta a merged_obj. Dopo l'unlink merged_obj non è più
+    # nella scena, ma view_layer.objects.active resterebbe un puntatore all'oggetto
+    # migrato → depsgraph incoerente → possibile crash quando l'utente interagisce
+    # con la scena sorgente (es. click, switch scena).
+    for vl in source_scene.view_layers:
+        if vl.objects.active is merged_obj:
+            vl.objects.active = None
+    merged_obj.select_set(False)
+
     for collection in list(merged_obj.users_collection):
         collection.objects.unlink(merged_obj)
 
@@ -629,6 +852,11 @@ def _save_blend(cfg: BakeConfig, new_scene: bpy.types.Scene) -> str:
     proprio filepath — il file è una copia autonoma che include la scena Baked,
     le texture bakate (generate in RAM, salvate nel .blend) e il World/HDRI
     referenziato dalla scena originale.
+
+    Questa funzione è progettata per essere chiamata FUORI dall'`execute()` di un
+    operatore (tipicamente via `bpy.app.timers`): chiamarla mentre un operatore
+    è in esecuzione cambia scene/context in un punto in cui il depsgraph li ha
+    già catturati, causando crash differiti alla prima interazione utente.
     """
     filename = cfg.blend_filename or f"{cfg.new_scene_name}.blend"
     if not filename.lower().endswith(".blend"):
@@ -641,7 +869,15 @@ def _save_blend(cfg: BakeConfig, new_scene: bpy.types.Scene) -> str:
 
     # Imposta la scena bakata come attiva nella finestra così il file si apre
     # direttamente su di essa.
+    # Non affidarsi a bpy.context.window: può essere None in un callback timer.
+    # Recuperare la finestra dalla lista window_managers (sempre valido).
     win = bpy.context.window
+    if win is None:
+        wms = bpy.data.window_managers
+        if wms:
+            wins = list(wms[0].windows)
+            if wins:
+                win = wins[0]
     if win is not None:
         win.scene = new_scene
 
@@ -661,7 +897,17 @@ def _log_summary(baked_images: Dict[str, Tuple[bpy.types.Image, str]], blend_pat
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run(cfg: BakeConfig) -> Dict[str, Tuple[bpy.types.Image, str]]:
+def run(cfg: BakeConfig) -> Tuple[Dict[str, Tuple[bpy.types.Image, str]], bpy.types.Scene]:
+    """Esegue la pipeline completa di bake.
+
+    Ritorna `(baked_images, new_scene)`.
+
+    Il salvataggio del .blend NON avviene qui, anche se `cfg.save_blend` è True:
+    `_save_blend` deve essere chiamato DOPO che l'eventuale operatore invocante è
+    terminato (via `bpy.app.timers`) per evitare crash da context incoerente.
+    L'uso "da codice" (Text Editor → Run Script, non annidato in un operatore)
+    può chiamare `_save_blend(cfg, new_scene)` subito dopo `run()`.
+    """
     scene = bpy.context.scene
     view_layer = bpy.context.view_layer
 
@@ -672,20 +918,25 @@ def run(cfg: BakeConfig) -> Dict[str, Tuple[bpy.types.Image, str]]:
         raise RuntimeError("Nessun oggetto MESH nella scena corrente.")
 
     duplicates = _duplicate_objects(source_objects, view_layer, cfg)
+    if cfg.apply_transform:
+        _apply_transforms(duplicates, view_layer)
     for dup in duplicates:
         _prepare_bake_uv_per_object(dup, view_layer, cfg)
     merged = _join_objects(duplicates, view_layer, cfg)
     _ensure_default_material(merged)
     uv_layer_name = _pack_bake_uv(merged, view_layer, cfg)
 
-    baked_images = _bake_all(merged, cfg, scene)
-    material = _build_material(cfg, baked_images)
+    baked_images = _bake_all(merged, cfg)
+    # Selezionare il materiale di riferimento PRIMA che _assemble_scene azzerino
+    # gli slot (merged_obj.data.materials.clear()), altrimenti il riferimento è perso.
+    ref_mat = _pick_reference_material(merged)
+    if ref_mat is not None:
+        print(f"bake_unified_material: materiale di riferimento per Settings → {ref_mat.name!r}")
+    material = _build_material(cfg, baked_images, ref_material=ref_mat)
     new_scene = _assemble_scene(cfg, merged, material, uv_layer_name, scene)
 
-    blend_path = _save_blend(cfg, new_scene) if cfg.save_blend else None
-
-    _log_summary(baked_images, blend_path)
-    return baked_images
+    _log_summary(baked_images)
+    return baked_images, new_scene
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -718,6 +969,14 @@ _DEVICE_ITEMS = (
     ('GPU', "GPU", "Bake sulla GPU (richiede un device Cycles configurato nelle Preferences)"),
     ('CPU', "CPU", "Bake sulla CPU"),
 )
+_SWIZZLE_ITEMS = (
+    ('POS_X', "+X", "Asse X positivo"),
+    ('NEG_X', "-X", "Asse X negativo"),
+    ('POS_Y', "+Y", "Asse Y positivo"),
+    ('NEG_Y', "-Y", "Asse Y negativo"),
+    ('POS_Z', "+Z", "Asse Z positivo"),
+    ('NEG_Z', "-Z", "Asse Z negativo"),
+)
 
 
 class BakeUnifiedMaterialProperties(bpy.types.PropertyGroup):
@@ -746,6 +1005,9 @@ class BakeUnifiedMaterialProperties(bpy.types.PropertyGroup):
     res_normal: bpy.props.IntVectorProperty(name="Resolution", size=2, min=1, default=_DEFAULT_RESOLUTIONS["normal"])
 
     normal_space: bpy.props.EnumProperty(name="Normal Space", items=_NORMAL_SPACE_ITEMS, default='TANGENT')
+    normal_r: bpy.props.EnumProperty(name="R", description="Asse della normal map nel canale rosso", items=_SWIZZLE_ITEMS, default='POS_X')
+    normal_g: bpy.props.EnumProperty(name="G", description="Asse della normal map nel canale verde", items=_SWIZZLE_ITEMS, default='POS_Y')
+    normal_b: bpy.props.EnumProperty(name="B", description="Asse della normal map nel canale blu", items=_SWIZZLE_ITEMS, default='POS_Z')
     tex_format: bpy.props.EnumProperty(name="Format", items=_TEX_FORMAT_ITEMS, default='OPEN_EXR')
     color_depth: bpy.props.EnumProperty(name="Color Depth", items=_COLOR_DEPTH_ITEMS, default='AUTO')
 
@@ -770,6 +1032,13 @@ class BakeUnifiedMaterialProperties(bpy.types.PropertyGroup):
     apply_modifiers: bpy.props.BoolProperty(
         name="Apply Modifiers",
         description="Applica i modificatori sulle mesh duplicate prima del join/bake",
+        default=True,
+    )
+    apply_transform: bpy.props.BoolProperty(
+        name="Apply Transform",
+        description="Applica rotazione/scala/posizione alle copie prima del bake: "
+                    "necessario per normali object-space allineate al mondo "
+                    "(evita assi invertiti quando gli oggetti hanno rotazioni non applicate)",
         default=True,
     )
     device: bpy.props.EnumProperty(name="Device", items=_DEVICE_ITEMS, default='GPU')
@@ -813,6 +1082,9 @@ def _config_from_properties(props: BakeUnifiedMaterialProperties) -> BakeConfig:
             "normal": tuple(props.res_normal),
         },
         normal_space=props.normal_space,
+        normal_r=props.normal_r,
+        normal_g=props.normal_g,
+        normal_b=props.normal_b,
         tex_format=TextureFormat[props.tex_format],
         color_depth=None if props.color_depth == 'AUTO' else props.color_depth,
         base_color_via_emission=props.base_color_via_emission,
@@ -821,6 +1093,7 @@ def _config_from_properties(props: BakeUnifiedMaterialProperties) -> BakeConfig:
         uv_island_margin=props.uv_island_margin,
         uv_angle_limit=props.uv_angle_limit,
         apply_modifiers=props.apply_modifiers,
+        apply_transform=props.apply_transform,
         device=props.device,
         copy_world=props.copy_world,
         save_blend=props.save_blend,
@@ -845,12 +1118,37 @@ class OBJECT_OT_bake_unified_material(bpy.types.Operator):
 
         cfg = _config_from_properties(props)
         try:
-            baked = run(cfg)
+            baked, new_scene = run(cfg)
         except Exception as exc:
             import traceback
             traceback.print_exc()
             self.report({'ERROR'}, f"Bake fallito: {exc}")
             return {'CANCELLED'}
+
+        if cfg.save_blend:
+            # Deferire il salvataggio (e lo scene-swap) fuori dall'execute via timer.
+            # Chiamare save_as_mainfile / cambiare window.scene DENTRO un execute() è
+            # una causa documentata di crash differiti (context incoerente al ritorno
+            # dell'operatore). Con first_interval=0.0 il callback gira al primo tick
+            # successivo del loop eventi, in un context pulito.
+            # Catturiamo solo dati per valore (stringhe, config) — mai riferimenti
+            # diretti a bpy.data (potrebbero diventare pendenti).
+            scene_name = new_scene.name
+
+            def _deferred_save():
+                scn = bpy.data.scenes.get(scene_name)
+                if scn is None:
+                    print(f"bake_unified_material: scena '{scene_name}' non trovata, skip save.")
+                    return None  # one-shot: non ripetere
+                try:
+                    blend_path = _save_blend(cfg, scn)
+                    print(f"bake_unified_material: scena salvata → {blend_path}")
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                return None  # one-shot
+
+            bpy.app.timers.register(_deferred_save, first_interval=0.0)
 
         self.report({'INFO'}, f"Bake completato: {len(baked)} canali salvati in {cfg.output_dir}")
         return {'FINISHED'}
@@ -911,7 +1209,15 @@ class VIEW3D_PT_bake_unified_material(bpy.types.Panel):
         box = layout.box()
         box.label(text="Avanzate")
         box.prop(props, "normal_space")
+        sub = box.column(align=True)
+        sub.enabled = props.bake_normal
+        sub.label(text="Normal swizzle (R  G  B):")
+        row = sub.row(align=True)
+        row.prop(props, "normal_r", text="")
+        row.prop(props, "normal_g", text="")
+        row.prop(props, "normal_b", text="")
         box.prop(props, "apply_modifiers")
+        box.prop(props, "apply_transform")
         box.prop(props, "device")
 
         layout.separator()
