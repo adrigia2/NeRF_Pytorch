@@ -52,6 +52,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from enum import Enum
+from quopri import decode
 from typing import Dict, List, Optional, Tuple
 
 import bpy
@@ -778,18 +779,11 @@ def _build_material(cfg: BakeConfig, baked_images: Dict[str, Tuple[bpy.types.Ima
                 # BakedMesh al render (potenziale rotazione residua dopo join/scene
                 # transfer → swap di assi). Il collegamento diretto con decode+normalize
                 # è corretto e robusto.
-                decode = nodes.new("ShaderNodeVectorMath")
-                decode.operation = 'MULTIPLY_ADD'
-                decode.inputs[1].default_value = (2.0, 2.0, 2.0)    # × 2
-                decode.inputs[2].default_value = (-1.0, -1.0, -1.0)  # − 1  →  [−1, 1]
-                decode.location = (-450, _CHANNEL_Y[channel])
-                links.new(tex_node.outputs["Color"], decode.inputs[0])
-
-                normalize = nodes.new("ShaderNodeVectorMath")
-                normalize.operation = 'NORMALIZE'
-                normalize.location = (-300, _CHANNEL_Y[channel])
-                links.new(decode.outputs["Vector"], normalize.inputs[0])
-                links.new(normalize.outputs["Vector"], principled.inputs["Normal"])
+                normal_map = nodes.new("ShaderNodeNormalMap")
+                normal_map.space = 'OBJECT'
+                normal_map.location = (-300, _CHANNEL_Y[channel])
+                links.new(tex_node.outputs["Color"], normal_map.inputs["Color"])
+                links.new(normal_map.outputs["Normal"], principled.inputs["Normal"])
             else:
                 # TANGENT space: collegare direttamente al nodo Normal Map.
                 # Il nodo applica internamente ×2−1 per decodificare i valori [0,1]
