@@ -460,15 +460,20 @@ def _apply_external_normal(rc, ium_res, ium_w: int, ium_h: int) -> None:
     #   - LDR (PNG/JPG) → uint8/255, quindi in [0,1]
     ext = _load_image_as_vec3(path, ium_w, ium_h)  # (N, 3)
 
-    # Per EXR potremmo avere valori già in [-1,1] se provengono da un precedente
-    # salvataggio; per LDR sono sempre in [0,1].  Detecta il range e normalizza
-    # solo se i valori sono positivi (convenzione normal-map LDR).
-    if ext.min() >= -0.01:
-        # Valori in [0,1] (o molto vicini): applica decode standard.
-        n = ext * 2.0 - 1.0
+    # Decodifica dal range sorgente a [-1,1].
+    # Il range va dichiarato esplicitamente in rc.external_normal_range: l'auto-detect
+    # su min() globale era fragile perché il ringing LANCZOS (su downscale aggressivi
+    # tipo 4096→512) spinge alcuni pixel sotto 0, facendo saltare il decode e lasciando
+    # i valori in [0,1] — il bug esatto segnalato.
+    if rc.external_normal_range == "0_1":
+        n = ext.astype(np.float32) * 2.0 - 1.0
+    elif rc.external_normal_range == "-1_1":
+        n = ext.astype(np.float32, copy=True)
     else:
-        # Valori già in [-1,1] (EXR float che contiene una normale pre-decodificata).
-        n = ext.copy()
+        raise ValueError(
+            f"external_normal_range non riconosciuto: {rc.external_normal_range!r} "
+            f"(attesi '0_1' | '-1_1')."
+        )
 
     if rc.external_normal_flip_green:
         n[:, 1] *= -1.0
@@ -623,8 +628,7 @@ class RenderConfig:
     ium_texture_size: list[int] = field(default_factory=lambda: [512, 512])
 
     # Normale IUM fornita dall'esterno (override rispetto a quella calcolata da OptiX).
-    # Il file può essere in qualsiasi formato immagine (PNG, JPG, EXR…); i valori
-    # per canale devono essere in [0, 1] (normal-map standard).
+    # Il file può essere in qualsiasi formato immagine (PNG, JPG, EXR…).
     # Se None (default) viene usata la normale calcolata dall'IUM.
     external_normal_path: str | None = None
     # Strategia da usare se la risoluzione dell'immagine esterna ≠ ium_texture_size.
@@ -633,6 +637,12 @@ class RenderConfig:
     #                 (positions/mask vengono rigenerati alla stessa risoluzione).
     #   None        → chiede all'utente a runtime.
     external_normal_resolution_mode: str | None = None
+    # Range dei valori della normale esterna.
+    #   "0_1"  → normal-map standard codificata in [0,1]: applica decode n = ext*2-1.
+    #   "-1_1" → EXR già decodificato in [-1,1] (es. un ium_normals ri-caricato): usa as-is.
+    # Da impostare esplicitamente: l'auto-detect su min() globale era fragile (il
+    # ringing LANCZOS su downscale aggressivi spingeva min sotto 0 saltando il decode).
+    external_normal_range: str = "0_1"
     # Inverti il canale verde dopo il decode (utile per baker con convenzione DirectX).
     # Default False = convenzione OpenGL/Blender (Y+ verso l'alto).
     external_normal_flip_green: bool = False
@@ -1647,7 +1657,7 @@ if __name__ == "__main__":
             external_normal_resolution_mode = "resample",  # "adapt" | "resample" | "none"
             transforms_path = f"{REPO}/Scenes/TableAndOther/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/TableAndOther/Models/Baked.obj",
-            output_dir      = "D:/tesi_output/new_scene_nerf_color_mapping",
+            output_dir      = "D:/tesi_output/new_scene_nerf_color_mapping_fix_resize_normal_map",
 
             render_depth    = True,
             render_position = True,  # Step 1 produces only depth+mask
@@ -1660,7 +1670,8 @@ if __name__ == "__main__":
             debug_pixel_change    = False,
 
             render_irradiance      = True,
-            irradiance_format      = ImageFormat.OPENEXR,
+            
+
             skybox_path            = f"{REPO}/Scenes/TableAndOther/Blender/assets/hdri/suburban_garden_4k.exr",
             skybox_size            = [1024, 512],
             irradiance_sample_side = 512,
@@ -1688,7 +1699,7 @@ if __name__ == "__main__":
 
         ),
 
-        nerf_num_iters     = 30000,
+        nerf_num_iters     = 50000,
         nerf_batch_size    = 4096*24,
         nerf_lr            = 5e-4,
         nerf_display_every = 100,
