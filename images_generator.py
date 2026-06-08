@@ -1019,7 +1019,7 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
         bg_depth_window           = cfg.nerf_bg_depth_window,
         bg_depth_window_end       = cfg.nerf_bg_depth_window_end,
         profile_iters             = cfg.nerf_profile_iters,
-        use_hdr_activation       = False,
+        use_hdr_activation       = True,
     )
 
     print(f"[Step 2] Training NeRF (depth-guided) — {cfg.nerf_num_iters} iter, ckpt → {ckpt}")
@@ -1657,7 +1657,7 @@ if __name__ == "__main__":
             external_normal_resolution_mode = "resample",  # "adapt" | "resample" | "none"
             transforms_path = f"{REPO}/Scenes/TableAndOther/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/TableAndOther/Models/Baked.obj",
-            output_dir      = "D:/tesi_output/new_scene_nerf_color_mapping_fix_resize_normal_map",
+            output_dir      = "D:/tesi_output/new_scene_nerf_color_mapping_fix_resize_normal_map_exp",
 
             render_depth    = True,
             render_position = True,  # Step 1 produces only depth+mask
@@ -1699,7 +1699,7 @@ if __name__ == "__main__":
 
         ),
 
-        nerf_num_iters     = 50000,
+        nerf_num_iters     = 20000,
         nerf_batch_size    = 4096*24,
         nerf_lr            = 5e-4,
         nerf_display_every = 100,
@@ -1720,7 +1720,6 @@ if __name__ == "__main__":
         nerf_bg_depth_window_end       = 0.1,
 
         nerf_profile_iters = 0,
-
     )
 
     run_pipeline(cfg)
