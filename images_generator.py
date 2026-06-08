@@ -386,6 +386,108 @@ def _load_exr_as_flat(path: str) -> np.ndarray | None:
         return None
 
 
+def _resolve_external_normal_size(
+    rc,
+    default_w: int,
+    default_h: int,
+) -> tuple[int, int, str | None]:
+    """Determina larghezza/altezza effettiva per l'IUM quando si usa una normale esterna.
+
+    Se rc.external_normal_path è None restituisce (default_w, default_h, None).
+
+    Se la risoluzione nativa della normale coincide già con default_w×default_h
+    restituisce quella stessa risoluzione con mode="match".
+
+    Altrimenti:
+      - rc.external_normal_resolution_mode == "resample" → (default_w, default_h, "resample")
+      - rc.external_normal_resolution_mode == "adapt"    → (native_w, native_h, "adapt")
+      - rc.external_normal_resolution_mode is None       → chiede all'utente a runtime
+    """
+    if not rc.external_normal_path:
+        return default_w, default_h, None
+
+    native = _load_image_hw3_native(rc.external_normal_path)
+    native_h, native_w = native.shape[:2]
+
+    if native_w == default_w and native_h == default_h:
+        print(f"[IUM] Normale esterna: risoluzione nativa {native_w}×{native_h} "
+              f"coincide con ium_texture_size → nessun ricampionamento necessario.")
+        return default_w, default_h, "match"
+
+    print(f"[IUM] Normale esterna: risoluzione nativa {native_w}×{native_h}, "
+          f"ium_texture_size={default_w}×{default_h} — risoluzioni diverse.")
+
+    mode = rc.external_normal_resolution_mode
+    if mode is None:
+        while True:
+            ans = input(
+                f"  Scegli la strategia di risoluzione:\n"
+                f"    1 = resample: ridimensiona la normale a {default_w}×{default_h}\n"
+                f"    2 = adapt: adatta ium_texture_size a {native_w}×{native_h}\n"
+                f"  Scelta [1/2]: "
+            ).strip()
+            if ans in ("1", "2"):
+                mode = "resample" if ans == "1" else "adapt"
+                break
+            print("  Input non valido, inserisci 1 o 2.")
+
+    if mode == "resample":
+        print(f"[IUM] Strategia: resample → la normale verrà ridimensionata a {default_w}×{default_h}.")
+        return default_w, default_h, "resample"
+    elif mode == "adapt":
+        print(f"[IUM] Strategia: adapt → IUM verrà eseguita a {native_w}×{native_h}.")
+        return native_w, native_h, "adapt"
+    else:
+        raise ValueError(
+            f"external_normal_resolution_mode non riconosciuto: {mode!r}. "
+            "Usa 'resample', 'adapt' o None."
+        )
+
+
+def _apply_external_normal(rc, ium_res, ium_w: int, ium_h: int) -> None:
+    """Decodifica la normale esterna da [0,1] a [-1,1] e la inietta nel buffer C++
+    di IUM_Generator::Result, sovrascrivendo la face-normal calcolata da OptiX.
+
+    Dopo questa chiamata ium_res.normals_np (e il corrispondente buffer GPU usato
+    da IrradianceGenerator / IndirectGenerator) contiene la normale esterna.
+    """
+    path = rc.external_normal_path
+    print(f"[IUM] Carico normale esterna: {path}")
+
+    # Carica e ridimensiona a ium_texture_size (LANCZOS).
+    # _load_image_as_vec3 restituisce (N, 3) float32:
+    #   - EXR → valori HDR raw (possibilmente già in [-1,1] o [0,1])
+    #   - LDR (PNG/JPG) → uint8/255, quindi in [0,1]
+    ext = _load_image_as_vec3(path, ium_w, ium_h)  # (N, 3)
+
+    # Per EXR potremmo avere valori già in [-1,1] se provengono da un precedente
+    # salvataggio; per LDR sono sempre in [0,1].  Detecta il range e normalizza
+    # solo se i valori sono positivi (convenzione normal-map LDR).
+    if ext.min() >= -0.01:
+        # Valori in [0,1] (o molto vicini): applica decode standard.
+        n = ext * 2.0 - 1.0
+    else:
+        # Valori già in [-1,1] (EXR float che contiene una normale pre-decodificata).
+        n = ext.copy()
+
+    if rc.external_normal_flip_green:
+        n[:, 1] *= -1.0
+
+    # Renormalizza: LANCZOS/interpolazione può produrre vettori non-unit.
+    ln = np.linalg.norm(n, axis=1, keepdims=True)
+    n = np.divide(n, ln, out=np.zeros_like(n), where=ln > 1e-8)
+
+    # Azzera i texel fuori dal mesh, coerentemente con la normale generata.
+    if ium_res.has_masks():
+        m = ium_res.masks_np.astype(bool)
+        n[~m] = 0.0
+
+    # Scrive nel buffer C++ (normals_np è una view zero-copy scrivibile).
+    ium_res.normals_np[:] = n.astype(np.float32)
+    print(f"[IUM] Normale esterna iniettata nel buffer IUM ({ium_w}×{ium_h}, "
+          f"{int(np.count_nonzero(m) if ium_res.has_masks() else ium_w * ium_h)} texel validi).")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Parsing transforms.json
 # ──────────────────────────────────────────────────────────────────────────────
@@ -520,6 +622,21 @@ class RenderConfig:
     # Dimensione texture IUM [width, height]
     ium_texture_size: list[int] = field(default_factory=lambda: [512, 512])
 
+    # Normale IUM fornita dall'esterno (override rispetto a quella calcolata da OptiX).
+    # Il file può essere in qualsiasi formato immagine (PNG, JPG, EXR…); i valori
+    # per canale devono essere in [0, 1] (normal-map standard).
+    # Se None (default) viene usata la normale calcolata dall'IUM.
+    external_normal_path: str | None = None
+    # Strategia da usare se la risoluzione dell'immagine esterna ≠ ium_texture_size.
+    #   "resample"  → ricampiona la normale a ium_texture_size (LANCZOS).
+    #   "adapt"     → adatta ium_texture_size alla risoluzione nativa della normale
+    #                 (positions/mask vengono rigenerati alla stessa risoluzione).
+    #   None        → chiede all'utente a runtime.
+    external_normal_resolution_mode: str | None = None
+    # Inverti il canale verde dopo il decode (utile per baker con convenzione DirectX).
+    # Default False = convenzione OpenGL/Blender (Y+ verso l'alto).
+    external_normal_flip_green: bool = False
+
     # Scala applicata ai depth — deve essere False: scale nei transforms.json
     # è da applicare ANCHE alle traslazioni della camera, e non farlo crea un
     # mismatch (query points NeRF ≠ superficie mesh).  Lasciare False.
@@ -558,8 +675,10 @@ class RenderConfig:
     indirect_tile_size: int = 1024       # texel per tile GPU (bilancia memoria/VRAM)
     indirect_nerf_cache_path: str = ""   # path al checkpoint NeRF (default: auto-detect)
     indirect_format: ImageFormat = ImageFormat.OPENEXR
-    # Depth hints: se True concentra i sample attorno al t_hit OptiX invece di stratified puro
-    indirect_depth_hint_enabled: bool = False
+    # Se True, il pass indiretto usa una finestra di campionamento custom attorno al
+    # t_hit OptiX (indirect_depth_window / _end), invece di ereditare quella salvata
+    # nel checkpoint di training. Il campionamento è comunque sempre centrato sul t_hit.
+    indirect_override_depth_window: bool = False
     indirect_depth_window: float = 0.5
     indirect_depth_window_end: float = 0.0
 
@@ -640,7 +759,7 @@ def _precompute_indirect_irradiance(
     import torch
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_bundle, nerf_cfg = load_checkpoint(cache_path, device)
-    if cfg.indirect_depth_hint_enabled:
+    if cfg.indirect_override_depth_window:
         nerf_cfg.depth_window     = cfg.indirect_depth_window
         nerf_cfg.depth_window_end = cfg.indirect_depth_window_end
     print(f"✓ NeRF model caricato da: {cache_path}")
@@ -894,7 +1013,7 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
     )
 
     print(f"[Step 2] Training NeRF (depth-guided) — {cfg.nerf_num_iters} iter, ckpt → {ckpt}")
-    print(f"[Step 2] campionamento naturale, mesh_window=[t-{cfg.nerf_depth_window}, t+{cfg.nerf_depth_window_end}], "
+    print(f"[Step 2] campionamento depth-guided, mesh_window=[t-{cfg.nerf_depth_window}, t+{cfg.nerf_depth_window_end}], "
           f"bg_radius_mult={cfg.nerf_bg_radius_mult}")
     nerf_train(
         str(transforms_extended_path), nerf_cfg,
@@ -1216,7 +1335,12 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
     ium_result_data: dict = output_json.get("ium", {})
 
     if rc.render_ium:
-        ium_w, ium_h = rc.ium_texture_size[0], rc.ium_texture_size[1]
+        # Dimensione IUM: potrebbe essere adattata alla risoluzione della normale esterna
+        # se external_normal_resolution_mode == "adapt" (o se l'utente lo sceglie a runtime).
+        default_ium_w, default_ium_h = rc.ium_texture_size[0], rc.ium_texture_size[1]
+        ium_w, ium_h, _ext_norm_mode = _resolve_external_normal_size(
+            rc, default_ium_w, default_ium_h
+        )
 
         ium_gen = optix_mod.IUMGenerator()
         ium_gen.set_traversable(model)
@@ -1224,6 +1348,11 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
         ium_gen.render()
         ium_res = ium_gen.get_result()
         print("[Step 3] IUM rendering completato")
+
+        # Se è stata fornita una normale esterna, decodificala e iniettala nel buffer
+        # C++ di IUM_Generator::Result prima di qualsiasi uso a valle.
+        if rc.external_normal_path:
+            _apply_external_normal(rc, ium_res, ium_w, ium_h)
 
         ium_out_dir = json_dir / "ium"
         os.makedirs(ium_out_dir, exist_ok=True)
@@ -1236,8 +1365,13 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
 
         if ium_res.has_normals():
             norm_arr = _reshape_flat(ium_res.normals_np.astype(np.float32), ium_w, ium_h)
-            ium_norm_path = (ium_out_dir / f"ium_normals{rc.ium_format.extension}").resolve().as_posix()
-            _save_layer(norm_arr, ium_norm_path, rc.ium_format, DataLayer.NORMAL)
+            # Quando si usa la normale esterna forziamo EXR per garantire il salvataggio
+            # dei valori raw in [-1, 1] indipendentemente da rc.ium_format.
+            norm_save_fmt = (
+                ImageFormat.OPENEXR if rc.external_normal_path else rc.ium_format
+            )
+            ium_norm_path = (ium_out_dir / f"ium_normals{norm_save_fmt.extension}").resolve().as_posix()
+            _save_layer(norm_arr, ium_norm_path, norm_save_fmt, DataLayer.NORMAL)
             ium_result_data["ium_normals_path"] = _as_relative_to(ium_norm_path, json_dir_str)
 
         if ium_res.has_masks():
@@ -1509,9 +1643,11 @@ if __name__ == "__main__":
 
 
         render = RenderConfig(
+            external_normal_path = f"{REPO}/Scenes/TableAndOther/BlenderBaked/BakedMaterial_normal.exr",
+            external_normal_resolution_mode = "resample",  # "adapt" | "resample" | "none"
             transforms_path = f"{REPO}/Scenes/TableAndOther/NerfOpenEXR/transforms.json",
-            model_path      = f"{REPO}/Scenes/TableAndOther/Models/TableAndOther.obj",
-            output_dir      = "D:/tesi_output/tableandother_render_no_perturb_rel_mse_high_batch_size_no_exponential_check_normal",
+            model_path      = f"{REPO}/Scenes/TableAndOther/Models/Baked.obj",
+            output_dir      = "D:/tesi_output/new_scene_nerf_color_mapping",
 
             render_depth    = True,
             render_position = True,  # Step 1 produces only depth+mask
@@ -1525,14 +1661,14 @@ if __name__ == "__main__":
 
             render_irradiance      = True,
             irradiance_format      = ImageFormat.OPENEXR,
-            skybox_path            = f"{REPO}/Scenes/TableAndOther/Blender/assets/hdri/pav_studio_03_4k.exr",
+            skybox_path            = f"{REPO}/Scenes/TableAndOther/Blender/assets/hdri/suburban_garden_4k.exr",
             skybox_size            = [1024, 512],
             irradiance_sample_side = 512,
 
             precompute_indirect           = True,
             indirect_sample_side          = 64,
             indirect_tile_size            = 1024,
-            indirect_depth_hint_enabled   = False,
+            indirect_override_depth_window = False,
 
             render_albedo = True,
             albedo_format = ImageFormat.OPENEXR,
@@ -1547,7 +1683,7 @@ if __name__ == "__main__":
             ium_texture_size = [512, 512],
             apply_scale      = False,
 
-            color_texture_image_source = "gt",  # "nerf" | "gt"
+            color_texture_image_source = "nerf",  # "nerf" | "gt"
             
 
         ),
