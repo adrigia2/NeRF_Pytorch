@@ -1246,11 +1246,24 @@ def _step2b_render_train_images(cfg: PipelineConfig,
     Gli output vengono scritti in una sottocartella denominata iter_<NNNNNN> all'interno
     di nerf_render_images, così ogni stop del training interattivo produce una directory
     separata senza sovrascrivere gli stop precedenti.
+
+    Metriche di bias colore prodotte al termine:
+      frame_NNN_bias.png   — scatter densità pred-vs-gt (4 pannelli R/G/B/Luma, log-log)
+      bias_scatter_all.png — scatter aggregato su tutti i frame
+      metrics_per_frame.csv — PSNR, PSNR-tonemap, errore percentili, residui per frame
+      bias_bins.csv         — ratio mediana pred/gt per fascia di luminanza e canale
+      metrics_summary.txt   — riepilogo testuale (numeri per la tesi)
     """
+    import csv
     import sys
     import torch as _torch
     sys.path.insert(0, str(Path(__file__).parent))
     from nerf import load_checkpoint, render_image as nerf_render_image
+    from nerf.metrics import (
+        plot_bias_scatter, tonemapped_psnr,
+        highlight_percentile_error, signed_residual_stats,
+        binned_median_curve, _LUMA_COEFF,
+    )
 
     rc = cfg.render
 
@@ -1270,8 +1283,16 @@ def _step2b_render_train_images(cfg: PipelineConfig,
 
     exr_writer = get_writer(ImageFormat.OPENEXR)
 
+    # ── Accumulatori per scatter aggregato (subsample per contenere la memoria) ──
+    _MAX_AGG_PX = 20_000   # pixel massimi prelevati da ogni frame per l'aggregato
+    agg_pred_rgb: list[np.ndarray] = []   # (N_i, 3) per frame i
+    agg_gt_rgb:   list[np.ndarray] = []
+
+    # ── Metriche per-frame ────────────────────────────────────────────────────
+    psnrs: list[float] = []
+    metrics_rows: list[dict] = []
+
     print(f"\n[Step 2b] Rendering {len(tf.frames)} frame con NeRF (iter={iter_done})...")
-    psnrs = []
     for i, (frame, raw_frame) in enumerate(zip(tf.frames, raw_frames)):
         gt_np  = _load_image_hw3_native(frame.file_path)
         pose   = np.array(frame.transform_matrix, dtype=np.float32)
@@ -1313,10 +1334,167 @@ def _step2b_render_train_images(cfg: PipelineConfig,
         _write_rgb_hist_comparison(pred_np, gt_np,
                                    (base / f"{stem}_rgb_hist.png").as_posix(), stem)
 
-        if (i + 1) % max(1, len(tf.frames) // 5) == 0 or i == len(tf.frames) - 1:
-            print(f"  [Step 2b] {i+1}/{len(tf.frames)}  PSNR={psnr:.2f} dB")
+        # ── Metriche di bias colore ───────────────────────────────────────────
+        psnr_tm_clip     = tonemapped_psnr(pred_np, gt_np, mask_bool, mode="clip")
+        psnr_tm_reinhard = tonemapped_psnr(pred_np, gt_np, mask_bool, mode="reinhard")
+        hl_err           = highlight_percentile_error(pred_np, gt_np, mask_bool)
+        res_stats        = signed_residual_stats(pred_np, gt_np, mask_bool)
 
-    print(f"[Step 2b] Completato — PSNR medio={np.mean(psnrs):.2f} dB → {base}")
+        metrics_rows.append({
+            "frame":               i,
+            "psnr":                round(psnr, 4),
+            "psnr_tonemap_clip":   round(psnr_tm_clip, 4),
+            "psnr_tonemap_reinhard": round(psnr_tm_reinhard, 4),
+            "rel_err_p99":         round(hl_err.get(99.0,  float("nan")), 5),
+            "rel_err_p999":        round(hl_err.get(99.9,  float("nan")), 5),
+            "residual_mean":       round(res_stats["mean"],             6),
+            "residual_median":     round(res_stats["median"],           6),
+            "residual_mean_hl":    round(res_stats["mean_highlight"],   6),
+            "residual_median_hl":  round(res_stats["median_highlight"], 6),
+        })
+
+        # Scatter bias per-frame (R/G/B/Luma log-log con bisettrice + curva mediana)
+        bias_title = (f"{stem}  PSNR={psnr:.2f} dB  "
+                      f"tonemap-clip={psnr_tm_clip:.2f} dB  "
+                      f"tonemap-Reinhard={psnr_tm_reinhard:.2f} dB")
+        plot_bias_scatter(pred_np, gt_np, mask_bool,
+                          str(base / f"{stem}_bias.png"), title=bias_title)
+
+        # Accumulo subsample per scatter aggregato (già mascherato)
+        p3 = pred_np.astype(np.float32)
+        g3 = gt_np.astype(np.float32)
+        if mask_bool is not None:
+            p3 = p3[mask_bool]
+            g3 = g3[mask_bool]
+        else:
+            p3 = p3.reshape(-1, 3)
+            g3 = g3.reshape(-1, 3)
+        n_px = p3.shape[0]
+        if n_px > _MAX_AGG_PX:
+            rng_idx = np.random.choice(n_px, _MAX_AGG_PX, replace=False)
+            p3 = p3[rng_idx]
+            g3 = g3[rng_idx]
+        agg_pred_rgb.append(p3)
+        agg_gt_rgb.append(g3)
+
+        if (i + 1) % max(1, len(tf.frames) // 5) == 0 or i == len(tf.frames) - 1:
+            print(f"  [Step 2b] {i+1}/{len(tf.frames)}  PSNR={psnr:.2f} dB  "
+                  f"tonemap={psnr_tm_clip:.2f} dB")
+
+    # ── metrics_per_frame.csv ─────────────────────────────────────────────────
+    _csv_fields = [
+        "frame", "psnr", "psnr_tonemap_clip", "psnr_tonemap_reinhard",
+        "rel_err_p99", "rel_err_p999",
+        "residual_mean", "residual_median", "residual_mean_hl", "residual_median_hl",
+    ]
+    csv_path = base / "metrics_per_frame.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=_csv_fields)
+        writer.writeheader()
+        writer.writerows(metrics_rows)
+
+    # ── Scatter aggregato + bias_bins.csv ─────────────────────────────────────
+    all_pred = np.concatenate(agg_pred_rgb, axis=0)   # (N_total, 3)
+    all_gt   = np.concatenate(agg_gt_rgb,   axis=0)
+    n_agg    = all_pred.shape[0]
+
+    # Scatter aggregato — reshaping virtuale (1, N, 3) senza maschera (già filtrato)
+    agg_pred_hw3 = all_pred.reshape(1, n_agg, 3)
+    agg_gt_hw3   = all_gt.reshape(1, n_agg, 3)
+    agg_title = (f"Tutti i frame aggregati ({n_agg} pixel campionati, "
+                 f"{len(psnrs)} frame, PSNR medio={float(np.mean(psnrs)):.2f} dB)")
+    plot_bias_scatter(agg_pred_hw3, agg_gt_hw3, None,
+                      str(base / "bias_scatter_all.png"), title=agg_title)
+
+    # Canali per bias_bins.csv (luma ricalcolata dall'RGB aggregato)
+    luma_pred_agg = (all_pred * _LUMA_COEFF).sum(-1)
+    luma_gt_agg   = (all_gt   * _LUMA_COEFF).sum(-1)
+    _channels = [
+        ("R",    all_pred[:, 0], all_gt[:, 0]),
+        ("G",    all_pred[:, 1], all_gt[:, 1]),
+        ("B",    all_pred[:, 2], all_gt[:, 2]),
+        ("Luma", luma_pred_agg,  luma_gt_agg),
+    ]
+    bins_rows: list[dict] = []
+    for ch_name, cp, cg in _channels:
+        centers, pred_meds, gt_meds, counts = binned_median_curve(cp, cg, n_bins=20)
+        for k in range(len(centers)):
+            pm = float(pred_meds[k])
+            ct = float(centers[k])
+            ratio = (pm / ct) if (ct > 1e-6 and not np.isnan(pm)) else float("nan")
+            bins_rows.append({
+                "channel":    ch_name,
+                "bin_idx":    k,
+                "center_gt":  f"{ct:.5f}",
+                "median_gt":  f"{float(gt_meds[k]):.5f}",
+                "median_pred": f"{pm:.5f}" if not np.isnan(pm) else "nan",
+                "ratio":      f"{ratio:.4f}" if not np.isnan(ratio) else "nan",
+                "count":      int(counts[k]),
+            })
+    bins_path = base / "bias_bins.csv"
+    with open(bins_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh, fieldnames=["channel", "bin_idx", "center_gt", "median_gt",
+                            "median_pred", "ratio", "count"])
+        writer.writeheader()
+        writer.writerows(bins_rows)
+
+    # ── metrics_summary.txt ───────────────────────────────────────────────────
+    def _nanmean(vals):
+        arr = [v for v in vals if not (isinstance(v, float) and np.isnan(v))]
+        return float(np.mean(arr)) if arr else float("nan")
+
+    psnr_tm_clips     = [r["psnr_tonemap_clip"]     for r in metrics_rows]
+    psnr_tm_reinhards = [r["psnr_tonemap_reinhard"]  for r in metrics_rows]
+    rel_p99s          = [r["rel_err_p99"]            for r in metrics_rows]
+    rel_p999s         = [r["rel_err_p999"]           for r in metrics_rows]
+    res_means         = [r["residual_mean"]          for r in metrics_rows]
+    res_medians       = [r["residual_median"]        for r in metrics_rows]
+    res_hl_means      = [r["residual_mean_hl"]       for r in metrics_rows]
+
+    lines = [
+        f"=== Analisi bias colore NeRF — iter {iter_done} ===",
+        f"Frame valutati          : {len(metrics_rows)}",
+        f"Pixel aggregati scatter : {n_agg}",
+        "",
+        "── PSNR ──────────────────────────────────────────",
+        f"  PSNR lineare (HDR)    : {float(np.mean(psnrs)):.3f} dB",
+        f"  PSNR tonemap clip     : {_nanmean(psnr_tm_clips):.3f} dB",
+        f"  PSNR tonemap Reinhard : {_nanmean(psnr_tm_reinhards):.3f} dB",
+        "  (tonemap clip ≈ qualità range diffuso senza coda HDR)",
+        "",
+        "── Highlight (percentili di luminanza GT) ────────",
+        f"  Errore relativo medio p99   : {_nanmean(rel_p99s):.4f}",
+        f"  Errore relativo medio p99.9 : {_nanmean(rel_p999s):.4f}",
+        "",
+        "── Residui con segno (pred − gt) ─────────────────",
+        f"  Media globale   : {_nanmean(res_means):.5f}  (>0 sovrastima, <0 sottostima)",
+        f"  Mediana globale : {_nanmean(res_medians):.5f}",
+        f"  Media highlight (gt>1) : {_nanmean(res_hl_means):.5f}",
+        "",
+        "── Ratio mediana pred/gt per fascia (canali aggregati) ───",
+        "   ratio < 1 = sottostima, ratio > 1 = sovrastima",
+        "   (vedi bias_bins.csv per il dettaglio completo)",
+    ]
+    for ch_name, _cp, _cg in _channels:
+        ch_bins = [r for r in bins_rows if r["channel"] == ch_name and r["ratio"] != "nan"]
+        hl_bins = [r for r in ch_bins if float(r["center_gt"]) > 1.0]
+        diff_bins = [r for r in ch_bins if float(r["center_gt"]) <= 1.0]
+        ratio_diff = float(np.mean([float(r["ratio"]) for r in diff_bins])) if diff_bins else float("nan")
+        ratio_hl   = float(np.mean([float(r["ratio"]) for r in hl_bins]))   if hl_bins else float("nan")
+        lines.append(f"  {ch_name:<5}  range diffuso (gt≤1): {ratio_diff:.3f}  "
+                     f"highlight (gt>1): {ratio_hl:.3f}" if not np.isnan(ratio_hl)
+                     else f"  {ch_name:<5}  range diffuso (gt≤1): {ratio_diff:.3f}  "
+                          f"highlight (gt>1): n/a (nessun campione)")
+
+    summary_path = base / "metrics_summary.txt"
+    with open(summary_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+    print(f"[Step 2b] Completato — PSNR medio={float(np.mean(psnrs)):.2f} dB  "
+          f"tonemap-clip={_nanmean(psnr_tm_clips):.2f} dB → {base}")
+    print(f"  Scritti: metrics_per_frame.csv, bias_bins.csv, "
+          f"metrics_summary.txt, bias_scatter_all.png")
 
 
 def _step3_posttrain_assets(cfg: PipelineConfig,
@@ -1657,7 +1835,7 @@ if __name__ == "__main__":
             external_normal_resolution_mode = "resample",  # "adapt" | "resample" | "none"
             transforms_path = f"{REPO}/Scenes/TableAndOther/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/TableAndOther/Models/Baked.obj",
-            output_dir      = "D:/tesi_output/new_scene_nerf_color_mapping_fix_resize_normal_map_exp",
+            output_dir      = "D:/tesi_output/new_scene_nerf_color_mapping_fix_resize_normal_map_exp_nuovo_grafico_confronto_gt",
 
             render_depth    = True,
             render_position = True,  # Step 1 produces only depth+mask
