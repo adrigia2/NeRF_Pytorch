@@ -92,7 +92,9 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    decay_steps = cfg.lrate_decay * 1000
+    # Decay spalmato sull'intero run (incluso l'eventuale resume):
+    # lr → 0.1·lr all'ultima iterazione pianificata.
+    decay_steps = iter_start + num_iters
     loss_window: deque[torch.Tensor] = deque(maxlen=display_every)
     mse_window:  deque[torch.Tensor] = deque(maxlen=display_every)
 
