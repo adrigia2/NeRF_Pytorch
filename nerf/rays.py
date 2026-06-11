@@ -30,13 +30,13 @@ def get_rays_np(H, W, K, c2w):
 
 
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0.0, bg_color=None,
-                hdr_activation=False):
+                rgb_activation="softplus"):
     """Convert raw NeRF output to RGB, depth and compositing weights.
 
     raw: (..., N_samples, 4) — [RGB, sigma] from network
     z_vals: (..., N_samples)
     rays_d: (..., 3)
-    hdr_activation: if True, use exp(x) for RGB instead of softplus.
+    rgb_activation: "exp" (HDR) or "softplus".
     Returns: rgb_map, disp_map, acc_map, weights, depth_map
     """
     dists = z_vals[..., 1:] - z_vals[..., :-1]
@@ -44,10 +44,13 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0.0, bg_color=None,
     # convert t-distances to world-space distances
     dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
 
-    if hdr_activation:
+    if rgb_activation == "exp":
         rgb = torch.exp(raw[..., :3])
-    else:
+    elif rgb_activation == "softplus":
         rgb = F.softplus(raw[..., :3])
+    else:
+        raise ValueError(f"Unknown rgb_activation: {rgb_activation!r} "
+                         f"(expected 'exp' or 'softplus')")
 
     noise = 0.0
     if raw_noise_std > 0.0:

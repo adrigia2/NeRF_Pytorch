@@ -674,6 +674,13 @@ class RenderConfig:
     # Irradiance map (Monte Carlo skybox lighting per-texel)
     render_irradiance: bool = False
     irradiance_format: ImageFormat = ImageFormat.OPENEXR
+    # Sorgente dell'envmap usato dal pass irradiance:
+    #   "file" → EXR equirettangolare letto da skybox_path
+    #   "nerf" → bake della bg-sphere del NeRF allenato (checkpoint risolto come per
+    #            l'indirect: indirect_nerf_cache_path o <output_dir>/model/...).
+    #            skybox_path non è richiesto; la mappa bakata viene salvata come
+    #            skybox_nerf_baked.exr per ispezione/confronto con la GT.
+    skybox_source: str = "file"
     skybox_path: str = ""                # path al file EXR equirettangolare
     skybox_size: list[int] = field(default_factory=lambda: [1024, 512])  # resize target
     irradiance_sample_side: int = 16     # N → N×N campioni per emisfero (16 = 256, 256 = 65536)
@@ -732,12 +739,57 @@ class PipelineConfig:
     nerf_bg_depth_window_end:  float = 2.0
     nerf_profile_iters: int = 0         # per-fase timing sincronizzato per i primi N iter (0=off)
 
+    # Attivazione RGB e loss del training (Step 2).
+    # nerf_rgb_activation: "exp" (HDR) | "softplus"
+    # nerf_loss_type:      "l1" | "mse" | "rel_mse" (RawNeRF) | "log_l1"
+    # N.B. checkpoint salvati con un'attivazione NON sono compatibili con l'altra.
+    nerf_rgb_activation: str = "exp"
+    nerf_loss_type:      str = "rel_mse"
+
     # Render dei frame di training col NeRF allenato (post-Step 2)
     enable_nerf_render_train_images: bool = False
     nerf_render_train_images_dir:    str  = ""  # default: <output_dir>/nerf_render_images
 
     # Se True, chiede all'utente di continuare il training al termine di ogni round
     nerf_interactive_loop: bool = True
+
+
+def _resolve_nerf_ckpt_path(cfg: RenderConfig) -> str:
+    """Path del checkpoint NeRF usato dai pass di Step 3 (indirect, skybox bake)."""
+    path = cfg.indirect_nerf_cache_path
+    if not path:
+        path = os.path.join(cfg.output_dir, "model", "nerf_model_cache.pt")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"NeRF model cache non trovato: {path}\n"
+            "Imposta indirect_nerf_cache_path oppure eseguire prima Step 2."
+        )
+    return path
+
+
+def _bake_skybox_from_nerf(cfg: RenderConfig, sky_w: int, sky_h: int,
+                           json_dir: Path) -> np.ndarray:
+    """Bake della bg-sphere del NeRF in envmap equirettangolare (skybox_source="nerf").
+
+    Salva skybox_nerf_baked.exr in json_dir per ispezione e restituisce (N, 3) float32
+    nello stesso layout flat di _load_image_as_vec3.
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from nerf import load_checkpoint, bake_envmap
+    import torch
+
+    ckpt_path = _resolve_nerf_ckpt_path(cfg)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_bundle, nerf_cfg = load_checkpoint(ckpt_path, device)
+    print(f"[Step 3] Bake skybox da NeRF ({sky_w}×{sky_h}, "
+          f"yaw={cfg.skybox_yaw_degrees}°) — ckpt: {ckpt_path}")
+    baked = bake_envmap(model_bundle, nerf_cfg, sky_w, sky_h,
+                        yaw_degrees=cfg.skybox_yaw_degrees)
+    out_path = (json_dir / "skybox_nerf_baked.exr").resolve().as_posix()
+    get_writer(ImageFormat.OPENEXR).write(baked, out_path)
+    print(f"[Step 3] Skybox bakata salvata: {out_path}")
+    return baked.reshape(-1, 3)
 
 
 def _precompute_indirect_irradiance(
@@ -757,14 +809,7 @@ def _precompute_indirect_irradiance(
     import OptixProgrammablePasses as optix
 
     # ── Carica il modello NeRF dal cache ──────────────────────────────────────
-    cache_path = cfg.indirect_nerf_cache_path
-    if not cache_path:
-        cache_path = os.path.join(cfg.output_dir, "model", "nerf_model_cache.pt")
-    if not os.path.exists(cache_path):
-        raise FileNotFoundError(
-            f"NeRF model cache non trovato: {cache_path}\n"
-            "Imposta indirect_nerf_cache_path oppure eseguire prima Step 2."
-        )
+    cache_path = _resolve_nerf_ckpt_path(cfg)
 
     import torch
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1019,7 +1064,8 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
         bg_depth_window           = cfg.nerf_bg_depth_window,
         bg_depth_window_end       = cfg.nerf_bg_depth_window_end,
         profile_iters             = cfg.nerf_profile_iters,
-        use_hdr_activation       = True,
+        rgb_activation            = cfg.nerf_rgb_activation,
+        loss_type                 = cfg.nerf_loss_type,
     )
 
     print(f"[Step 2] Training NeRF (depth-guided) — {cfg.nerf_num_iters} iter, ckpt → {ckpt}")
@@ -1669,19 +1715,23 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
 
         # ── Irradiance (Monte Carlo skybox) ──────────────────────────────────
         irr_res = None
-        if (rc.render_irradiance and rc.skybox_path
+        if (rc.render_irradiance
+                and (rc.skybox_path or rc.skybox_source == "nerf")
                 and ium_res.has_positions() and ium_res.has_normals()):
             print(f"[Step 3] Calcolo Irradiance "
                   f"({rc.irradiance_sample_side}×{rc.irradiance_sample_side} samples)…")
             sky_w, sky_h = rc.skybox_size[0], rc.skybox_size[1]
-            # Usa lo skybox normalizzato dal JSON se disponibile (stessa scala di color+NeRF)
-            norm_sky_rel = output_json.get("normalization", {}).get("normalized_skybox_path", "")
-            if norm_sky_rel:
-                norm_sky_abs = (json_dir / norm_sky_rel).resolve().as_posix()
-                skybox_src = norm_sky_abs if Path(norm_sky_abs).exists() else rc.skybox_path
+            if rc.skybox_source == "nerf":
+                skybox_flat = _bake_skybox_from_nerf(rc, sky_w, sky_h, json_dir)
             else:
-                skybox_src = rc.skybox_path
-            skybox_flat = _load_image_as_vec3(skybox_src, sky_w, sky_h)
+                # Usa lo skybox normalizzato dal JSON se disponibile (stessa scala di color+NeRF)
+                norm_sky_rel = output_json.get("normalization", {}).get("normalized_skybox_path", "")
+                if norm_sky_rel:
+                    norm_sky_abs = (json_dir / norm_sky_rel).resolve().as_posix()
+                    skybox_src = norm_sky_abs if Path(norm_sky_abs).exists() else rc.skybox_path
+                else:
+                    skybox_src = rc.skybox_path
+                skybox_flat = _load_image_as_vec3(skybox_src, sky_w, sky_h)
             irr_gen = optix_mod.IrradianceGenerator()
             irr_gen.set_traversable(model)
             irr_gen.set_inputs(ium_res, skybox_flat, [sky_w, sky_h],
@@ -1835,7 +1885,7 @@ if __name__ == "__main__":
             external_normal_resolution_mode = "resample",  # "adapt" | "resample" | "none"
             transforms_path = f"{REPO}/Scenes/TableAndOther/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/TableAndOther/Models/Baked.obj",
-            output_dir      = "D:/tesi_output/new_scene_nerf_color_mapping_fix_resize_normal_map_exp_nuovo_grafico_confronto_gt",
+            output_dir      = "D:/tesi_output/generate_skybox",
 
             render_depth    = True,
             render_position = True,  # Step 1 produces only depth+mask
@@ -1848,10 +1898,10 @@ if __name__ == "__main__":
             debug_pixel_change    = False,
 
             render_irradiance      = True,
-            
+            skybox_source          = "nerf",  # "nerf" | "external"
 
-            skybox_path            = f"{REPO}/Scenes/TableAndOther/Blender/assets/hdri/suburban_garden_4k.exr",
-            skybox_size            = [1024, 512],
+            # skybox_path            = f"{REPO}/Scenes/TableAndOther/Blender/assets/hdri/suburban_garden_4k.exr",
+            skybox_size            = [2048, 1024],
             irradiance_sample_side = 512,
 
             precompute_indirect           = True,
@@ -1877,7 +1927,7 @@ if __name__ == "__main__":
 
         ),
 
-        nerf_num_iters     = 20000,
+        nerf_num_iters     = 2000,
         nerf_batch_size    = 4096*24,
         nerf_lr            = 5e-4,
         nerf_display_every = 100,

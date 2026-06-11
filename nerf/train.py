@@ -15,11 +15,22 @@ from .render import render_image, render_rays_depth, render_unified
 
 
 def _rel_mse(pred, target, eps=1e-3):
-    """Relative MSE: weights each pixel by its predicted intensity."""
+    """Relative MSE: weights each pixel by its predicted intensity (RawNeRF)."""
     return (((pred - target) ** 2) / (pred.detach() ** 2 + eps)).mean()
 
 def _mse(pred, target):
     return ((pred - target) ** 2).mean()
+
+def _log_l1(pred, target):
+    """L1 in log1p space: compresses highlights, boosts shadow gradients."""
+    return F.l1_loss(torch.log1p(pred), torch.log1p(target))
+
+LOSSES = {
+    "l1":      F.l1_loss,
+    "mse":     _mse,
+    "rel_mse": _rel_mse,
+    "log_l1":  _log_l1,
+}
 
 
 def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: str,
@@ -33,8 +44,14 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
     torch.manual_seed(seed)
     np.random.seed(seed)
 
+    if cfg.loss_type not in LOSSES:
+        raise ValueError(f"Unknown loss_type: {cfg.loss_type!r} "
+                         f"(expected one of {sorted(LOSSES)})")
+    loss_fn = LOSSES[cfg.loss_type]
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"  NeRF training on: {device}")
+    print(f"  NeRF training on: {device}  "
+          f"(activation={cfg.rgb_activation}, loss={cfg.loss_type})")
 
     dataset = NerfDataset(transforms_path, device, composite_white=False)
 
@@ -119,10 +136,7 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
         if _profiling: _sync(); _prof["render"] += time.perf_counter() - _t0
 
         # ── loss ─────────────────────────────────────────────────────────────
-        if cfg.use_hdr_activation:
-            loss = F.l1_loss(rgb_pred, rgb_gt)
-        else:
-            loss = _rel_mse(rgb_pred, rgb_gt)
+        loss = loss_fn(rgb_pred, rgb_gt)
 
         # ── per-ray MSE per PSNR (no grad) ───────────────────────────────────
         with torch.no_grad():
@@ -178,8 +192,7 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
             win_times   = list(_iter_times)
             iters_per_s = len(win_times) / max(sum(win_times), 1e-9)
             rays_per_s  = batch_size * iters_per_s
-            loss_name = "l1_loss" if cfg.use_hdr_activation else "rel_loss"
-            print(f"  iter {i + 1}  {loss_name}={recent_loss:.4f}  PSNR≈{psnr:.2f} dB  "
+            print(f"  iter {i + 1}  {cfg.loss_type}={recent_loss:.4f}  PSNR≈{psnr:.2f} dB  "
                   f"lr={new_lr:.2e}  {iters_per_s:.1f} it/s  {rays_per_s/1e3:.0f}k rays/s")
 
             with torch.no_grad():

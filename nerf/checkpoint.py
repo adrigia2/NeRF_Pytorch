@@ -25,7 +25,7 @@ def _build_models(cfg: NerfConfig, device):
                  input_ch_views=input_ch_views, skips=list(cfg.skips),
                  use_viewdirs=cfg.use_viewdirs).to(device)
 
-    if cfg.use_hdr_activation and cfg.use_viewdirs:
+    if cfg.rgb_activation == "exp" and cfg.use_viewdirs:
         with torch.no_grad():
             torch.nn.init.constant_(model.rgb_linear.bias, cfg.hdr_init_bias)
 
@@ -57,7 +57,12 @@ def load_checkpoint(path: str, device=None):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ckpt = torch.load(path, map_location=device)
-    cfg_dict = ckpt["config"]
+    cfg_dict = dict(ckpt["config"])
+    # Legacy checkpoints: map the old use_hdr_activation flag onto the new fields.
+    if "rgb_activation" not in cfg_dict and "use_hdr_activation" in cfg_dict:
+        hdr = bool(cfg_dict["use_hdr_activation"])
+        cfg_dict["rgb_activation"] = "exp" if hdr else "softplus"
+        cfg_dict["loss_type"]      = "l1"  if hdr else "rel_mse"
     valid_keys = {f.name for f in dataclasses.fields(NerfConfig)}
     cfg = NerfConfig(**{k: v for k, v in cfg_dict.items() if k in valid_keys})
 

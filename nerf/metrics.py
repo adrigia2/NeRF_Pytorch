@@ -4,10 +4,8 @@ Funzioni pure NumPy: confronto pred-vs-GT per fascia di luminanza,
 PSNR tonemappato, errore relativo agli highlight.
 plot_bias_scatter richiede matplotlib (backend Agg).
 
-Compatibile con entrambe le modalità di training:
-  use_hdr_activation=False (softplus + rel_MSE)
-  use_hdr_activation=True  (exp + L1)
-Entrambe producono output HDR (valori > 1 ammessi).
+Compatibile con tutte le combinazioni di training (rgb_activation × loss_type):
+entrambe le attivazioni ("exp", "softplus") producono output HDR (valori > 1 ammessi).
 """
 from __future__ import annotations
 

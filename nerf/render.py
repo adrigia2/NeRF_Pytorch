@@ -57,7 +57,7 @@ def render_rays_depth(rays_o, rays_d, model, embed_fn, embeddirs_fn, cfg: NerfCo
     raw = _run_network(pts, rays_d, model, embed_fn, embeddirs_fn, cfg.chunk)
     rgb, _, acc, _, _ = raw2outputs(raw, z_vals, rays_d, cfg.raw_noise_std,
                                     bg_color=bg_color,
-                                    hdr_activation=cfg.use_hdr_activation)
+                                    rgb_activation=cfg.rgb_activation)
     if return_acc:
         return rgb, acc
     return rgb
@@ -136,7 +136,7 @@ def render_unified(rays_o, rays_d, depths, in_mask, model, embed_fn, embeddirs_f
     pts = eff_origin[:, None, :] + eff_dir[:, None, :] * z_vals[:, :, None]
     raw = _run_network(pts, eff_dir, model, embed_fn, embeddirs_fn, cfg.chunk)
     rgb, _, acc, _, _ = raw2outputs(raw, z_vals, eff_dir, cfg.raw_noise_std,
-                                    hdr_activation=cfg.use_hdr_activation)
+                                    rgb_activation=cfg.rgb_activation)
     if return_acc:
         return rgb, acc
     return rgb
@@ -204,6 +204,48 @@ def render_image(model_bundle, H: int, W: int, focal_x: float, pose_4x4,
                 model, embed_fn, embeddirs_fn, cfg, perturb=False)
 
     return result_rgb.reshape(H, W, 3).cpu().numpy().astype(np.float32)
+
+
+def bake_envmap(model_bundle, cfg: NerfConfig, width: int, height: int,
+                *, yaw_degrees: float = 0.0) -> np.ndarray:
+    """Bake the NeRF background sphere into an equirectangular envmap.
+
+    Inverts the lookup convention of sampleEnvmap in deviceProgramsIrradiance.cu
+    (world Z-up, azimuth atan2(dx, -dy) → Blender -Y forward at u=0.5, yaw as a
+    U-axis shift), so the baked EXR can be fed to IrradianceGenerator.set_inputs
+    with the same skybox_yaw_degrees and is pixel-comparable to a real skybox file.
+
+    Returns (height, width, 3) float32 radiance in the NeRF training scale.
+    """
+    model, embed_fn, embeddirs_fn, device, center, sphere_radius = model_bundle
+
+    yaw_offset_u = (yaw_degrees * np.pi / 180.0) / (2.0 * np.pi)
+    yaw_offset_u -= np.floor(yaw_offset_u)  # wrap a [0, 1) come Irradiance_Generator.cpp
+
+    px = (np.arange(width,  dtype=np.float32) + 0.5) / width    # u
+    py = (np.arange(height, dtype=np.float32) + 0.5) / height   # v
+    u, v = np.meshgrid(px, py, indexing="xy")
+
+    # v = 0.5 - asin(dz)/π  →  dz = sin(π·(0.5 - v))
+    elev   = np.pi * (0.5 - v)
+    dz     = np.sin(elev)
+    cos_el = np.cos(elev)
+    # u = 0.5 + atan2(dx, -dy)/(2π) + yaw_offset_u  →  φ = 2π·(u - 0.5 - yaw_offset_u)
+    phi = 2.0 * np.pi * (u - 0.5 - yaw_offset_u)
+    dx  = np.sin(phi) * cos_el
+    dy  = -np.cos(phi) * cos_el
+
+    dirs = torch.tensor(np.stack([dx, dy, dz], axis=-1).reshape(-1, 3),
+                        device=device, dtype=torch.float32)
+
+    model.eval()
+    chunks = []
+    with torch.no_grad():
+        for i in range(0, dirs.shape[0], cfg.chunk):
+            chunks.append(render_bg(dirs[i:i + cfg.chunk], center, sphere_radius,
+                                    model, embed_fn, embeddirs_fn, cfg, perturb=False))
+    rgb = torch.cat(chunks, 0).cpu().numpy().astype(np.float32)
+    return rgb.reshape(height, width, 3)
 
 
 def query_radiance(model_bundle, origins_np: np.ndarray, dirs_np: np.ndarray,

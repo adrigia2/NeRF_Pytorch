@@ -20,11 +20,14 @@ class NerfConfig:
     far: float = 20.0          # overwritten at runtime from sphere radius
     perturb: bool = True
     raw_noise_std: float = 0.0
-    # HDR mode: torch.exp activation on RGB + L1 loss instead of softplus + rel_MSE.
-    # Better fidelity on highlights; mirrors NeILFMLP/pbrnerf.
-    # Note: checkpoints saved with use_hdr_activation=False are NOT compatible with True (different weight scales).
-    use_hdr_activation: bool = False
-    # Initial bias of rgb_linear when use_hdr_activation=True.
+    # RGB output activation: "exp" (HDR, mirrors NeILFMLP/pbrnerf) or "softplus".
+    # Note: checkpoints saved with one activation are NOT compatible with the
+    # other (different weight scales).
+    rgb_activation: str = "exp"
+    # Training loss: "l1" | "mse" | "rel_mse" (RawNeRF-style weighted MSE,
+    # balances shadows vs highlights) | "log_l1" (L1 on log1p).
+    loss_type: str = "l1"
+    # Initial bias of rgb_linear when rgb_activation="exp".
     # exp(hdr_init_bias) ≈ rgb output at iter 0; choose ~log(scene_target_mean).
     # -3 → exp(-3)≈0.05; -5 → exp(-5)≈0.007. Required to avoid exp dead-zone collapse.
     hdr_init_bias: float = -3.0
