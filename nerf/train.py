@@ -15,8 +15,24 @@ from .render import render_image, render_rays_depth, render_unified
 
 
 def _rel_mse(pred, target, eps=1e-3):
-    """Relative MSE: weights each pixel by its predicted intensity."""
+    """Relative MSE: weights each pixel by its predicted intensity (RawNeRF-style).
+
+    eps should be ~(scene_mean)^2 so dark-pixel weights don't saturate; default 1e-3
+    is appropriate for normalised data (mean ≈ 0.03–0.1).
+    """
     return (((pred - target) ** 2) / (pred.detach() ** 2 + eps)).mean()
+
+
+def _tonemap_l1(pred, target):
+    """L1 loss in log1p (ψ=log(1+x)) space.
+
+    For x≫1 (sky/highlights): log(1+x·a) ≈ log(x)+log(a) → relative error, correct for
+    HDR data and albedo = color/irradiance ratios.
+    For x≪1 (dark areas): log1p(x) ≈ x → absolute L1, stable without any eps division.
+    Recommended default for HDR training.
+    """
+    return F.l1_loss(torch.log1p(pred), torch.log1p(target))
+
 
 def _mse(pred, target):
     return ((pred - target) ** 2).mean()
@@ -119,10 +135,15 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
         if _profiling: _sync(); _prof["render"] += time.perf_counter() - _t0
 
         # ── loss ─────────────────────────────────────────────────────────────
-        if cfg.use_hdr_activation:
+        if cfg.loss_type == "tonemap_l1":
+            loss = _tonemap_l1(rgb_pred, rgb_gt)
+        elif cfg.loss_type == "rel_mse":
+            loss = _rel_mse(rgb_pred, rgb_gt)
+        elif cfg.loss_type == "l1":
             loss = F.l1_loss(rgb_pred, rgb_gt)
         else:
-            loss = _rel_mse(rgb_pred, rgb_gt)
+            raise ValueError(f"Unknown loss_type: {cfg.loss_type!r}. "
+                             "Use 'tonemap_l1', 'rel_mse', or 'l1'.")
 
         # ── per-ray MSE per PSNR (no grad) ───────────────────────────────────
         with torch.no_grad():

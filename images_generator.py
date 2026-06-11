@@ -604,9 +604,18 @@ class RenderConfig:
     output_dir: str
 
     # Normalizzazione HDR delle immagini sorgente (Step 1).
-    # Divisore = skybox.max() se skybox_path è impostato, altrimenti max sulle immagini sorgente.
-    # Lo skybox normalizzato viene salvato come skybox_normalized.exr e usato in Step 3.
+    # Quando normalize_images=True, tutte le immagini (e la skybox se fornita) vengono divise
+    # per un unico divisore calcolato come percentile della skybox (se presente) o delle immagini.
+    # Nessun clamp: i valori > divisore restano > 1, preservando la fisica del rapporto albedo.
+    # Il divisore è applicato in modo IDENTICO a color, skybox e output NeRF; albedo invariante.
+    #
+    # normalization_percentile: percentile usato per calcolare il divisore (0–100).
+    #   99.5  → ignora il top 0.5% (outlier estremi come il disco solare); raccomandato.
+    #   100.0 → usa il massimo assoluto (comportamento precedente, sensibile agli outlier).
+    #
+    # Se normalize_images=False: immagini copiate raw HDR, nessuna scala applicata.
     normalize_images: bool = False
+    normalization_percentile: float = 99.5
 
     # Cosa renderizzare
     render_depth:    bool = True
@@ -731,6 +740,11 @@ class PipelineConfig:
     nerf_bg_depth_window:      float = 2.0   # finestra bg [R - window, R + window_end]
     nerf_bg_depth_window_end:  float = 2.0
     nerf_profile_iters: int = 0         # per-fase timing sincronizzato per i primi N iter (0=off)
+    # Loss function (vedi NerfConfig.loss_type):
+    #   "tonemap_l1" (default) — L1 su log1p, relativa su bright, assoluta su dark; raccomandata per HDR.
+    #   "rel_mse"              — relative MSE RawNeRF-style.
+    #   "l1"                   — L1 lineare; solo per dati LDR [0,1].
+    nerf_loss_type: str = "tonemap_l1"
 
     # Render dei frame di training col NeRF allenato (post-Step 2)
     enable_nerf_render_train_images: bool = False
@@ -881,37 +895,48 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
     norm_divisor: float | None = None
     norm_source: str | None = None
     sky_norm_path: str | None = None  # path allo skybox normalizzato salvato
+    pct = rc.normalization_percentile  # shorthand
     if rc.normalize_images:
         if rc.skybox_path:
             sky_raw = _load_image_hw3_native(rc.skybox_path)
-            norm_divisor = float(sky_raw.max())
+            norm_divisor = float(np.percentile(sky_raw, pct))
             norm_source = "skybox"
-            print(f"[Step 1] Normalizzazione: skybox → max={norm_divisor:.6f}")
-            # Salva skybox normalizzato — usato da Step 3 per coerenza radiometrica
+            print(f"[Step 1] Normalizzazione: skybox → p{pct:.4g}={norm_divisor:.6f}")
+            # Salva skybox normalizzato — usato da Step 3 per coerenza radiometrica.
+            # NON si clampa: valori > norm_divisor restano > 1 (sole, highlight) per
+            # preservare il rapporto color/irradiance nell'albedo.
             sky_normalized = (sky_raw / norm_divisor).astype(np.float32)
             sky_norm_path = (json_dir / "skybox_normalized.exr").as_posix()
             get_writer(ImageFormat.OPENEXR).write(sky_normalized, sky_norm_path)
             sky_norm_path = _as_relative_to(sky_norm_path, json_dir_str)
             print(f"[Step 1] Skybox normalizzata salvata: {(json_dir / sky_norm_path).resolve()}")
         else:
-            running_max = 0.0
-            print("[Step 1] Normalizzazione: scansione immagini per trovare il max globale…")
+            # Accumula tutti i pixel per calcolare il percentile globale robusto
+            print(f"[Step 1] Normalizzazione: scansione immagini per p{pct:.4g} globale…")
+            all_pixels: list[np.ndarray] = []
             for frame in tf.frames:
                 src = Path(frame.file_path)
                 if not src.exists():
                     continue
                 arr = _load_image_hw3_native(str(src))
-                running_max = max(running_max, float(arr.max()))
-            norm_divisor = running_max
+                all_pixels.append(arr.reshape(-1))
+            if all_pixels:
+                stacked = np.concatenate(all_pixels)
+                norm_divisor = float(np.percentile(stacked, pct))
+            else:
+                norm_divisor = 0.0
             norm_source = "images"
-            print(f"[Step 1] Normalizzazione: immagini → max={norm_divisor:.6f}")
+            print(f"[Step 1] Normalizzazione: immagini → p{pct:.4g}={norm_divisor:.6f}")
         if norm_divisor <= 0:
-            print("[Step 1] ⚠  max = 0, normalizzazione disabilitata per questa run.")
+            print("[Step 1] ⚠  percentile = 0, normalizzazione disabilitata per questa run.")
             norm_divisor = None
 
     hist_dir = images_out_dir / "histograms"
     hist_edges: np.ndarray | None = None
     hist_counts: np.ndarray | None = None   # shape (256, 3)
+    # Per il calcolo automatico di hdr_init_bias (solo quando si normalizza)
+    _mean_sum: float = 0.0
+    _mean_count: int = 0
 
     for idx, frame in enumerate(tf.frames):
         print(f"\n[Step 1] Frame {idx + 1}/{len(tf.frames)}: {frame.stem}")
@@ -944,6 +969,10 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
             for ch in range(3):
                 c, _ = np.histogram(flat[:, ch], bins=hist_edges)
                 hist_counts[:, ch] += c
+            # Accumula la media per l'auto-calibrazione di hdr_init_bias
+            if norm_divisor is not None:
+                _mean_sum   += float(arr.mean())
+                _mean_count += 1
 
         camera = _camera_from_matrix(frame.transform_matrix, intr.camera_angle_y, [W, H], optix_mod)
         depth_gen.set_camera(camera)
@@ -983,13 +1012,27 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
     output_json["w"] = W
     output_json["frames"] = output_frames
 
+    # ── Calcolo automatico hdr_init_bias ─────────────────────────────────────
+    # exp(hdr_init_bias) ≈ mean_target_normalized. Necessario per evitare zone morte
+    # di exp(): troppo alto → gradienti esplodono; troppo basso → gradienti svaniscono.
+    hdr_init_bias_auto: float | None = None
+    if norm_divisor is not None and _mean_count > 0:
+        mean_normalized = _mean_sum / _mean_count
+        hdr_init_bias_auto = float(np.log(mean_normalized + 1e-6))
+        print(f"[Step 1] mean_target_norm={mean_normalized:.6f} "
+              f"→ hdr_init_bias_auto={hdr_init_bias_auto:.4f}")
+
     if norm_divisor is not None:
-        output_json["normalization"] = {
+        norm_entry: dict = {
             "max": float(norm_divisor),
+            "percentile": float(pct),
             "source": norm_source,
             "skybox_path": rc.skybox_path or None,
             "normalized_skybox_path": sky_norm_path,
         }
+        if hdr_init_bias_auto is not None:
+            norm_entry["hdr_init_bias_auto"] = hdr_init_bias_auto
+        output_json["normalization"] = norm_entry
 
     out_json_path = json_dir / "transforms_extended.json"
     with open(out_json_path, "w", encoding="utf-8") as fh:
@@ -1009,6 +1052,15 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
                 Path(rc.output_dir) / "model" / "nerf_model_cache.pt")
     out_dir = Path(cfg.nerf_train_output_dir or Path(rc.output_dir) / "nerf_train")
 
+    # Legge hdr_init_bias_auto dal JSON di Step 1 (calcolato dalla media dei target normalizzati).
+    # Se non presente (normalize_images=False o Step 1 non eseguito), usa il default del config.
+    hdr_init_bias_from_json: float | None = None
+    if transforms_extended_path.exists():
+        import json as _json
+        with open(transforms_extended_path, encoding="utf-8") as _f:
+            _ext = _json.load(_f)
+        hdr_init_bias_from_json = _ext.get("normalization", {}).get("hdr_init_bias_auto")
+
     nerf_cfg = NerfConfig(
         depth_window_samples      = cfg.nerf_depth_window_samples,
         depth_window              = cfg.nerf_depth_window,
@@ -1019,8 +1071,16 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
         bg_depth_window           = cfg.nerf_bg_depth_window,
         bg_depth_window_end       = cfg.nerf_bg_depth_window_end,
         profile_iters             = cfg.nerf_profile_iters,
-        use_hdr_activation       = True,
+        use_hdr_activation        = True,
+        loss_type                 = cfg.nerf_loss_type,
     )
+    if hdr_init_bias_from_json is not None:
+        nerf_cfg.hdr_init_bias = hdr_init_bias_from_json
+        print(f"[Step 2] hdr_init_bias auto-calibrato: {hdr_init_bias_from_json:.4f} "
+              f"(= log(mean_target_norm))")
+    else:
+        print(f"[Step 2] hdr_init_bias: {nerf_cfg.hdr_init_bias:.4f} (default — "
+              f"esegui Step 1 con normalize_images=True per la calibrazione automatica)")
 
     print(f"[Step 2] Training NeRF (depth-guided) — {cfg.nerf_num_iters} iter, ckpt → {ckpt}")
     print(f"[Step 2] campionamento depth-guided, mesh_window=[t-{cfg.nerf_depth_window}, t+{cfg.nerf_depth_window_end}], "
@@ -1674,8 +1734,22 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
             print(f"[Step 3] Calcolo Irradiance "
                   f"({rc.irradiance_sample_side}×{rc.irradiance_sample_side} samples)…")
             sky_w, sky_h = rc.skybox_size[0], rc.skybox_size[1]
-            # Usa lo skybox normalizzato dal JSON se disponibile (stessa scala di color+NeRF)
-            norm_sky_rel = output_json.get("normalization", {}).get("normalized_skybox_path", "")
+            # Usa lo skybox normalizzato dal JSON se disponibile (stessa scala di color+NeRF).
+            # COERENZA DI SCALA: color e irradiance devono usare la stessa scala s per
+            # ottenere albedo corretto (s si semplifica nel rapporto π·color/irr).
+            # Se normalize_images=True la skybox_normalized.exr è già nella scala s.
+            # Se normalize_images=False: sia color sia skybox sono raw → coerenti.
+            # ATTENZIONE: mischiare normalizzazione "da immagini" (s_img) con skybox grezza
+            # rompe l'albedo — in quel caso il warning qui sotto segnala l'incoerenza.
+            norm_meta = output_json.get("normalization", {})
+            norm_sky_rel = norm_meta.get("normalized_skybox_path", "")
+            _norm_source = norm_meta.get("source", "")
+            if _norm_source == "images" and not norm_sky_rel:
+                print("[Step 3] ⚠  ATTENZIONE COERENZA SCALA: le immagini sono normalizzate "
+                      "per s_img ma la skybox verrà usata raw. "
+                      "color(s_img) / irr(raw) → albedo ERRATO. "
+                      "Soluzione: fornire skybox_path in Step 1 con normalize_images=True, "
+                      "oppure disattivare normalize_images.")
             if norm_sky_rel:
                 norm_sky_abs = (json_dir / norm_sky_rel).resolve().as_posix()
                 skybox_src = norm_sky_abs if Path(norm_sky_abs).exists() else rc.skybox_path
@@ -1848,11 +1922,15 @@ if __name__ == "__main__":
             debug_pixel_change    = False,
 
             render_irradiance      = True,
-            
 
             skybox_path            = f"{REPO}/Scenes/TableAndOther/Blender/assets/hdri/suburban_garden_4k.exr",
             skybox_size            = [1024, 512],
             irradiance_sample_side = 512,
+
+            # Normalizzazione HDR: divide color, skybox e NeRF per lo stesso divisore lineare
+            # → albedo invariante. Usare normalize_images=True con skybox_path impostato.
+            normalize_images         = True,
+            normalization_percentile = 99.5,  # 99.5 = ignora top 0.5% (sole), 100.0 = max assoluto
 
             precompute_indirect           = True,
             indirect_sample_side          = 64,
@@ -1861,6 +1939,9 @@ if __name__ == "__main__":
 
             render_albedo = True,
             albedo_format = ImageFormat.OPENEXR,
+            # albedo_eps: clamp minimo del denominatore irr per evitare /0 sui texel in ombra.
+            # Con normalize_images=True l'irradiance è in ~[0,1], quindi 1e-3 è appropriato.
+            # Con HDR raw (normalize_images=False) il valore va scalato di conseguenza.
             albedo_eps    = 1e-3,
 
             depth_format         = ImageFormat.OPENEXR,
@@ -1873,7 +1954,6 @@ if __name__ == "__main__":
             apply_scale      = False,
 
             color_texture_image_source = "nerf",  # "nerf" | "gt"
-            
 
         ),
 
@@ -1886,8 +1966,6 @@ if __name__ == "__main__":
         enable_nerf_render_train_images = True,
         nerf_interactive_loop           = False,
 
-
-
         nerf_depth_window_samples      = 4,
         nerf_depth_window              = 0.1,
         nerf_depth_window_end          = 0.1,
@@ -1898,6 +1976,10 @@ if __name__ == "__main__":
         nerf_bg_depth_window_end       = 0.1,
 
         nerf_profile_iters = 0,
+
+        # Loss HDR raccomandata: L1 su log1p → errore relativo sui bright (cielo, irradiance),
+        # errore assoluto sui dark. Alternativa: "rel_mse". Solo per dati LDR [0,1]: "l1".
+        nerf_loss_type = "tonemap_l1",
     )
 
     run_pipeline(cfg)

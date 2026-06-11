@@ -20,14 +20,26 @@ class NerfConfig:
     far: float = 20.0          # overwritten at runtime from sphere radius
     perturb: bool = True
     raw_noise_std: float = 0.0
-    # HDR mode: torch.exp activation on RGB + L1 loss instead of softplus + rel_MSE.
-    # Better fidelity on highlights; mirrors NeILFMLP/pbrnerf.
+    # HDR mode: torch.exp activation on RGB instead of softplus.
     # Note: checkpoints saved with use_hdr_activation=False are NOT compatible with True (different weight scales).
     use_hdr_activation: bool = False
     # Initial bias of rgb_linear when use_hdr_activation=True.
-    # exp(hdr_init_bias) ≈ rgb output at iter 0; choose ~log(scene_target_mean).
-    # -3 → exp(-3)≈0.05; -5 → exp(-5)≈0.007. Required to avoid exp dead-zone collapse.
+    # exp(hdr_init_bias) ≈ mean RGB emitted at iter 0; must be ≈ log(mean_target) to keep exp
+    # in its productive gradient zone (too high → explosion, too low → vanishing gradients).
+    # After linear normalisation by s, mean_target ≈ mean_raw/s, so the correct value is
+    # log(mean_raw) - log(s) — more negative than the un-normalised case.
+    # images_generator.py computes and sets this automatically when normalize_images=True;
+    # -3 (≈0.05) is a reasonable fallback for un-normalised HDR (mean ~0.05–0.1).
     hdr_init_bias: float = -3.0
+
+    # Loss function used during training.
+    # "tonemap_l1"  (default) — L1 on log1p(pred) vs log1p(target): relative error on bright
+    #               pixels (correct for albedo = color/irr ratio), absolute on dark ones (stable).
+    #               Best choice when training on HDR data.
+    # "rel_mse"     — RawNeRF-style relative MSE: (pred-gt)² / (pred²+eps). Good relative
+    #               behaviour but eps=1e-3 over-weights dark pixels; eps should be tuned to scale.
+    # "l1"          — plain linear L1. Dominated by bright highlights; use only for LDR [0,1] data.
+    loss_type: str = "tonemap_l1"
 
     # Rendering chunking
     chunk: int = 1024 * 32
