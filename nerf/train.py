@@ -209,6 +209,10 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
                       f"target=[{_rgb_gt.min():.3f},{_rgb_gt.mean():.3f},{_rgb_gt.max():.3f}]")
 
             _save_preview(model_bundle, dataset, cfg, out_dir / f"preview_iter_{i+1:06d}.exr")
+            # Checkpoint periodico: permette il watch-mode di nerf_viewer e il
+            # resume da crash. Scrittura atomica, costo trascurabile vs preview.
+            save_checkpoint(ckpt_path, model, optimizer, i + 1, cfg,
+                            scene_center=center, sphere_radius=sphere_radius)
             if use_cuda:
                 torch.cuda.empty_cache()
             model.train()

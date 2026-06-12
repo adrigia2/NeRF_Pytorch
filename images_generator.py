@@ -1881,11 +1881,11 @@ if __name__ == "__main__":
 
 
         render = RenderConfig(
-            external_normal_path = f"{REPO}/Scenes/TableAndOther/BlenderBaked/BakedMaterial_normal.exr",
+            external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBaked/BakedMaterial_normal.exr",
             external_normal_resolution_mode = "resample",  # "adapt" | "resample" | "none"
-            transforms_path = f"{REPO}/Scenes/TableAndOther/NerfOpenEXR/transforms.json",
-            model_path      = f"{REPO}/Scenes/TableAndOther/Models/Baked.obj",
-            output_dir      = "D:/tesi_output/generate_skybox",
+            transforms_path = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXR/transforms.json",
+            model_path      = f"{REPO}/Scenes/TableAndOtherInterior/Models/Baked.obj",
+            output_dir      = "D:/tesi_output/interior",
 
             render_depth    = True,
             render_position = True,  # Step 1 produces only depth+mask
@@ -1927,7 +1927,7 @@ if __name__ == "__main__":
 
         ),
 
-        nerf_num_iters     = 2000,
+        nerf_num_iters     = 20000,
         nerf_batch_size    = 4096*24,
         nerf_lr            = 5e-4,
         nerf_display_every = 100,

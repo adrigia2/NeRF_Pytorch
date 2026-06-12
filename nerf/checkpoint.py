@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 from pathlib import Path
 
 import torch
@@ -36,6 +37,9 @@ def save_checkpoint(path: str, model, optimizer, iter_done: int, cfg: NerfConfig
                     scene_center=None, sphere_radius: float = 0.0) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     center_list = scene_center.tolist() if scene_center is not None else [0.0, 0.0, 0.0]
+    # Scrittura atomica (tmp + replace): un reader concorrente (es. nerf_viewer
+    # in watch-mode) non vede mai un file parziale.
+    tmp_path = str(path) + ".tmp"
     torch.save({
         "model_state":    model.state_dict(),
         "optimizer":      optimizer.state_dict(),
@@ -43,15 +47,17 @@ def save_checkpoint(path: str, model, optimizer, iter_done: int, cfg: NerfConfig
         "config":         {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)},
         "scene_center":   center_list,
         "sphere_radius":  float(sphere_radius),
-    }, path)
+    }, tmp_path)
+    os.replace(tmp_path, path)
 
 
-def load_checkpoint(path: str, device=None):
+def load_checkpoint(path: str, device=None, *, return_iter: bool = False):
     """Load a saved NeRF checkpoint.
 
     Returns:
         model_bundle: (model, embed_fn, embeddirs_fn, device, scene_center, sphere_radius)
         cfg: NerfConfig reconstructed from the saved config dict
+        iter_done: (only when return_iter=True) training iterations completed
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -74,4 +80,7 @@ def load_checkpoint(path: str, device=None):
                           device=device, dtype=torch.float32)
     radius = float(ckpt.get("sphere_radius", 0.0))
 
-    return (model, embed_fn, embeddirs_fn, device, center, radius), cfg
+    bundle = (model, embed_fn, embeddirs_fn, device, center, radius)
+    if return_iter:
+        return bundle, cfg, int(ckpt.get("iter_done", 0))
+    return bundle, cfg
