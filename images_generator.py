@@ -669,6 +669,10 @@ class RenderConfig:
     color_texture_image_source: str = "gt"
     # Iterazione Step 2b da cui leggere i pred NeRF. -1 = usa l'ultima disponibile.
     color_texture_nerf_iter: int = -1
+    # Angolo massimo (in gradi) dalla normale del texel oltre il quale il contributo
+    # di una camera viene scartato (vista troppo radente → bleed dello sfondo ai bordi).
+    # 90.0 = filtro disabilitato; default operativo 75° (scarta entro 15° dalla tangente).
+    color_texture_grazing_max_deg: float = 75.0
 
     # Debug output
     debug_camera_texture: bool = False   # salva side-by-side camera image vs camera_texture
@@ -1870,7 +1874,8 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
                 optix_frames.append(optix_mod.Frame(cam, peak, img_flat))
 
             ct_gen = optix_mod.ColorTexGenerator()
-            ct_gen.set_inputs(ium_res, visibility_map, optix_frames)
+            ct_gen.set_inputs(ium_res, visibility_map, optix_frames,
+                              grazing_max_deg=rc.color_texture_grazing_max_deg)
             ct_gen.render()
             ct_result = ct_gen.get_result()
 
@@ -2114,7 +2119,7 @@ if __name__ == "__main__":
             external_normal_resolution_mode = "resample",  # "adapt" | "resample" | "none"
             transforms_path = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/TableAndOtherInterior/Models/Baked.obj",
-            output_dir      = "D:/tesi_output/fixskybox",
+            output_dir      = "D:/tesi_output/filtertangent",
 
             render_depth    = True,
             render_position = True,  # Step 1 produces only depth+mask
