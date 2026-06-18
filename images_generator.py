@@ -47,6 +47,10 @@ class DataLayer(Enum):
     IRRADIANCE          = auto() # energia HDR per texel (RGB float)
     IRRADIANCE_INDIRECT = auto() # contributo indiretto NeRF per texel (RGB float)
     ALBEDO              = auto() # riflettanza HDR per texel (RGB float)
+    SPEC_CONE           = auto() # radianza media cono speculare L_j(r) (RGB float HDR)
+    METALLIC            = auto() # specularità 1−X del fit PBR, [0,1] (float)
+    ROUGHNESS           = auto() # apertura cono / 180 dove attendibile, [0,1] (float)
+    SPEC_CONE_R         = auto() # apertura cono best-fit in gradi (float)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -213,7 +217,9 @@ def _save_layer(
       - MASK              → già uint8 0/1; nessuna normalizzazione applicata.
     """
     needs_raw = layer in {DataLayer.DEPTH, DataLayer.POSITION, DataLayer.NORMAL,
-                          DataLayer.IRRADIANCE, DataLayer.IRRADIANCE_INDIRECT, DataLayer.ALBEDO}
+                          DataLayer.IRRADIANCE, DataLayer.IRRADIANCE_INDIRECT, DataLayer.ALBEDO,
+                          DataLayer.SPEC_CONE, DataLayer.METALLIC, DataLayer.ROUGHNESS,
+                          DataLayer.SPEC_CONE_R}
 
     if needs_raw and not fmt.supports_raw_float:
         print(f"    ⚠  {fmt.value} non supporta float raw ({layer.name}) → normalizzo in [0,1]")
@@ -699,6 +705,28 @@ class RenderConfig:
     indirect_depth_window: float = 0.5
     indirect_depth_window_end: float = 0.0
 
+    # Specular cone pass — precompute L_j(r_k) per il fit PBR C_j = X·D + (1-X)·L_j(r).
+    # Campionamento ad anelli concentrici attorno al raggio riflesso: ogni raggio è
+    # tracciato/interrogato una volta e i coni si ricostruiscono per cumulativa pesata
+    # (vedi _precompute_spec_cone). Richiede render_ium, render_visibility e il
+    # checkpoint NeRF (come precompute_indirect); usa la stessa skybox dell'irradiance.
+    precompute_spec_cone: bool = False
+    # Aperture TOTALI dei coni in gradi, crescenti, primo elemento = 0 (raggio specchio)
+    spec_cone_apertures_deg: list[float] = field(
+        default_factory=lambda: [0.0, 10.0, 25.0, 50.0, 90.0, 130.0, 180.0])
+    spec_cone_samples_per_ring: int = 32
+    spec_cone_tile_size: int = 1024
+    spec_cone_cameras: list[int] | None = None  # indici frame da processare (None = tutti)
+    spec_cone_format: ImageFormat = ImageFormat.OPENEXR
+
+    # Mappe PBR finali (pbr_solver) — richiede precompute_spec_cone, color_texture
+    # con pixel_change e visibility. Salva metallic/metallic.exr (= 1−X) e
+    # roughness/roughness.exr (= r/180 dove attendibile, 1.0 altrove), come l'albedo.
+    render_pbr_maps: bool = False
+    pbr_min_views: int = 2
+    pbr_diffuse_cv_gate: float = 0.05  # std tra camere < gate·luminanza → diffuso
+    pbr_spec_threshold: float = 0.2    # metallic minimo perché r sia attendibile
+
     # Albedo (color_texture / irradiance) — modello Lambertiano ρ = π · L / E
     render_albedo: bool = False
     albedo_format: ImageFormat = ImageFormat.OPENEXR
@@ -792,6 +820,24 @@ def _bake_skybox_from_nerf(cfg: RenderConfig, sky_w: int, sky_h: int,
     return baked.reshape(-1, 3)
 
 
+def _resolve_skybox_flat(cfg: RenderConfig, output_json: dict, json_dir: Path,
+                         sky_w: int, sky_h: int) -> np.ndarray:
+    """Skybox flat (H*W, 3) per i pass Step 3 (irradiance, spec_cone).
+
+    skybox_source="nerf" → bake dalla bg-sphere del NeRF; altrimenti preferisce
+    lo skybox normalizzato dal JSON (stessa scala di color+NeRF) se presente.
+    """
+    if cfg.skybox_source == "nerf":
+        return _bake_skybox_from_nerf(cfg, sky_w, sky_h, json_dir)
+    norm_sky_rel = output_json.get("normalization", {}).get("normalized_skybox_path", "")
+    if norm_sky_rel:
+        norm_sky_abs = (json_dir / norm_sky_rel).resolve().as_posix()
+        skybox_src = norm_sky_abs if Path(norm_sky_abs).exists() else cfg.skybox_path
+    else:
+        skybox_src = cfg.skybox_path
+    return _load_image_as_vec3(skybox_src, sky_w, sky_h)
+
+
 def _precompute_indirect_irradiance(
     cfg: RenderConfig,
     ium_res,        # IUM_Generator.Result
@@ -868,6 +914,156 @@ def _precompute_indirect_irradiance(
     _save_layer(irr_indirect_arr, indirect_path, cfg.indirect_format,
                 DataLayer.IRRADIANCE_INDIRECT)
     print(f"✓ irradiance_indirect salvato: {indirect_path}")
+
+
+def _precompute_spec_cone(
+    cfg: RenderConfig,
+    ium_res,            # IUM_Generator.Result
+    model,              # OptixProgrammablePasses.TriangleMesh
+    ium_w: int,
+    ium_h: int,
+    frames,             # tf.frames (per le posizioni camera)
+    visibility_map: np.ndarray,   # flat (num_pix * n_cams) uint8
+    n_cams: int,
+    skybox_flat: "np.ndarray | None",
+    sky_size: list[int],
+    out_dir: Path,
+) -> None:
+    """Precompute L_j(r_k): radianza media su coni concentrici attorno al raggio
+    riflesso R_j = reflect(v_j, n), per ogni camera selezionata e ogni apertura
+    della griglia. Serve al fit PBR  C_j = X·D + (1-X)·L_j(r)  (pbr_solver.py).
+
+    Campionamento ad anelli (deviceProgramsSpecCone.cu): ogni raggio è tracciato
+    e interrogato sul NeRF una volta sola; i coni si ricostruiscono per somma
+    cumulativa pesata sugli angoli solidi degli anelli:
+        L(r_k) = Σ_{i≤k} Ω_i·sum_i / Σ_{i≤k} Ω_i·valid_i
+    Livello 0 = raggio specchio puro. Miss → envmap (su GPU), hit → query NeRF.
+
+    Output in out_dir: cam_{j:03d}_r{k:02d}.exr (K livelli per camera),
+    cam_{j:03d}_valid.png (texel con almeno un campione) e spec_cone_meta.json.
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from nerf import load_checkpoint, query_radiance
+    import OptixProgrammablePasses as optix
+    import torch
+
+    cache_path = _resolve_nerf_ckpt_path(cfg)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_bundle, nerf_cfg = load_checkpoint(cache_path, device)
+    if cfg.indirect_override_depth_window:
+        nerf_cfg.depth_window     = cfg.indirect_depth_window
+        nerf_cfg.depth_window_end = cfg.indirect_depth_window_end
+    print(f"✓ NeRF model caricato da: {cache_path}")
+
+    apertures = [float(a) for a in cfg.spec_cone_apertures_deg]
+    K = len(apertures)                  # livelli: 0 = specchio, 1..K-1 = coni
+    M = cfg.spec_cone_samples_per_ring
+
+    gen = optix.SpecConeGenerator()
+    gen.set_traversable(model)
+    gen.set_inputs(ium_res, apertures, M, cfg.spec_cone_tile_size)
+    if skybox_flat is not None:
+        gen.set_envmap(skybox_flat.astype(np.float32), sky_size,
+                       cfg.skybox_yaw_degrees)
+    else:
+        print("    ⚠  spec_cone senza skybox: i raggi miss contribuiscono 0")
+
+    num_pix = gen.num_pixels()
+    n_tiles = gen.num_tiles()
+    tile_sz = cfg.spec_cone_tile_size
+
+    # Angoli solidi degli anelli (semi-apertura = apertura totale / 2)
+    cos_b = np.cos(np.radians(np.asarray(apertures)) * 0.5)
+    omega = 2.0 * np.pi * (cos_b[:-1] - cos_b[1:])      # (K-1,) anelli 1..K-1
+
+    ium_positions_np = ium_res.positions_np.astype(np.float32)
+    ium_normals_np   = ium_res.normals_np.astype(np.float32)
+    eps = 1e-4
+
+    vis2d = np.asarray(visibility_map, dtype=np.uint8).reshape(num_pix, n_cams)
+    cam_indices = (list(cfg.spec_cone_cameras) if cfg.spec_cone_cameras
+                   else list(range(len(frames))))
+
+    os.makedirs(out_dir, exist_ok=True)
+    fmt = cfg.spec_cone_format
+
+    for j in cam_indices:
+        level_paths = [out_dir / f"cam_{j:03d}_r{k:02d}{fmt.extension}"
+                       for k in range(K)]
+        valid_path = out_dir / f"cam_{j:03d}_valid.png"
+        if all(p.exists() for p in level_paths) and valid_path.exists():
+            print(f"    cam {j}: già su disco, skip")
+            continue
+
+        m = frames[j].transform_matrix
+        cam_pos = [float(m[0][3]), float(m[1][3]), float(m[2][3])]
+        gen.set_camera(cam_pos, np.ascontiguousarray(vis2d[:, j]))
+
+        ring_sum = np.zeros((num_pix, K, 3), dtype=np.float64)
+        valid    = np.zeros((num_pix, K),    dtype=np.int64)
+
+        for tile_idx in range(n_tiles):
+            tile_res = gen.render_tile(tile_idx)
+            off = tile_idx * tile_sz
+            tt  = tile_res.tile_texels
+            ring_sum[off:off + tt] += tile_res.sky_sum_np.astype(np.float64)
+            valid[off:off + tt]    += tile_res.valid_count_np
+
+            if tile_res.count > 0:
+                local_idx = tile_res.local_idx_np.copy()
+                ring_idx  = tile_res.ring_idx_np.copy()
+                dirs_np   = tile_res.directions_np.copy()
+                t_hit_np  = tile_res.t_hit_np.copy()
+
+                global_idx = off + local_idx
+                origins_np = (ium_positions_np[global_idx]
+                              + ium_normals_np[global_idx] * eps)
+                colors = query_radiance(model_bundle, origins_np, dirs_np,
+                                        nerf_cfg, t_hits_np=t_hit_np)
+                np.add.at(ring_sum, (global_idx, ring_idx),
+                          np.asarray(colors, dtype=np.float64))
+
+            if (tile_idx + 1) % max(1, n_tiles // 10) == 0:
+                print(f"    cam {j}: tile {tile_idx + 1}/{n_tiles}, "
+                      f"raggi hit: {tile_res.count}")
+
+        L = np.zeros((num_pix, K, 3), dtype=np.float32)
+
+        # Livello 0: raggio specchio puro
+        mirror_ok = valid[:, 0] > 0
+        L[mirror_ok, 0] = (ring_sum[mirror_ok, 0]
+                           / valid[mirror_ok, 0][:, None]).astype(np.float32)
+
+        # Coni 1..K-1: cumulativa pesata sugli angoli solidi degli anelli
+        w_sum = np.cumsum(omega[None, :, None] * ring_sum[:, 1:], axis=1)
+        w_cnt = np.cumsum(omega[None, :] * valid[:, 1:], axis=1)
+        ok = w_cnt > 0
+        L[:, 1:][ok] = (w_sum[ok] / w_cnt[ok][:, None]).astype(np.float32)
+
+        cam_valid = (mirror_ok | ok[:, -1]).astype(np.uint8)
+
+        for k in range(K):
+            _save_layer(_reshape_flat(L[:, k], ium_w, ium_h),
+                        level_paths[k].resolve().as_posix(), fmt,
+                        DataLayer.SPEC_CONE)
+        _save_layer(_reshape_flat(cam_valid, ium_w, ium_h),
+                    valid_path.resolve().as_posix(), ImageFormat.PNG,
+                    DataLayer.MASK)
+        print(f"    ✓ cam {j}: {K} livelli salvati")
+
+    meta = {
+        "apertures_deg": apertures,
+        "samples_per_ring": M,
+        "cameras": [int(j) for j in cam_indices],
+        "num_levels": K,
+        "level_file_pattern": "cam_{cam:03d}_r{level:02d}" + fmt.extension,
+        "valid_file_pattern": "cam_{cam:03d}_valid.png",
+        "skybox_yaw_degrees": cfg.skybox_yaw_degrees,
+    }
+    with open(out_dir / "spec_cone_meta.json", "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, indent=2)
+    print(f"✓ spec_cone meta salvato: {out_dir / 'spec_cone_meta.json'}")
 
 
 def _find_nerf_pred_dir(base_root: Path, iter_sel: int) -> "Path | None":
@@ -1715,23 +1911,15 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
 
         # ── Irradiance (Monte Carlo skybox) ──────────────────────────────────
         irr_res = None
+        skybox_flat_step3 = None   # condivisa tra irradiance e spec_cone
         if (rc.render_irradiance
                 and (rc.skybox_path or rc.skybox_source == "nerf")
                 and ium_res.has_positions() and ium_res.has_normals()):
             print(f"[Step 3] Calcolo Irradiance "
                   f"({rc.irradiance_sample_side}×{rc.irradiance_sample_side} samples)…")
             sky_w, sky_h = rc.skybox_size[0], rc.skybox_size[1]
-            if rc.skybox_source == "nerf":
-                skybox_flat = _bake_skybox_from_nerf(rc, sky_w, sky_h, json_dir)
-            else:
-                # Usa lo skybox normalizzato dal JSON se disponibile (stessa scala di color+NeRF)
-                norm_sky_rel = output_json.get("normalization", {}).get("normalized_skybox_path", "")
-                if norm_sky_rel:
-                    norm_sky_abs = (json_dir / norm_sky_rel).resolve().as_posix()
-                    skybox_src = norm_sky_abs if Path(norm_sky_abs).exists() else rc.skybox_path
-                else:
-                    skybox_src = rc.skybox_path
-                skybox_flat = _load_image_as_vec3(skybox_src, sky_w, sky_h)
+            skybox_flat = _resolve_skybox_flat(rc, output_json, json_dir, sky_w, sky_h)
+            skybox_flat_step3 = skybox_flat
             irr_gen = optix_mod.IrradianceGenerator()
             irr_gen.set_traversable(model)
             irr_gen.set_inputs(ium_res, skybox_flat, [sky_w, sky_h],
@@ -1761,6 +1949,44 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
             if ind_arr is not None:
                 irr_indirect_flat = ind_arr
                 ium_result_data["irradiance_indirect_path"] = _as_relative_to(ind_path, json_dir_str)
+
+        # ── Specular cone L_j(r) via envmap + NeRF ───────────────────────────
+        if (rc.precompute_spec_cone and ium_res.has_positions()
+                and ium_res.has_normals() and visibility_map is not None):
+            sky_w, sky_h = rc.skybox_size[0], rc.skybox_size[1]
+            if skybox_flat_step3 is None and (rc.skybox_path or rc.skybox_source == "nerf"):
+                skybox_flat_step3 = _resolve_skybox_flat(rc, output_json, json_dir, sky_w, sky_h)
+            spec_dir = json_dir / "spec_cone"
+            print(f"[Step 3] Precompute Specular Cone L_j(r) "
+                  f"(aperture={rc.spec_cone_apertures_deg}°, "
+                  f"M={rc.spec_cone_samples_per_ring}/anello)…")
+            _precompute_spec_cone(rc, ium_res, model, ium_w, ium_h, tf.frames,
+                                  visibility_map, len(all_cameras),
+                                  skybox_flat_step3, [sky_w, sky_h], spec_dir)
+            ium_result_data["spec_cone_dir"] = _as_relative_to(
+                spec_dir.resolve().as_posix(), json_dir_str)
+
+        # ── PBR maps (metallic / roughness dal fit spec-cone) ────────────────
+        if rc.render_pbr_maps:
+            spec_meta = json_dir / "spec_cone" / "spec_cone_meta.json"
+            cmin_path = json_dir / "pixel_change" / "color_min.exr"
+            if spec_meta.exists() and cmin_path.exists():
+                from pbr_solver import solve_pbr
+                print("[Step 3] Fit PBR → metallic/roughness "
+                      f"(cv_gate={rc.pbr_diffuse_cv_gate}, "
+                      f"spec_threshold={rc.pbr_spec_threshold})…")
+                pbr_out = solve_pbr(json_dir_str,
+                                    cv_gate=rc.pbr_diffuse_cv_gate,
+                                    spec_threshold=rc.pbr_spec_threshold,
+                                    min_views=rc.pbr_min_views)
+                ium_result_data["metallic_path"] = _as_relative_to(
+                    pbr_out["metallic_path"], json_dir_str)
+                ium_result_data["roughness_path"] = _as_relative_to(
+                    pbr_out["roughness_path"], json_dir_str)
+            else:
+                print("    ⚠  render_pbr_maps: mancano spec_cone_meta.json o "
+                      "pixel_change/color_min.exr → skip "
+                      "(servono precompute_spec_cone e render_pixel_change)")
 
         # ── Albedo ───────────────────────────────────────────────────────────
         if (rc.render_albedo and ct_result is not None and irr_res is not None):
@@ -1842,7 +2068,9 @@ def run_pipeline(cfg: PipelineConfig) -> dict:
             if ans != "y":
                 break
 
-    elif cfg.run_step3 and cfg.render.precompute_indirect and not ckpt_path.exists():
+    elif (cfg.run_step3
+          and (cfg.render.precompute_indirect or cfg.render.precompute_spec_cone)
+          and not ckpt_path.exists()):
         raise FileNotFoundError(
             f"Step 2 disabilitato ma il checkpoint NeRF non esiste: {ckpt_path}\n"
             "Attivare run_step2=True oppure fornire nerf_ckpt_path valido."
@@ -1858,7 +2086,8 @@ def run_pipeline(cfg: PipelineConfig) -> dict:
         pass
 
     if cfg.run_step3:
-        if cfg.render.precompute_indirect and not cfg.render.indirect_nerf_cache_path:
+        if ((cfg.render.precompute_indirect or cfg.render.precompute_spec_cone)
+                and not cfg.render.indirect_nerf_cache_path):
             cfg.render.indirect_nerf_cache_path = str(ckpt_path)
 
         return _step3_posttrain_assets(cfg, transforms_extended, optix)
@@ -1885,7 +2114,7 @@ if __name__ == "__main__":
             external_normal_resolution_mode = "resample",  # "adapt" | "resample" | "none"
             transforms_path = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/TableAndOtherInterior/Models/Baked.obj",
-            output_dir      = "D:/tesi_output/interior",
+            output_dir      = "D:/tesi_output/test",
 
             render_depth    = True,
             render_position = True,  # Step 1 produces only depth+mask
@@ -1923,11 +2152,13 @@ if __name__ == "__main__":
             apply_scale      = False,
 
             color_texture_image_source = "nerf",  # "nerf" | "gt"
-            
+
+            precompute_spec_cone = False,
+            render_pbr_maps      = False,
 
         ),
 
-        nerf_num_iters     = 20000,
+        nerf_num_iters     = 5000,
         nerf_batch_size    = 4096*24,
         nerf_lr            = 5e-4,
         nerf_display_every = 100,

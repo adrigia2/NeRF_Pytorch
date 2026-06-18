@@ -12,6 +12,8 @@ Comandi (finestra attiva):
     A / D       orbita in azimut
     W / S       orbita in elevazione
     Q / E       zoom out / in
+    ← / →       pan del centro dell'orbita: sinistra / destra (right della camera)
+    ↑ / ↓       pan del centro dell'orbita: avanti / indietro (forward della camera)
     + / -       esposizione (±0.5 EV)
     H           render alla risoluzione del dataset (lento, una tantum)
     R           ricarica il checkpoint da disco
@@ -240,7 +242,8 @@ def main() -> None:
             cv2.imshow(win, disp)
             dirty = False
 
-        k = cv2.waitKey(50) & 0xFF
+        kraw = cv2.waitKeyEx(50)          # waitKeyEx: serve per i codici estesi (frecce)
+        k = (kraw & 0xFF) if kraw != -1 else 255   # valore mascherato per i tasti ASCII
         if k == 27:                       # ESC
             break
         elif k in (ord("a"), ord("A")):
@@ -255,6 +258,22 @@ def main() -> None:
             viewer.radius *= ZOOM; dirty = True
         elif k in (ord("e"), ord("E")):
             viewer.radius /= ZOOM; dirty = True
+        # frecce: pan del centro dell'orbita relativo all'orientamento della camera (3D pieno)
+        elif kraw in (65361, 2424832, 65363, 2555904,    # left / right
+                      65362, 2490368, 65364, 2621440):   # up / down
+            c2w_cur = _orbit_c2w(viewer.center, viewer.radius, viewer.az, viewer.el)
+            cam_right = c2w_cur[:3, 0]
+            cam_fwd = -c2w_cur[:3, 2]                     # direzione verso cui guarda la camera
+            step = viewer.radius * 0.1
+            if kraw in (65361, 2424832):      # ←  sinistra
+                viewer.center -= cam_right * step
+            elif kraw in (65363, 2555904):    # →  destra
+                viewer.center += cam_right * step
+            elif kraw in (65362, 2490368):    # ↑  avanti (lungo il forward della camera)
+                viewer.center += cam_fwd * step
+            else:                             # ↓  indietro
+                viewer.center -= cam_fwd * step
+            dirty = True
         elif k in (ord("+"), ord("=")):
             viewer.ev += 0.5; dirty = True
         elif k == ord("-"):
