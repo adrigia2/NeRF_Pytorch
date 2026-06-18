@@ -211,7 +211,7 @@ def bake_envmap(model_bundle, cfg: NerfConfig, width: int, height: int,
     """Bake the NeRF background sphere into an equirectangular envmap.
 
     Inverts the lookup convention of sampleEnvmap in deviceProgramsIrradiance.cu
-    (world Z-up, azimuth atan2(dx, -dy) → Blender -Y forward at u=0.5, yaw as a
+    (world Z-up, azimuth -atan2(dy, dx) → Blender equirectangular convention, yaw as a
     U-axis shift), so the baked EXR can be fed to IrradianceGenerator.set_inputs
     with the same skybox_yaw_degrees and is pixel-comparable to a real skybox file.
 
@@ -230,10 +230,11 @@ def bake_envmap(model_bundle, cfg: NerfConfig, width: int, height: int,
     elev   = np.pi * (0.5 - v)
     dz     = np.sin(elev)
     cos_el = np.cos(elev)
-    # u = 0.5 + atan2(dx, -dy)/(2π) + yaw_offset_u  →  φ = 2π·(u - 0.5 - yaw_offset_u)
-    phi = 2.0 * np.pi * (u - 0.5 - yaw_offset_u)
-    dx  = np.sin(phi) * cos_el
-    dy  = -np.cos(phi) * cos_el
+    # u = 0.5 - atan2(dy, dx)/(2π) + yaw_offset_u  →  atan2(dy,dx) = 2π·(0.5 + yaw_offset_u - u)
+    # → dx = cos(φ)·cos_el, dy = sin(φ)·cos_el  with φ = 2π·(0.5 + yaw_offset_u - u)
+    phi = 2.0 * np.pi * (0.5 + yaw_offset_u - u)
+    dx  =  np.cos(phi) * cos_el
+    dy  =  np.sin(phi) * cos_el
 
     dirs = torch.tensor(np.stack([dx, dy, dz], axis=-1).reshape(-1, 3),
                         device=device, dtype=torch.float32)

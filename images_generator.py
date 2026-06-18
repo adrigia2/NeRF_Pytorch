@@ -2114,7 +2114,7 @@ if __name__ == "__main__":
             external_normal_resolution_mode = "resample",  # "adapt" | "resample" | "none"
             transforms_path = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXR/transforms.json",
             model_path      = f"{REPO}/Scenes/TableAndOtherInterior/Models/Baked.obj",
-            output_dir      = "D:/tesi_output/test",
+            output_dir      = "D:/tesi_output/fixskybox",
 
             render_depth    = True,
             render_position = True,  # Step 1 produces only depth+mask
