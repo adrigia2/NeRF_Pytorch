@@ -9,10 +9,12 @@ non supporta dati raw (float), normalizza automaticamente i valori in [0,1].
 
 from __future__ import annotations
 
+import copy
+import datetime
 import json
 import os
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from typing import Protocol
@@ -784,6 +786,17 @@ class PipelineConfig:
 
     # Se True, chiede all'utente di continuare il training al termine di ogni round
     nerf_interactive_loop: bool = True
+
+
+@dataclass
+class SceneConfig:
+    """Campi che variano per scena, usati da run_pipeline_multi."""
+    name: str                               # nome della sottocartella di output (es. "SwordShield")
+    transforms_path: str
+    model_path: str
+    external_normal_path: str | None = None  # sovrascrive RenderConfig solo se non None
+    skybox_path: str | None = None           # usato solo se skybox_source == "file"
+    note: str = ""                           # nota opzionale specifica della scena
 
 
 def _resolve_nerf_ckpt_path(cfg: RenderConfig) -> str:
@@ -2102,24 +2115,99 @@ def run_pipeline(cfg: PipelineConfig) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Manifest per-run e runner multi-scena
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _write_run_manifest(cfg: PipelineConfig, scene: SceneConfig, run_note: str) -> None:
+    """Salva run_manifest.json in output_dir con config completa + timestamp + nota."""
+    def _enc(o: object) -> str:
+        if isinstance(o, Enum):
+            return o.name
+        if isinstance(o, Path):
+            return str(o)
+        return str(o)
+
+    manifest = {
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+        "run_note": run_note,
+        "scene": asdict(scene),
+        "config": asdict(cfg),   # include output_dir e tutti i path già risolti per la scena
+    }
+    out = Path(cfg.render.output_dir) / "run_manifest.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2, ensure_ascii=False, default=_enc)
+    print(f"  manifest salvato → {out}")
+
+
+def run_pipeline_multi(
+    template: PipelineConfig,
+    scenes: list[SceneConfig],
+    output_root: str,
+    run_note: str = "",
+) -> dict:
+    """Esegue run_pipeline su ogni scena in sequenza, in sottocartelle distinte.
+
+    Per ogni SceneConfig:
+    - clona ``template`` (deep-copy, sicuro con i default_factory mutabili)
+    - sovrascrive i path per-scena e ``output_dir = <output_root>/<scene.name>``
+    - scrive ``run_manifest.json`` nella sottocartella
+    - chiama ``run_pipeline``
+
+    ``nerf_ckpt_path`` / ``nerf_train_output_dir`` restano ``""`` nel template e vengono
+    derivati automaticamente da ``output_dir`` per scena (un checkpoint per scena).
+
+    Returns:
+        dict scena → risultato di run_pipeline
+    """
+    results: dict = {}
+    for scene in scenes:
+        cfg = copy.deepcopy(template)
+        cfg.render.transforms_path = scene.transforms_path
+        cfg.render.model_path      = scene.model_path
+        if scene.external_normal_path is not None:
+            cfg.render.external_normal_path = scene.external_normal_path
+        if scene.skybox_path is not None:
+            cfg.render.skybox_path = scene.skybox_path
+        cfg.render.output_dir = os.path.join(output_root, scene.name)
+        os.makedirs(cfg.render.output_dir, exist_ok=True)
+
+        full_note = scene.note if scene.note else run_note
+        _write_run_manifest(cfg, scene, full_note)
+
+        print(f"\n{'='*70}")
+        print(f"  Scena : {scene.name}")
+        print(f"  Output: {cfg.render.output_dir}")
+        print(f"{'='*70}")
+        results[scene.name] = run_pipeline(cfg)
+
+    return results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     REPO = "C:/Users/adria/Documents/GitHub/Tesi/OptixProjectCMake"
 
-    cfg = PipelineConfig(
+    # ── Template condiviso ────────────────────────────────────────────────────
+    # I path specifici della scena (transforms_path, model_path, external_normal_path,
+    # skybox_path) sono vuoti qui e vengono sovrascritti per ogni SceneConfig.
+    # Tutti gli altri parametri di rendering/NeRF sono condivisi tra le scene.
+    template = PipelineConfig(
         run_step1 = True,
         run_step2 = True,
         run_step3 = True,
 
-
         render = RenderConfig(
-            external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBaked/BakedMaterial_normal.exr",
+            # path per-scena (sovrascritta da SceneConfig — non modificare qui)
+            transforms_path      = "",
+            model_path           = "",
+            external_normal_path = None,
+            output_dir           = "",  # impostato come <output_root>/<scene.name>
+
             external_normal_resolution_mode = "resample",  # "adapt" | "resample" | "none"
-            transforms_path = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXR/transforms.json",
-            model_path      = f"{REPO}/Scenes/TableAndOtherInterior/Models/Baked.obj",
-            output_dir      = "D:/tesi_output/filtertangent",
 
             render_depth    = True,
             render_position = True,  # Step 1 produces only depth+mask
@@ -2132,15 +2220,15 @@ if __name__ == "__main__":
             debug_pixel_change    = False,
 
             render_irradiance      = True,
-            skybox_source          = "nerf",  # "nerf" | "external"
+            skybox_source          = "nerf",  # "nerf" | "file"
 
-            # skybox_path            = f"{REPO}/Scenes/TableAndOther/Blender/assets/hdri/suburban_garden_4k.exr",
+            # skybox_path          = f"{REPO}/Scenes/TableAndOther/Blender/assets/hdri/suburban_garden_4k.exr",
             skybox_size            = [2048, 1024],
             irradiance_sample_side = 512,
 
-            precompute_indirect           = True,
-            indirect_sample_side          = 64,
-            indirect_tile_size            = 1024,
+            precompute_indirect            = True,
+            indirect_sample_side           = 64,
+            indirect_tile_size             = 1024,
             indirect_override_depth_window = False,
 
             render_albedo = True,
@@ -2160,7 +2248,6 @@ if __name__ == "__main__":
 
             precompute_spec_cone = False,
             render_pbr_maps      = False,
-
         ),
 
         nerf_num_iters     = 5000,
@@ -2171,8 +2258,6 @@ if __name__ == "__main__":
 
         enable_nerf_render_train_images = True,
         nerf_interactive_loop           = False,
-
-
 
         nerf_depth_window_samples      = 4,
         nerf_depth_window              = 0.1,
@@ -2186,4 +2271,29 @@ if __name__ == "__main__":
         nerf_profile_iters = 0,
     )
 
-    run_pipeline(cfg)
+    # ── Scene ─────────────────────────────────────────────────────────────────
+    # Aggiungere/commentare SceneConfig per scegliere quali scene processare.
+    # L'output di ogni scena finisce in <output_root>/<scene.name>/.
+    SCENES = [
+        # SceneConfig(
+        #     name             = "TableAndOtherInterior",
+        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXR/transforms.json",
+        #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/Models/Baked.obj",
+        #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBaked/BakedMaterial_normal.exr",
+        # ),
+        SceneConfig(
+            name            = "SwordShield",
+            transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
+            model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
+        ),
+    ]
+
+    # ── Esecuzione ────────────────────────────────────────────────────────────
+    # run_note descrive le modifiche fatte al codice per questo run.
+    # Viene salvato in run_manifest.json di ogni scena.
+    run_pipeline_multi(
+        template,
+        SCENES,
+        output_root = "D:/tesi_output/filtertangent_multiscene_test",
+        run_note    = "Aggiunta della possiblità di eseguire il codice su più scene",
+    )
