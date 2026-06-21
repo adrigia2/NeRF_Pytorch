@@ -2248,6 +2248,9 @@ if __name__ == "__main__":
 
             precompute_spec_cone = False,
             render_pbr_maps      = False,
+
+            color_texture_grazing_max_deg = 75.0
+
         ),
 
         nerf_num_iters     = 5000,
@@ -2269,18 +2272,19 @@ if __name__ == "__main__":
         nerf_bg_depth_window_end       = 0.1,
 
         nerf_profile_iters = 0,
+
     )
 
     # ── Scene ─────────────────────────────────────────────────────────────────
     # Aggiungere/commentare SceneConfig per scegliere quali scene processare.
     # L'output di ogni scena finisce in <output_root>/<scene.name>/.
     SCENES = [
-        # SceneConfig(
-        #     name             = "TableAndOtherInterior",
-        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXR/transforms.json",
-        #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/Models/Baked.obj",
-        #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBaked/BakedMaterial_normal.exr",
-        # ),
+        SceneConfig(
+            name             = "TableAndOtherInterior",
+            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXR/transforms.json",
+            model_path       = f"{REPO}/Scenes/TableAndOtherInterior/Models/Baked.obj",
+            external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBaked/BakedMaterial_normal.exr",
+        ),
         SceneConfig(
             name            = "SwordShield",
             transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
@@ -2294,6 +2298,7 @@ if __name__ == "__main__":
     run_pipeline_multi(
         template,
         SCENES,
-        output_root = "D:/tesi_output/filtertangent_multiscene_test",
-        run_note    = "Aggiunta della possiblità di eseguire il codice su più scene",
+        output_root = "D:/tesi_output/test_tangent_75deg",
+        run_note    = "Test tangent 75° grazing angle in color texture"
     )
+    
