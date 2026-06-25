@@ -30,7 +30,7 @@ Uso (tre modalità equivalenti — stessa pipeline `BakeConfig` + `run`):
 bl_info = {
     "name": "Bake Unified Material",
     "author": "Adriano Cicco",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > Bake",
     "description": "Unisce le mesh della scena, baka i materiali in texture PBR "
@@ -52,7 +52,6 @@ import math
 import os
 from dataclasses import dataclass, field
 from enum import Enum
-from quopri import decode
 from typing import Dict, List, Optional, Tuple
 
 import bpy
@@ -239,7 +238,11 @@ def _new_target_image(name: str, width: int, height: int, fmt: TextureFormat, co
         alpha=False,
         float_buffer=fmt.use_float_buffer,
     )
-    image.colorspace_settings.name = colorspace
+    try:
+        image.colorspace_settings.name = colorspace
+    except TypeError:
+        # Il nome del colorspace potrebbe differire fra versioni/config OCIO.
+        pass
     return image
 
 
@@ -308,8 +311,17 @@ def _cleanup_bake_nodes(created) -> None:
 # Bake: pass nativi (DIFFUSE / ROUGHNESS / NORMAL)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _bake_native(bake_type: str, **kwargs) -> None:
-    bpy.ops.object.bake(type=bake_type, **kwargs)
+def _bake_native(bake_type: str, **kwargs) -> bool:
+    """Esegue un pass di bake nativo. Aggiorna il depsgraph prima di avviare il
+    bake e ritorna True se l'operatore ha completato con successo."""
+    bpy.context.view_layer.update()
+    try:
+        result = bpy.ops.object.bake(type=bake_type, **kwargs)
+        return 'FINISHED' in result
+    except RuntimeError as exc:
+        print(f"bake_unified_material: WARNING – bake nativo {bake_type} "
+              f"fallito: {exc}")
+        return False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -317,20 +329,29 @@ def _bake_native(bake_type: str, **kwargs) -> None:
 # Base Color quando `base_color_via_emission=True`)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _bake_emission(materials: List[bpy.types.Material], socket_name: str) -> None:
+def _bake_emission(materials: List[bpy.types.Material], socket_name: str,
+                   bake_nodes: list) -> bool:
     """Baka il valore del socket `socket_name` del Principled BSDF di ogni
     materiale, reindirizzandolo temporaneamente attraverso un nodo Emission
     e usando `bake(type='EMIT')`. Ripristina sempre i node tree originali
     (anche in caso di errore), grazie al `try/finally`.
 
-    Materiali privi di Principled BSDF o del socket richiesto vengono
-    semplicemente saltati: le loro isole UV resteranno al colore di clear
-    dell'immagine target (nessun valore scritto per quelle facce)."""
+    Materiali privi di Principled BSDF o del socket richiesto vengono saltati:
+    le loro isole UV resteranno al colore di clear dell'immagine target.
+
+    `bake_nodes` è la lista (mat, tex_node) restituita da `_setup_bake_nodes`:
+    viene usata per re-asserire il nodo Image Texture come nodo attivo *dopo*
+    aver creato il nodo Emission (che ruberebbe lo stato "active" altrimenti).
+
+    Ritorna True se il bake ha completato con successo."""
     setups = []
+    bake_success = False
     try:
         for mat in materials:
             principled = _get_principled(mat)
             if principled is None or socket_name not in principled.inputs:
+                print(f"bake_unified_material: skip '{mat.name if mat else None}' "
+                      f"— nessun Principled BSDF con socket '{socket_name}'.")
                 continue
 
             node_tree = mat.node_tree
@@ -338,10 +359,13 @@ def _bake_emission(materials: List[bpy.types.Material], socket_name: str) -> Non
 
             output_node = _get_active_output(node_tree)
             if output_node is None or "Surface" not in output_node.inputs:
+                print(f"bake_unified_material: skip '{mat.name}' "
+                      f"— nessun nodo Output Material attivo.")
                 continue
             surface_input = output_node.inputs["Surface"]
 
-            original_link = surface_input.links[0].from_socket if surface_input.is_linked else None
+            original_link = (surface_input.links[0].from_socket
+                             if surface_input.is_linked else None)
 
             emission = nodes.new("ShaderNodeEmission")
             emission.label = "_BAKE_EMISSION_"
@@ -355,7 +379,29 @@ def _bake_emission(materials: List[bpy.types.Material], socket_name: str) -> Non
             links.new(emission.outputs["Emission"], surface_input)
             setups.append((node_tree, surface_input, original_link, emission))
 
-        bpy.ops.object.bake(type="EMIT")
+        if not setups:
+            print(f"bake_unified_material: WARNING – nessun materiale configurabile "
+                  f"per l'emission-swap di '{socket_name}': il canale sarà nero.")
+
+        # Re-asserire il nodo Image Texture come nodo attivo: nodes.new() sopra ha
+        # rubato lo stato "active" assegnandolo al nodo Emission — senza questo
+        # passaggio il bake EMIT non ha un target valido e il canale esce nero.
+        for mat, tex_node in bake_nodes:
+            if mat is None or mat.node_tree is None:
+                continue
+            mat.node_tree.nodes.active = tex_node
+            tex_node.select = True
+
+        # Sincronizzare il depsgraph dopo la chirurgia sui nodi.
+        bpy.context.view_layer.update()
+
+        try:
+            result = bpy.ops.object.bake(type="EMIT")
+            bake_success = 'FINISHED' in result
+        except RuntimeError as exc:
+            print(f"bake_unified_material: WARNING – bake EMIT ('{socket_name}') "
+                  f"fallito: {exc}")
+            bake_success = False
     finally:
         for node_tree, surface_input, original_link, emission in setups:
             links = node_tree.links
@@ -364,19 +410,98 @@ def _bake_emission(materials: List[bpy.types.Material], socket_name: str) -> Non
             if original_link is not None:
                 links.new(original_link, surface_input)
             node_tree.nodes.remove(emission)
+    return bake_success
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline: setup, duplicazione, join, UV, bake, materiale, scena
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Ordine di preferenza per il tipo di device GPU Cycles.
+_GPU_DEVICE_TYPE_PRIORITY = ("OPTIX", "CUDA", "HIP", "METAL", "ONEAPI")
+
+
+def _enable_gpu_device() -> bool:
+    """Abilita il primo tipo di device GPU disponibile nelle preferenze di Cycles.
+
+    Blender richiede che `compute_device_type` sia impostato e che almeno un
+    device GPU sia abilitato (`device.use = True`) prima di avviare un bake su
+    GPU: senza questo passaggio i pass *shaded* (EMIT/DIFFUSE/ROUGHNESS) possono
+    tornare zero in modo non deterministico mentre il pass NORMAL (puramente
+    geometrico) scrive comunque, producendo il sintomo "tutto nero tranne normale".
+
+    Itera i tipi in ordine di preferenza (`_GPU_DEVICE_TYPE_PRIORITY`), prova
+    ognuno e si ferma al primo per cui `get_devices()` restituisce almeno un
+    device non-CPU. Ritorna True se almeno un device GPU è stato abilitato,
+    False se nessun device GPU è disponibile (il chiamante fa fallback a CPU)."""
+    try:
+        prefs = bpy.context.preferences.addons["cycles"].preferences
+    except (KeyError, AttributeError):
+        return False
+
+    for device_type in _GPU_DEVICE_TYPE_PRIORITY:
+        try:
+            prefs.compute_device_type = device_type
+            prefs.get_devices()
+        except (TypeError, AttributeError):
+            continue
+        gpu_devices = [d for d in prefs.devices if d.type != "CPU"]
+        if not gpu_devices:
+            continue
+        for d in gpu_devices:
+            d.use = True
+        enabled = sum(1 for d in gpu_devices if d.use)
+        print(f"bake_unified_material: device GPU abilitato "
+              f"({device_type}, {enabled} device attivi).")
+        return True
+
+    return False
+
+
 def _setup_render_settings(scene: bpy.types.Scene, cfg: BakeConfig) -> None:
     scene.render.engine = "CYCLES"
     scene.cycles.samples = cfg.samples
-    scene.cycles.device = cfg.device
     scene.render.bake.margin = cfg.bake_margin
     scene.render.bake.use_clear = True
     scene.render.bake.use_selected_to_active = False
+    if cfg.device == "GPU":
+        if _enable_gpu_device():
+            scene.cycles.device = "GPU"
+        else:
+            print("bake_unified_material: nessun device GPU disponibile, "
+                  "fallback a CPU.")
+            scene.cycles.device = "CPU"
+    else:
+        scene.cycles.device = "CPU"
+
+
+def _make_materials_single_user(objects: List[bpy.types.Object]) -> None:
+    """Rende single-user i materiali dei duplicati spezzando la condivisione con gli
+    originali.
+
+    `bpy.ops.object.duplicate(linked=False)` copia oggetto e dati mesh, ma i
+    materiali restano CONDIVISI per default (Blender non duplica i datablock dei
+    materiali). Il bake esegue chirurgia sui nodi (aggiunge Image Texture, emission-
+    swap del socket Surface): senza questa funzione quelle modifiche avvengono sui
+    materiali degli ORIGINALI — anche con il ripristino in `finally` — lasciando i
+    node tree in uno stato che causa crash alla prima re-valutazione del depsgraph.
+
+    I duplicati che condividevano lo stesso materiale ricevono la stessa copia
+    (dict orig → copia): il dedup-per-datablock in `_bake_all` e
+    `_pick_reference_material` rimane valido. Gli originali non vengono MAI toccati
+    dal bake."""
+    mat_copies: Dict[bpy.types.Material, bpy.types.Material] = {}
+    for obj in objects:
+        for slot in obj.material_slots:
+            orig = slot.material
+            if orig is None:
+                continue
+            if orig not in mat_copies:
+                mat_copies[orig] = orig.copy()
+            slot.material = mat_copies[orig]
+    if mat_copies:
+        print(f"bake_unified_material: {len(mat_copies)} materiale/i reso/i "
+              f"single-user — i materiali originali non saranno modificati dal bake.")
 
 
 def _duplicate_objects(source_objects: List[bpy.types.Object], view_layer: bpy.types.ViewLayer, cfg: BakeConfig) -> List[bpy.types.Object]:
@@ -396,6 +521,10 @@ def _duplicate_objects(source_objects: List[bpy.types.Object], view_layer: bpy.t
             obj.select_set(True)
         view_layer.objects.active = duplicates[0]
         bpy.ops.object.convert(target="MESH", keep_original=False)
+
+    # Spezza la condivisione dei materiali con gli originali: il bake farà chirurgia
+    # sui nodi delle COPIE, gli originali restano bit-per-bit intatti.
+    _make_materials_single_user(duplicates)
 
     return duplicates
 
@@ -539,6 +668,26 @@ def _pack_bake_uv(obj: bpy.types.Object, view_layer: bpy.types.ViewLayer, cfg: B
     return UV_LAYER_NAME
 
 
+def _do_bake_with_retry(bake_fn, channel: str) -> bool:
+    """Esegue `bake_fn()` con un singolo retry automatico se il bake fallisce.
+
+    Il fallimento random in blocco (tutti i canali shaded neri insieme) è
+    tipicamente causato da un depsgraph non sincronizzato o da un init del device
+    GPU non ancora completato al momento del primo bake. Un singolo retry, dopo
+    un `view_layer.update()` forzato, è sufficiente per recuperare in questi casi.
+
+    Ritorna True se il bake ha avuto successo (al primo tentativo o al retry)."""
+    success = bake_fn()
+    if not success:
+        print(f"bake_unified_material: bake '{channel}' fallito, eseguo retry...")
+        bpy.context.view_layer.update()
+        success = bake_fn()
+        if not success:
+            print(f"bake_unified_material: WARNING – bake '{channel}' fallito "
+                  f"anche dopo retry. La texture potrebbe essere nera.")
+    return success
+
+
 def _bake_all(obj: bpy.types.Object, cfg: BakeConfig) -> Dict[str, Tuple[bpy.types.Image, str]]:
     """Esegue il bake di ogni canale abilitato e lo salva su disco.
     Ritorna {canale: (image, path)}."""
@@ -576,23 +725,38 @@ def _bake_all(obj: bpy.types.Object, cfg: BakeConfig) -> Dict[str, Tuple[bpy.typ
         try:
             if channel == "base_color":
                 if cfg.base_color_via_emission:
-                    _bake_emission(materials, "Base Color")
+                    _do_bake_with_retry(
+                        lambda: _bake_emission(materials, "Base Color", bake_nodes),
+                        channel,
+                    )
                 else:
-                    _bake_native("DIFFUSE", pass_filter={"COLOR"})
+                    _do_bake_with_retry(
+                        lambda: _bake_native("DIFFUSE", pass_filter={"COLOR"}),
+                        channel,
+                    )
             elif channel == "roughness":
-                _bake_native("ROUGHNESS")
+                _do_bake_with_retry(
+                    lambda: _bake_native("ROUGHNESS"),
+                    channel,
+                )
             elif channel == "metallic":
-                _bake_emission(materials, "Metallic")
+                _do_bake_with_retry(
+                    lambda: _bake_emission(materials, "Metallic", bake_nodes),
+                    channel,
+                )
             elif channel == "normal":
                 # normal_r/g/b vanno passati DIRETTAMENTE all'operatore come kwargs:
                 # impostarli su scene.render.bake viene ignorato da bpy.ops.object.bake
                 # eseguito da script (l'operatore usa i propri default per i kwarg mancanti).
-                _bake_native(
-                    "NORMAL",
-                    normal_space=cfg.normal_space,
-                    normal_r=cfg.normal_r,
-                    normal_g=cfg.normal_g,
-                    normal_b=cfg.normal_b,
+                _do_bake_with_retry(
+                    lambda: _bake_native(
+                        "NORMAL",
+                        normal_space=cfg.normal_space,
+                        normal_r=cfg.normal_r,
+                        normal_g=cfg.normal_g,
+                        normal_b=cfg.normal_b,
+                    ),
+                    channel,
                 )
         finally:
             _cleanup_bake_nodes(bake_nodes)
@@ -603,7 +767,11 @@ def _bake_all(obj: bpy.types.Object, cfg: BakeConfig) -> Dict[str, Tuple[bpy.typ
         # sovrascrivendo quello corretto (Non-Color per roughness/metallic/normal).
         # Ripristinarlo subito così il nodo Image Texture nel materiale bakato
         # non applica trasformazioni di colore ai canali dati.
-        image.colorspace_settings.name = colorspace
+        try:
+            image.colorspace_settings.name = colorspace
+        except TypeError:
+            # Il nome del colorspace potrebbe differire fra versioni/config OCIO.
+            pass
         baked[channel] = (image, path)
 
     return baked
@@ -808,21 +976,53 @@ def _assemble_scene(cfg: BakeConfig, merged_obj: bpy.types.Object, material: bpy
     gli assegna come UNICO materiale quello unificato e attiva l'UV di bake.
     Se `cfg.copy_world` è True, condivide il World della scena sorgente (HDRI /
     environment map) con la nuova scena."""
-    # Prima dell'unlink: azzerare l'attivo e la selezione in ogni view_layer della
-    # scena sorgente che punta a merged_obj. Dopo l'unlink merged_obj non è più
-    # nella scena, ma view_layer.objects.active resterebbe un puntatore all'oggetto
-    # migrato → depsgraph incoerente → possibile crash quando l'utente interagisce
-    # con la scena sorgente (es. click, switch scena).
+    # Prima dell'unlink: azzerare TUTTI i riferimenti a merged_obj che restano
+    # in sessione dopo la migrazione nella nuova scena. Un puntatore pendente a un
+    # oggetto scollegato causa crash alla prima interazione utente (click, switch
+    # scena, apertura Properties editor, ecc.).
+
+    # 1. View layer della scena sorgente: active object.
     for vl in source_scene.view_layers:
         if vl.objects.active is merged_obj:
             vl.objects.active = None
     merged_obj.select_set(False)
+
+    # 2. Tutte le finestre aperte: view_layer.active e pin_id nei Properties editor.
+    for wm in bpy.data.window_managers:
+        for win in wm.windows:
+            # Active object per il view_layer della finestra (può differire dalla scena).
+            try:
+                if win.view_layer is not None and win.view_layer.objects.active is merged_obj:
+                    win.view_layer.objects.active = None
+            except (AttributeError, ReferenceError):
+                pass
+            # Pin nei Properties editor (Space Properties / Space Graph / ecc.).
+            try:
+                for area in win.screen.areas:
+                    for space in area.spaces:
+                        if getattr(space, "pin_id", None) is merged_obj:
+                            space.pin_id = None
+            except (AttributeError, ReferenceError):
+                pass
 
     for collection in list(merged_obj.users_collection):
         collection.objects.unlink(merged_obj)
 
     new_scene = bpy.data.scenes.new(cfg.new_scene_name)
     new_scene.collection.objects.link(merged_obj)
+
+    # Validazione diagnostica: la scena Baked deve contenere esattamente 1 oggetto.
+    scene_objs = list(new_scene.collection.objects)
+    if len(scene_objs) == 1 and scene_objs[0].name == cfg.merged_object_name:
+        print(f"bake_unified_material: scena '{cfg.new_scene_name}' contiene "
+              f"1 oggetto: '{cfg.merged_object_name}' ✓")
+    else:
+        names = [o.name for o in scene_objs]
+        print(f"bake_unified_material: WARNING – scena '{cfg.new_scene_name}' "
+              f"contiene {len(scene_objs)} oggetti: {names} "
+              f"(atteso: ['{cfg.merged_object_name}']) — possibile bug nel join.")
+    print(f"bake_unified_material: scena sorgente '{source_scene.name}' — "
+          f"{len(list(source_scene.objects))} oggetti (originali intatti).")
 
     if cfg.copy_world and source_scene.world is not None:
         new_scene.world = source_scene.world
@@ -840,17 +1040,20 @@ def _assemble_scene(cfg: BakeConfig, merged_obj: bpy.types.Object, material: bpy
 
 
 def _save_blend(cfg: BakeConfig, new_scene: bpy.types.Scene) -> str:
-    """Salva una copia del file .blend corrente (con la scena bakata) su disco.
+    """Salva una COPIA del file .blend corrente su disco, aprendosi sulla scena Baked.
 
-    Usa `save_as_mainfile(copy=True)` così la sessione corrente non cambia il
-    proprio filepath — il file è una copia autonoma che include la scena Baked,
-    le texture bakate (generate in RAM, salvate nel .blend) e il World/HDRI
-    referenziato dalla scena originale.
+    Comportamento di salvataggio (NON DISTRUTTIVO):
+    - `save_as_mainfile(copy=True)` NON cambia il filepath della sessione.
+    - NON sovrascrive né tocca il file .blend originale.
+    - Salva una copia autonoma in `cfg.output_dir` contenente la scena Baked, le
+      texture bakate (generate in RAM, pacchettizzate nel .blend) e il World/HDRI.
 
-    Questa funzione è progettata per essere chiamata FUORI dall'`execute()` di un
-    operatore (tipicamente via `bpy.app.timers`): chiamarla mentre un operatore
-    è in esecuzione cambia scene/context in un punto in cui il depsgraph li ha
-    già catturati, causando crash differiti alla prima interazione utente.
+    Per far aprire la copia direttamente sulla scena Baked (invece che sulla scena
+    sorgente), esegue uno switch temporaneo: imposta la scena attiva della finestra
+    su `new_scene`, salva con copy=True, poi ripristina la scena precedente in un
+    `finally`. Sicuro da un timer: il callback gira in un context pulito dopo che
+    l'operatore è già tornato, quindi non c'è rischio di invalidare il depsgraph
+    durante l'esecuzione dell'operatore.
     """
     filename = cfg.blend_filename or f"{cfg.new_scene_name}.blend"
     if not filename.lower().endswith(".blend"):
@@ -861,21 +1064,17 @@ def _save_blend(cfg: BakeConfig, new_scene: bpy.types.Scene) -> str:
     if directory and not os.path.isdir(directory):
         os.makedirs(directory, exist_ok=True)
 
-    # Imposta la scena bakata come attiva nella finestra così il file si apre
-    # direttamente su di essa.
-    # Non affidarsi a bpy.context.window: può essere None in un callback timer.
-    # Recuperare la finestra dalla lista window_managers (sempre valido).
     win = bpy.context.window
-    if win is None:
-        wms = bpy.data.window_managers
-        if wms:
-            wins = list(wms[0].windows)
-            if wins:
-                win = wins[0]
-    if win is not None:
+    prev_scene = win.scene
+    try:
+        # Switch temporaneo alla scena Baked: la copia .blend registrerà Baked come
+        # scena attiva → riaprendo il file si vede subito la mesh unita BakedMesh.
         win.scene = new_scene
-
-    bpy.ops.wm.save_as_mainfile(filepath=path, copy=True)
+        bpy.ops.wm.save_as_mainfile(filepath=path, copy=True)
+    finally:
+        # Ripristino garantito: la sessione live torna sulla scena sorgente originale,
+        # esattamente come stava prima del salvataggio, anche in caso di errore.
+        win.scene = prev_scene
     return path
 
 
@@ -1120,31 +1319,37 @@ class OBJECT_OT_bake_unified_material(bpy.types.Operator):
             return {'CANCELLED'}
 
         if cfg.save_blend:
-            # Deferire il salvataggio (e lo scene-swap) fuori dall'execute via timer.
-            # Chiamare save_as_mainfile / cambiare window.scene DENTRO un execute() è
-            # una causa documentata di crash differiti (context incoerente al ritorno
-            # dell'operatore). Con first_interval=0.0 il callback gira al primo tick
-            # successivo del loop eventi, in un context pulito.
+            # Deferire il salvataggio fuori dall'execute via timer.
+            # Chiamare save_as_mainfile DENTRO un execute() è una causa documentata
+            # di crash differiti (context incoerente al ritorno dell'operatore).
+            # Con first_interval=0.1 il callback gira ~100 ms dopo che l'operatore è
+            # tornato, in un context pulito.
+            # _save_blend fa switch → salva (copy=True) → ripristina: sicuro da timer.
             # Catturiamo solo dati per valore (stringhe, config) — mai riferimenti
-            # diretti a bpy.data (potrebbero diventare pendenti).
+            # diretti a bpy.data (potrebbero diventare pendenti se la scena venisse
+            # eliminata prima che il timer scatti).
             scene_name = new_scene.name
 
             def _deferred_save():
                 scn = bpy.data.scenes.get(scene_name)
                 if scn is None:
-                    print(f"bake_unified_material: scena '{scene_name}' non trovata, skip save.")
+                    print(f"bake_unified_material: scena '{scene_name}' non trovata, "
+                          f"skip salvataggio.")
                     return None  # one-shot: non ripetere
                 try:
                     blend_path = _save_blend(cfg, scn)
-                    print(f"bake_unified_material: scena salvata → {blend_path}")
+                    print(f"bake_unified_material: COPIA salvata → {blend_path}")
+                    print(f"bake_unified_material: il file originale NON è stato toccato "
+                          f"(salvataggio tramite copy=True in output_dir).")
                 except Exception:
                     import traceback
                     traceback.print_exc()
                 return None  # one-shot
 
-            bpy.app.timers.register(_deferred_save, first_interval=0.0)
+            bpy.app.timers.register(_deferred_save, first_interval=0.1)
 
-        self.report({'INFO'}, f"Bake completato: {len(baked)} canali salvati in {cfg.output_dir}")
+        self.report({'INFO'}, f"Bake completato: {len(baked)} canali. "
+                    f"COPIA .blend in: {cfg.output_dir} — originale NON modificato.")
         return {'FINISHED'}
 
 
