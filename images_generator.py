@@ -697,6 +697,7 @@ class RenderConfig:
     skybox_size: list[int] = field(default_factory=lambda: [1024, 512])  # resize target
     irradiance_sample_side: int = 16     # N → N×N campioni per emisfero (16 = 256, 256 = 65536)
     skybox_yaw_degrees: float = 0.0      # rotazione yaw skybox; 0° = -Y (Blender fwd) al centro
+    compare_skybox_to_gt: bool = False   # True → genera skybox_compare/skybox_heatmap.png dopo il bake
 
     # Indirect irradiance via NeRF (precompute once, cache on disk)
     precompute_indirect: bool = False
@@ -778,7 +779,7 @@ class PipelineConfig:
     # nerf_loss_type:      "l1" | "mse" | "rel_mse" (RawNeRF) | "log_l1"
     # N.B. checkpoint salvati con un'attivazione NON sono compatibili con l'altra.
     nerf_rgb_activation: str = "exp"
-    nerf_loss_type:      str = "rel_mse"
+    nerf_loss_type:      str = "l1"
 
     # Render dei frame di training col NeRF allenato (post-Step 2)
     enable_nerf_render_train_images: bool = False
@@ -1519,9 +1520,9 @@ def _step2b_render_train_images(cfg: PipelineConfig,
     sys.path.insert(0, str(Path(__file__).parent))
     from nerf import load_checkpoint, render_image as nerf_render_image
     from nerf.metrics import (
-        plot_bias_scatter, tonemapped_psnr,
-        highlight_percentile_error, signed_residual_stats,
-        binned_median_curve, _LUMA_COEFF,
+        plot_bias_scatter, plot_error_heatmap,
+        tonemapped_psnr, highlight_percentile_error,
+        signed_residual_stats, binned_median_curve, _LUMA_COEFF,
     )
 
     rc = cfg.render
@@ -1618,6 +1619,11 @@ def _step2b_render_train_images(cfg: PipelineConfig,
                       f"tonemap-Reinhard={psnr_tm_reinhard:.2f} dB")
         plot_bias_scatter(pred_np, gt_np, mask_bool,
                           str(base / f"{stem}_bias.png"), title=bias_title)
+
+        # Heatmap diagnostica per-frame: GT, Pred (clip [0,1]) + ΔR ΔG ΔB + |Δ| luma
+        # Nessuna maschera: l'intero frame entra (modello + skybox/background).
+        plot_error_heatmap(pred_np, gt_np,
+                           str(base / f"{stem}_heatmap.png"), title=bias_title)
 
         # Accumulo subsample per scatter aggregato (già mascherato)
         p3 = pred_np.astype(np.float32)
@@ -1951,6 +1957,29 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
             _save_layer(irr_arr, irr_path, rc.irradiance_format, DataLayer.IRRADIANCE)
             ium_result_data["irradiance_path"] = _as_relative_to(irr_path, json_dir_str)
 
+        # ── Confronto skybox GT vs NeRF-baked ────────────────────────────────
+        # Richiede: compare_skybox_to_gt=True + skybox_path non-vuoto (GT HDR) +
+        # skybox_nerf_baked.exr già scritto da _bake_skybox_from_nerf.
+        if rc.compare_skybox_to_gt and rc.skybox_path:
+            baked_exr = json_dir / "skybox_nerf_baked.exr"
+            if baked_exr.exists():
+                from nerf.metrics import plot_skybox_compare
+                gt_sky    = _load_image_hw3_native(rc.skybox_path)
+                baked_sky = _load_image_hw3_native(baked_exr.as_posix())
+                sky_cmp_dir = json_dir / "skybox_compare"
+                os.makedirs(sky_cmp_dir, exist_ok=True)
+                sky_title = (f"Skybox  baked NeRF ({baked_sky.shape[1]}x{baked_sky.shape[0]}) "
+                             f"→ GT ({gt_sky.shape[1]}x{gt_sky.shape[0]})")
+                plot_skybox_compare(
+                    gt_sky, baked_sky,
+                    str(sky_cmp_dir / "skybox_heatmap.png"),
+                    title=sky_title,
+                )
+                print(f"[Step 3] Skybox compare salvata: {sky_cmp_dir / 'skybox_heatmap.png'}")
+            else:
+                print("[Step 3] skybox_compare: skybox_nerf_baked.exr non trovato "
+                      "(atteso dopo skybox_source='nerf') — skip")
+
         # ── Indirect Irradiance via NeRF ─────────────────────────────────────
         irr_indirect_flat = None
         if rc.precompute_indirect and ium_res.has_positions() and ium_res.has_normals():
@@ -2249,11 +2278,14 @@ if __name__ == "__main__":
             precompute_spec_cone = False,
             render_pbr_maps      = False,
 
-            color_texture_grazing_max_deg = 75.0
+            color_texture_grazing_max_deg = 75.0,
+
+            # Heatmap diagnostica skybox GT vs NeRF-baked (richiede skybox_path nella SceneConfig)
+            compare_skybox_to_gt = True,
 
         ),
 
-        nerf_num_iters     = 5000,
+        nerf_num_iters     = 100000,
         nerf_batch_size    = 4096*24,
         nerf_lr            = 5e-4,
         nerf_display_every = 100,
@@ -2284,12 +2316,14 @@ if __name__ == "__main__":
             transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXR/transforms.json",
             model_path       = f"{REPO}/Scenes/TableAndOtherInterior/Models/Baked.obj",
             external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBaked/BakedMaterial_normal.exr",
+            # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
+            skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         ),
-        SceneConfig(
-            name            = "SwordShield",
-            transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
-            model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
-        ),
+        # SceneConfig(
+        #     name            = "SwordShield",
+        #     transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
+        #     model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
+        # ),
     ]
 
     # ── Esecuzione ────────────────────────────────────────────────────────────
@@ -2298,7 +2332,9 @@ if __name__ == "__main__":
     run_pipeline_multi(
         template,
         SCENES,
-        output_root = "D:/tesi_output/test_tangent_75deg",
-        run_note    = "Test tangent 75° grazing angle in color texture"
+        output_root = "D:/tesi_output/expo_l1_100k",
+        run_note    = (
+            "expo + l1 loss, 100k iter"
+        ),
     )
     

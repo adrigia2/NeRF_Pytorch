@@ -31,6 +31,30 @@ def _luminance(arr: np.ndarray) -> np.ndarray:
     return (arr.astype(np.float32) * _LUMA_COEFF).sum(-1)
 
 
+def _signed_log_norm(diff: np.ndarray):
+    """Normalizzazione AsinhNorm simmetrica per heatmap con segno.
+
+    Lineare vicino a 0, logaritmica sulle code su entrambi i segni, così gli outlier
+    restano visibili e distinguibili (nessun clamp/saturazione).
+
+    Parametri scelti automaticamente dai dati:
+    - vmin = −max|diff|, vmax = +max|diff|  (vero massimo, nessun clamp)
+    - linear_width = max(median|diff|, 1e-4) (soglia lineare/log)
+
+    Fallback a SymLogNorm se matplotlib < 3.5 (AsinhNorm non disponibile).
+    """
+    import matplotlib.colors as mcolors
+
+    M = max(float(np.abs(diff).max()), 1e-5)
+    linear_width = max(float(np.median(np.abs(diff[diff != 0]))) if (diff != 0).any()
+                       else 1e-4, 1e-4)
+    try:
+        return mcolors.AsinhNorm(linear_width=linear_width, vmin=-M, vmax=M)
+    except AttributeError:
+        # matplotlib < 3.5: fallback
+        return mcolors.SymLogNorm(linthresh=linear_width, vmin=-M, vmax=M, base=10)
+
+
 def _mask_flatten(arr: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
     """Appiattisce arr con maschera booleana opzionale.
 
@@ -339,6 +363,168 @@ def plot_bias_scatter(
     if title:
         fig.suptitle(title, fontsize=9, y=1.02)
 
+    fig.tight_layout()
+    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# plot_error_heatmap
+# ---------------------------------------------------------------------------
+
+def plot_error_heatmap(
+    pred_hw3: np.ndarray,
+    gt_hw3: np.ndarray,
+    out_png: str,
+    title: str = "",
+) -> None:
+    """Heatmap diagnostica per-frame: GT, Pred (clippati a [0,1]) e differenza di norme con segno.
+
+    Nessuna maschera: l'intero frame (modello + background/skybox) entra nella heatmap.
+    Il contrasto visivo tra skybox (errore ≈0) e modello (bias concentrato) è immediato.
+
+    Pannelli (1×3):
+    1. GT  clip [0, 1]
+    2. Pred clip [0, 1]
+    3. ‖GT‖ − ‖pred‖  (norma L2 RGB per pixel, con segno) — colormap magma, scala AsinhNorm
+
+    Valori positivi = il NeRF sottostima la magnitudine del colore.
+    Valori negativi = il NeRF sovrastima.
+
+    Parameters
+    ----------
+    pred_hw3, gt_hw3 : (H, W, 3) float32
+    out_png          : percorso output (le directory intermedie vengono create)
+    title            : suptitle del plot
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("    ⚠  matplotlib non disponibile: heatmap saltata")
+        return
+
+    p = pred_hw3.astype(np.float32)
+    g = gt_hw3.astype(np.float32)
+
+    norm_gt   = np.linalg.norm(g, axis=-1)   # (H, W)
+    norm_pred = np.linalg.norm(p, axis=-1)   # (H, W)
+    diff = norm_gt - norm_pred               # con segno: positivo dove NeRF sottostima
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+    # 1. GT clip
+    axes[0].imshow(np.clip(g, 0.0, 1.0))
+    axes[0].set_title("GT  (clip [0,1])", fontsize=9)
+    axes[0].axis("off")
+
+    # 2. Pred clip
+    axes[1].imshow(np.clip(p, 0.0, 1.0))
+    axes[1].set_title("Pred NeRF  (clip [0,1])", fontsize=9)
+    axes[1].axis("off")
+
+    # 3. ‖GT‖ − ‖pred‖ con segno — scala AsinhNorm: preserva outlier, lineare vicino a 0
+    im = axes[2].imshow(diff, cmap="magma", norm=_signed_log_norm(diff), interpolation="nearest")
+    axes[2].set_title("‖GT‖ − ‖pred‖  (positivo = NeRF sottostima)", fontsize=9)
+    axes[2].axis("off")
+    fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+
+    if title:
+        fig.suptitle(title, fontsize=9, y=1.01)
+
+    fig.tight_layout()
+    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# plot_skybox_compare
+# ---------------------------------------------------------------------------
+
+def plot_skybox_compare(
+    gt_hw3: np.ndarray,
+    baked_hw3: np.ndarray,
+    out_png: str,
+    title: str = "",
+) -> None:
+    """Heatmap di confronto skybox GT (HDR nativo) vs NeRF-baked.
+
+    Il baked viene portato alla risoluzione GT (upsample Lanczos canale per canale via PIL)
+    prima di calcolare la differenza. Si assume che lo skybox baked sia già visivamente
+    allineato al GT (yaw=0, bake inverte esattamente sampleEnvmap): nessuna ricerca di rotazione.
+
+    Pannelli (1×3):
+    1. GT  clip [0, 1]
+    2. Baked NeRF upsampled a risoluzione GT  clip [0, 1]
+    3. ‖GT‖ − ‖baked‖  (norma L2 RGB per pixel, con segno) — colormap magma, scala AsinhNorm
+
+    Valori positivi = il baked NeRF sottostima la magnitudine.
+    Nel titolo: rapporto medio delle norme (≈1 = scala media corretta) e media della differenza.
+
+    Parameters
+    ----------
+    gt_hw3    : (H_gt, W_gt, 3) float32 — skybox GT a risoluzione nativa
+    baked_hw3 : (H_b,  W_b,  3) float32 — skybox NeRF-baked (risoluzione inferiore)
+    out_png   : percorso output
+    title     : suptitle base (statistiche aggiunte automaticamente)
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("    ⚠  matplotlib non disponibile: skybox compare saltato")
+        return
+
+    from PIL import Image
+
+    g = gt_hw3.astype(np.float32)
+    b = baked_hw3.astype(np.float32)
+    h_gt, w_gt = g.shape[:2]
+    h_b,  w_b  = b.shape[:2]
+
+    # Upsample baked → risoluzione GT (Lanczos, canale per canale su float32)
+    if (h_b, w_b) != (h_gt, w_gt):
+        b_up = np.stack([
+            np.array(Image.fromarray(b[..., c]).resize((w_gt, h_gt), Image.LANCZOS))
+            for c in range(3)
+        ], axis=-1)
+    else:
+        b_up = b.copy()
+
+    # Statistiche per il titolo: rapporto medio delle norme e media della differenza con segno
+    norm_gt   = np.linalg.norm(g,    axis=-1)
+    norm_baked = np.linalg.norm(b_up, axis=-1)
+    diff = norm_gt - norm_baked  # con segno: positivo dove baked sottostima
+
+    eps = 1e-5
+    ratio_norm = float(norm_baked.mean() / max(norm_gt.mean(), eps))
+    mean_diff  = float(diff.mean())
+    stat_str   = f"norm_ratio={ratio_norm:.3f}  mean(‖gt‖-‖baked‖)={mean_diff:+.4f}"
+    full_title = f"{title}  [{stat_str}]" if title else stat_str
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+    # 1. GT clip
+    axes[0].imshow(np.clip(g, 0.0, 1.0))
+    axes[0].set_title(f"GT  ({w_gt}x{h_gt})", fontsize=9)
+    axes[0].axis("off")
+
+    # 2. Baked clip (upsampled)
+    axes[1].imshow(np.clip(b_up, 0.0, 1.0))
+    axes[1].set_title(f"Baked NeRF  ({w_b}x{h_b} → {w_gt}x{h_gt})", fontsize=9)
+    axes[1].axis("off")
+
+    # 3. ‖GT‖ − ‖baked‖ con segno — scala AsinhNorm: preserva outlier, lineare vicino a 0
+    im = axes[2].imshow(diff, cmap="magma", norm=_signed_log_norm(diff), interpolation="nearest")
+    axes[2].set_title("‖GT‖ − ‖baked‖  (positivo = baked sottostima)", fontsize=9)
+    axes[2].axis("off")
+    fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+
+    fig.suptitle(full_title, fontsize=9, y=1.01)
     fig.tight_layout()
     Path(out_png).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=110, bbox_inches="tight")
