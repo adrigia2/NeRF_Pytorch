@@ -773,13 +773,16 @@ class PipelineConfig:
     nerf_bg_depth_window:      float = 2.0   # finestra bg [R - window, R + window_end]
     nerf_bg_depth_window_end:  float = 2.0
     nerf_profile_iters: int = 0         # per-fase timing sincronizzato per i primi N iter (0=off)
+    nerf_multires:       int   = 10
+    nerf_multires_views: int   = 4
 
     # Attivazione RGB e loss del training (Step 2).
     # nerf_rgb_activation: "exp" (HDR) | "softplus"
-    # nerf_loss_type:      "l1" | "mse" | "rel_mse" (RawNeRF) | "log_l1"
+    # nerf_loss_type:      "l1" | "mse" | "rel_mse" (eps fuori dal quadrato) |
+    #                      "rel_mse_raw" (RawNeRF fedele, eps dentro al quadrato) | "log_l1"
     # N.B. checkpoint salvati con un'attivazione NON sono compatibili con l'altra.
     nerf_rgb_activation: str = "exp"
-    nerf_loss_type:      str = "l1"
+    nerf_loss_type:      str = "rel_mse_raw"
 
     # Render dei frame di training col NeRF allenato (post-Step 2)
     enable_nerf_render_train_images: bool = False
@@ -787,6 +790,7 @@ class PipelineConfig:
 
     # Se True, chiede all'utente di continuare il training al termine di ogni round
     nerf_interactive_loop: bool = True
+
 
 
 @dataclass
@@ -1280,6 +1284,8 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
         profile_iters             = cfg.nerf_profile_iters,
         rgb_activation            = cfg.nerf_rgb_activation,
         loss_type                 = cfg.nerf_loss_type,
+        multires=cfg.nerf_multires,
+        multires_views=cfg.nerf_multires_views,
     )
 
     print(f"[Step 2] Training NeRF (depth-guided) — {cfg.nerf_num_iters} iter, ckpt → {ckpt}")
@@ -2252,7 +2258,7 @@ if __name__ == "__main__":
             skybox_source          = "nerf",  # "nerf" | "file"
 
             # skybox_path          = f"{REPO}/Scenes/TableAndOther/Blender/assets/hdri/suburban_garden_4k.exr",
-            skybox_size            = [2048, 1024],
+            skybox_size            = [4096, 2048],
             irradiance_sample_side = 512,
 
             precompute_indirect            = True,
@@ -2270,7 +2276,7 @@ if __name__ == "__main__":
             visibility_format    = ImageFormat.OPENEXR,
             color_texture_format = ImageFormat.OPENEXR,
 
-            ium_texture_size = [512, 512],
+            ium_texture_size = [4096, 4096],
             apply_scale      = False,
 
             color_texture_image_source = "nerf",  # "nerf" | "gt"
@@ -2294,7 +2300,7 @@ if __name__ == "__main__":
         enable_nerf_render_train_images = True,
         nerf_interactive_loop           = False,
 
-        nerf_depth_window_samples      = 4,
+        nerf_depth_window_samples      = 5,
         nerf_depth_window              = 0.1,
         nerf_depth_window_end          = 0.1,
         nerf_opacity_weight            = 1.0,
@@ -2302,8 +2308,13 @@ if __name__ == "__main__":
         nerf_bg_radius_mult            = 3.0,
         nerf_bg_depth_window           = 0.1,
         nerf_bg_depth_window_end       = 0.1,
+        # nerf_multires = 12,
+        # nerf_multires_views = 6,
+
+
 
         nerf_profile_iters = 0,
+
 
     )
 
@@ -2311,11 +2322,19 @@ if __name__ == "__main__":
     # Aggiungere/commentare SceneConfig per scegliere quali scene processare.
     # L'output di ogni scena finisce in <output_root>/<scene.name>/.
     SCENES = [
+        # SceneConfig(
+        #     name             = "TableAndOtherInterior",
+        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXR/transforms.json",
+        #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/Models/Baked.obj",
+        #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBaked/BakedMaterial_normal.exr",
+        #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
+        #     skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+        # ),
         SceneConfig(
             name             = "TableAndOtherInterior",
-            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXR/transforms.json",
-            model_path       = f"{REPO}/Scenes/TableAndOtherInterior/Models/Baked.obj",
-            external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBaked/BakedMaterial_normal.exr",
+            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
+            model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+            external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
             # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
             skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         ),
@@ -2332,9 +2351,9 @@ if __name__ == "__main__":
     run_pipeline_multi(
         template,
         SCENES,
-        output_root = "D:/tesi_output/expo_l1_100k",
+        output_root = "D:/tesi_output/expo_rel_mse_raw_100k_Decay02_noperturb_5samples_smooth",
         run_note    = (
-            "expo + l1 loss, 100k iter"
+            "expo + rel_mse_raw loss, 100k iter smooth scene + decay 0.2 + no perturb 5 samples"
         ),
     )
     

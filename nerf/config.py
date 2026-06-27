@@ -24,8 +24,12 @@ class NerfConfig:
     # Note: checkpoints saved with one activation are NOT compatible with the
     # other (different weight scales).
     rgb_activation: str = "exp"
-    # Training loss: "l1" | "mse" | "rel_mse" (RawNeRF-style weighted MSE,
-    # balances shadows vs highlights) | "log_l1" (L1 on log1p).
+    # Training loss: "l1" | "mse" |
+    #   "rel_mse"     — variante con eps fuori dal quadrato: / (pred²+eps)
+    #   "rel_mse_raw" — RawNeRF fedele: / (pred+eps)² (cfr. multinerf train_utils.py)
+    #   "log_l1"      — L1 su log1p (comprime gli highlights)
+    # Default qui è "l1"; il default effettivo del training viene da
+    # nerf_loss_type in images_generator.py (→ "rel_mse_raw").
     loss_type: str = "l1"
     # Initial bias of rgb_linear when rgb_activation="exp".
     # exp(hdr_init_bias) ≈ rgb output at iter 0; choose ~log(scene_target_mean).

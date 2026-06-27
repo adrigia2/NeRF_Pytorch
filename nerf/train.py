@@ -15,8 +15,16 @@ from .render import render_image, render_rays_depth, render_unified
 
 
 def _rel_mse(pred, target, eps=1e-3):
-    """Relative MSE: weights each pixel by its predicted intensity (RawNeRF)."""
+    """Relative MSE (variante con eps fuori dal quadrato): divide per pred²+eps.
+    Non è la formulazione esatta di RawNeRF — vedi _rel_mse_raw per quella."""
     return (((pred - target) ** 2) / (pred.detach() ** 2 + eps)).mean()
+
+def _rel_mse_raw(pred, target, eps=1e-3):
+    """Relative MSE (RawNeRF fedele): pesa ogni pixel per l'inverso del quadrato
+    dell'intensità predetta, con eps dentro al quadrato → (pred+eps)².
+    Garantisce fedeltà relativa uniforme su tutto il range dinamico.
+    Cfr. google-research/multinerf, internal/train_utils.py."""
+    return (((pred - target) ** 2) / (pred.detach() + eps) ** 2).mean()
 
 def _mse(pred, target):
     return ((pred - target) ** 2).mean()
@@ -26,10 +34,11 @@ def _log_l1(pred, target):
     return F.l1_loss(torch.log1p(pred), torch.log1p(target))
 
 LOSSES = {
-    "l1":      F.l1_loss,
-    "mse":     _mse,
-    "rel_mse": _rel_mse,
-    "log_l1":  _log_l1,
+    "l1":          F.l1_loss,
+    "mse":         _mse,
+    "rel_mse":     _rel_mse,      # variante: eps fuori dal quadrato
+    "rel_mse_raw": _rel_mse_raw,  # RawNeRF fedele: eps dentro al quadrato
+    "log_l1":      _log_l1,
 }
 
 
@@ -93,7 +102,7 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Decay spalmato sull'intero run (incluso l'eventuale resume):
-    # lr → 0.1·lr all'ultima iterazione pianificata.
+    # lr → 0.2·lr all'ultima iterazione pianificata.
     decay_steps = iter_start + num_iters
     loss_window: deque[torch.Tensor] = deque(maxlen=display_every)
     mse_window:  deque[torch.Tensor] = deque(maxlen=display_every)
@@ -120,7 +129,7 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
         _profiling = _prof_active and (i - iter_start) < cfg.profile_iters
 
         # ── LR schedule ─────────────────────────────────────────────────────
-        new_lr = lr * (0.1 ** (i / decay_steps))
+        new_lr = lr * (0.2 ** (i / decay_steps))
         for pg in optimizer.param_groups:
             pg["lr"] = new_lr
 
@@ -134,7 +143,7 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
         rgb_pred = render_unified(
             rays_o, rays_d, depths, in_mask,
             model, embed_fn, embeddirs_fn, cfg, center, sphere_radius,
-            perturb=True)
+            perturb=False)
         if _profiling: _sync(); _prof["render"] += time.perf_counter() - _t0
 
         # ── loss ─────────────────────────────────────────────────────────────
