@@ -1129,9 +1129,9 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
 
     depth_gen = optix_mod.DepthGenerator()
     depth_gen.set_traversable(model)
-    depth_gen.need_render_depth(True)
-    depth_gen.need_render_position(False)
-    depth_gen.need_render_normal(False)
+    depth_gen.need_render_depth(rc.render_depth)
+    depth_gen.need_render_position(rc.render_position)
+    depth_gen.need_render_normal(rc.render_normal)
 
     images_out_dir = json_dir / "images"
     os.makedirs(images_out_dir, exist_ok=True)
@@ -1219,7 +1219,7 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
             "transform_matrix": frame.transform_matrix,
         }
 
-        if result.has_depth_data():
+        if rc.render_depth and result.has_depth_data():
             depth_arr = _reshape_flat(result.depths_np.astype(np.float32), W, H)
             if rc.apply_scale:
                 depth_arr = depth_arr * scale
@@ -1227,10 +1227,25 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
             _save_layer(depth_arr, out_path, rc.depth_format, DataLayer.DEPTH)
             frame_entry["depth_path"] = _as_relative_to(out_path, json_dir_str)
 
-        mask_arr = _reshape_flat(result.masks_np, W, H)
-        out_path = _build_output_path(rc.output_dir, frame.stem, "mask", rc.mask_format)
-        _save_layer(mask_arr, out_path, rc.mask_format, DataLayer.MASK)
-        frame_entry["mask_path"] = _as_relative_to(out_path, json_dir_str)
+        if rc.render_position and result.has_positional_data():
+            pos_arr = _reshape_flat(result.positions_np.astype(np.float32), W, H)
+            if rc.apply_scale:
+                pos_arr = pos_arr * scale
+            out_path = _build_output_path(rc.output_dir, frame.stem, "position", rc.position_format)
+            _save_layer(pos_arr, out_path, rc.position_format, DataLayer.POSITION)
+            frame_entry["position_path"] = _as_relative_to(out_path, json_dir_str)
+
+        if rc.render_normal and result.has_normal_data():
+            norm_arr = _reshape_flat(result.normals_np.astype(np.float32), W, H)
+            out_path = _build_output_path(rc.output_dir, frame.stem, "normal", rc.normal_format)
+            _save_layer(norm_arr, out_path, rc.normal_format, DataLayer.NORMAL)
+            frame_entry["normal_path"] = _as_relative_to(out_path, json_dir_str)
+
+        if rc.render_mask:
+            mask_arr = _reshape_flat(result.masks_np, W, H)
+            out_path = _build_output_path(rc.output_dir, frame.stem, "mask", rc.mask_format)
+            _save_layer(mask_arr, out_path, rc.mask_format, DataLayer.MASK)
+            frame_entry["mask_path"] = _as_relative_to(out_path, json_dir_str)
 
         output_frames.append(frame_entry)
 
@@ -2107,10 +2122,11 @@ def run_pipeline(cfg: PipelineConfig) -> dict:
         while True:
             ckpt_path = _step2_train_nerf(cfg, transforms_extended)
 
-            _step2b_render_train_images(cfg, transforms_extended, ckpt_path)
-            render_dir = cfg.nerf_render_train_images_dir or \
-                         str(Path(cfg.render.output_dir) / "nerf_render_images")
-            print(f"  EXR/PNG salvati in: {render_dir}")
+            if cfg.enable_nerf_render_train_images:
+                _step2b_render_train_images(cfg, transforms_extended, ckpt_path)
+                render_dir = cfg.nerf_render_train_images_dir or \
+                             str(Path(cfg.render.output_dir) / "nerf_render_images")
+                print(f"  EXR/PNG salvati in: {render_dir}")
 
             if not cfg.nerf_interactive_loop:
                 break
@@ -2291,7 +2307,7 @@ if __name__ == "__main__":
 
         ),
 
-        nerf_num_iters     = 100000,
+        nerf_num_iters     = 2,
         nerf_batch_size    = 4096*24,
         nerf_lr            = 5e-4,
         nerf_display_every = 100,
@@ -2351,7 +2367,7 @@ if __name__ == "__main__":
     run_pipeline_multi(
         template,
         SCENES,
-        output_root = "D:/tesi_output/expo_rel_mse_raw_100k_Decay02_noperturb_5samples_smooth",
+        output_root = "D:/tesi_output/ttttt",
         run_note    = (
             "expo + rel_mse_raw loss, 100k iter smooth scene + decay 0.2 + no perturb 5 samples"
         ),
