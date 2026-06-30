@@ -9,11 +9,15 @@ non supporta dati raw (float), normalizza automaticamente i valori in [0,1].
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import datetime
 import json
+import math
 import os
 import shutil
+import sys
+import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from pathlib import Path
@@ -161,6 +165,45 @@ def _to_uint8(array: np.ndarray) -> np.ndarray:
         arr = (arr - mn) / (mx - mn)
     arr = (arr * 255).clip(0, 255).astype(np.uint8)
     return arr
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging: tee stdout+stderr su file (diagnostica per run notturni)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _Tee:
+    """Scrive su due stream contemporaneamente; flush dopo ogni write."""
+    def __init__(self, original, file_stream):
+        self._orig = original
+        self._file = file_stream
+
+    def write(self, data):
+        self._orig.write(data)
+        self._file.write(data)
+        self._file.flush()
+
+    def flush(self):
+        self._orig.flush()
+        self._file.flush()
+
+    # Propagate altri attributi al flusso originale (es. encoding, isatty)
+    def __getattr__(self, name):
+        return getattr(self._orig, name)
+
+
+@contextlib.contextmanager
+def _console_to_file(log_path: str):
+    """Context manager: redirige stdout e stderr anche su *log_path* (append, flush per riga)."""
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    with open(log_path, "a", encoding="utf-8", buffering=1) as fh:
+        orig_out, orig_err = sys.stdout, sys.stderr
+        sys.stdout = _Tee(orig_out, fh)
+        sys.stderr = _Tee(orig_err, fh)
+        try:
+            yield
+        finally:
+            sys.stdout = orig_out
+            sys.stderr = orig_err
 
 
 def _reshape_flat(array: np.ndarray, w: int, h: int) -> np.ndarray:
@@ -669,6 +712,14 @@ class RenderConfig:
     # "gt"   → immagini ground-truth (default storico)
     # "nerf" → pred EXR salvati dallo Step 2b in nerf_render_images/iter_*/
     color_texture_image_source: str = "gt"
+    # Lista di sorgenti da cui produrre color_texture e albedo in parallelo.
+    # Se non None, sovrascrive color_texture_image_source per la scelta dei file ma
+    # color_texture_image_source rimane la sorgente "principale" (quella che produce
+    # camera_texture/, pixel_change/ e la chiave JSON color_texture_path).
+    # Esempio: ["gt", "nerf"] → color_texture_gt.exr + color_texture_nerf.exr,
+    #           albedo_gt.exr + albedo_nerf.exr.
+    # None → comportamento storico (sorgente singola = color_texture_image_source).
+    color_texture_image_sources: list[str] | None = None
     # Iterazione Step 2b da cui leggere i pred NeRF. -1 = usa l'ultima disponibile.
     color_texture_nerf_iter: int = -1
     # Angolo massimo (in gradi) dalla normale del texel oltre il quale il contributo
@@ -751,6 +802,12 @@ class PipelineConfig:
     run_step1: bool = True
     run_step2: bool = True
     run_step3: bool = True
+    # Se True, e se run_step2=True, salta il training NeRF per una scena se il
+    # checkpoint <output_dir>/model/nerf_model_cache.pt esiste già (utile per
+    # riprendere uno sweep interrotto senza ripetere il training).
+    # Caveat: un checkpoint incompleto verrebbe riusato; per forzare il
+    # riaddestramento basta cancellare il file .pt di quella config.
+    resume_skip_step2_if_ckpt: bool = False
 
     render: RenderConfig = field(default_factory=RenderConfig)
 
@@ -781,8 +838,21 @@ class PipelineConfig:
     # nerf_loss_type:      "l1" | "mse" | "rel_mse" (eps fuori dal quadrato) |
     #                      "rel_mse_raw" (RawNeRF fedele, eps dentro al quadrato) | "log_l1"
     # N.B. checkpoint salvati con un'attivazione NON sono compatibili con l'altra.
-    nerf_rgb_activation: str = "exp"
-    nerf_loss_type:      str = "rel_mse_raw"
+    nerf_rgb_activation: str   = "exp"
+    nerf_loss_type:      str   = "rel_mse_raw"
+
+    # Fattore di decay del learning rate: new_lr = lr * (nerf_lr_decay ** min(i/decay_steps, 1.0)).
+    # 0.2 → lr decade al 20 % del valore iniziale all'orizzonte nerf_lr_decay_steps;
+    # oltre la soglia il LR resta a plateau (lr*factor, non scende più).
+    # Sweepabile per confrontare regimi di decadimento: valori < 0.2 più aggressivi,
+    # valori > 0.2 più gentili. Propagato a NerfConfig.lr_decay_factor.
+    nerf_lr_decay: float = 0.2
+
+    # Orizzonte FISSO (iter assolute) su cui si spalma il decay del LR. 0 = auto → usa
+    # nerf_num_iters (run fresh identico a prima). Impostarlo a un valore fisso (es.
+    # uguale alla lunghezza pianificata totale) per far sì che riprendere il training
+    # continui il decay senza salti. Propagato a NerfConfig.lr_decay_steps.
+    nerf_lr_decay_steps: int = 0
 
     # Render dei frame di training col NeRF allenato (post-Step 2)
     enable_nerf_render_train_images: bool = False
@@ -1110,6 +1180,55 @@ def _nerf_pred_path(pred_dir: Path, idx: int) -> Path:
     return pred_dir / f"frame_{idx:03d}_pred.exr"
 
 
+def _build_optix_frames_for_source(
+    source: str,
+    tf,
+    all_cameras: list,
+    intr,
+    rc: "RenderConfig",
+    cfg: "PipelineConfig",
+    json_dir: Path,
+    optix_mod,
+) -> list:
+    """Costruisce la lista di optix_mod.Frame usando le immagini della sorgente indicata.
+
+    Args:
+        source: "gt" (immagini originali) | "nerf" (pred EXR dallo Step 2b).
+        tf: oggetto transforms caricato (tf.frames).
+        all_cameras: lista di optix_mod.Camera, una per frame.
+        intr: intrinseche (intr.w, intr.h).
+        rc: RenderConfig corrente.
+        cfg: PipelineConfig corrente (per nerf_render_train_images_dir).
+        json_dir: cartella base del run (Path).
+        optix_mod: modulo OptixProgrammablePasses importato.
+    """
+    nerf_pred_dir = None
+    if source == "nerf":
+        base_root = Path(cfg.nerf_render_train_images_dir or
+                         json_dir / "nerf_render_images")
+        nerf_pred_dir = _find_nerf_pred_dir(base_root, rc.color_texture_nerf_iter)
+        if nerf_pred_dir is None:
+            print(f"    ⚠  Nessuna cartella pred NeRF trovata (sorgente '{source}') → uso immagini GT")
+        else:
+            print(f"[Step 3] Color texture da pred NeRF ({source}): {nerf_pred_dir}")
+
+    optix_frames = []
+    for i, frame in enumerate(tf.frames):
+        cam = all_cameras[i]
+        img_path = frame.file_path
+        if nerf_pred_dir is not None:
+            pred_path = _nerf_pred_path(nerf_pred_dir, i)
+            if pred_path.exists():
+                img_path = pred_path.as_posix()
+            else:
+                print(f"    ⚠  pred NeRF mancante per frame {i} ({pred_path.name}), uso GT")
+        img_flat = _load_image_as_vec3(img_path, intr.w, intr.h)
+        peak = _compute_peak(img_flat.reshape(intr.h, intr.w, 3),
+                             rc.color_texture_peak_percentile)
+        optix_frames.append(optix_mod.Frame(cam, peak, img_flat))
+    return optix_frames
+
+
 def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
     """Renderizza depth + mask per ogni frame, copia le immagini RGB e scrive
     transforms_extended.json con i campi minimi richiesti da NerfDataset.
@@ -1276,8 +1395,17 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
     return out_json_path
 
 
-def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Path:
-    """Allena il NeRF (vanilla bmild coarse+fine) e restituisce il path del checkpoint."""
+def _step2_train_nerf(
+    cfg: PipelineConfig,
+    transforms_extended_path: Path,
+    tb_logger=None,
+) -> tuple[Path, float]:
+    """Allena il NeRF e restituisce (ckpt_path, final_psnr_dB).
+
+    ``tb_logger`` è un monitoring.RunLogger (o None per disabilitare il log TB).
+    Il PSNR è quello dell'ultimo blocco di display; float('nan') se il training è
+    troppo breve per raggiungere il primo blocco.
+    """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
     from nerf import NerfConfig, train as nerf_train
@@ -1299,14 +1427,18 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
         profile_iters             = cfg.nerf_profile_iters,
         rgb_activation            = cfg.nerf_rgb_activation,
         loss_type                 = cfg.nerf_loss_type,
-        multires=cfg.nerf_multires,
-        multires_views=cfg.nerf_multires_views,
+        multires                  = cfg.nerf_multires,
+        multires_views            = cfg.nerf_multires_views,
+        lr_decay_factor           = cfg.nerf_lr_decay,
+        lr_decay_steps            = cfg.nerf_lr_decay_steps,
     )
 
     print(f"[Step 2] Training NeRF (depth-guided) — {cfg.nerf_num_iters} iter, ckpt → {ckpt}")
     print(f"[Step 2] campionamento depth-guided, mesh_window=[t-{cfg.nerf_depth_window}, t+{cfg.nerf_depth_window_end}], "
-          f"bg_radius_mult={cfg.nerf_bg_radius_mult}")
-    nerf_train(
+          f"bg_radius_mult={cfg.nerf_bg_radius_mult}, lr_decay={cfg.nerf_lr_decay}, "
+          f"lr_decay_steps={cfg.nerf_lr_decay_steps or cfg.nerf_num_iters} "
+          f"({'auto' if cfg.nerf_lr_decay_steps == 0 else 'fisso'})")
+    final_psnr = nerf_train(
         str(transforms_extended_path), nerf_cfg,
         ckpt_path     = str(ckpt),
         output_dir    = str(out_dir),
@@ -1315,9 +1447,10 @@ def _step2_train_nerf(cfg: PipelineConfig, transforms_extended_path: Path) -> Pa
         lr            = cfg.nerf_lr,
         seed          = cfg.nerf_seed,
         display_every = cfg.nerf_display_every,
+        tb_logger     = tb_logger,
     )
     print(f"[Step 2] Training completato. Checkpoint: {ckpt}")
-    return ckpt
+    return ckpt, (final_psnr if final_psnr is not None else float("nan"))
 
 
 def _write_png_float(arr: np.ndarray, path: str) -> None:
@@ -1397,7 +1530,9 @@ def _write_rgb_histogram_from_counts(counts_n3: np.ndarray, edges: np.ndarray,
 
 def _write_rgb_hist_comparison(pred_hw3: np.ndarray, gt_hw3: np.ndarray,
                                 path: str, stem: str) -> None:
-    """Save a two-panel PNG: pred histogram (top) and GT histogram (bottom), shared x axis."""
+    """Save a three-panel PNG: pred histogram (top), GT histogram (middle),
+    and |Pred − GT| histogram (bottom), shared x axis. Pred and GT share
+    the same Y scale; the diff panel uses its own auto scale."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -1410,19 +1545,28 @@ def _write_rgb_hist_comparison(pred_hw3: np.ndarray, gt_hw3: np.ndarray,
     xmax = max(float(np.percentile(pred_flat, 99.5)),
                float(np.percentile(gt_flat, 99.5)), 1e-6)
     edges = np.linspace(0.0, xmax, 257)
-    fig, (ax_pred, ax_gt) = plt.subplots(2, 1, figsize=(7, 6), sharex=True)
+    fig, (ax_pred, ax_gt, ax_diff) = plt.subplots(3, 1, figsize=(7, 8), sharex=True)
+    ymax = 0
     for ch, (label, color) in enumerate(_RGB_HIST_COLORS):
         c_pred, _ = np.histogram(pred_flat[:, ch], bins=edges)
         ax_pred.stairs(c_pred, edges, fill=True, alpha=0.55, color=color, label=label)
         c_gt, _ = np.histogram(gt_flat[:, ch], bins=edges)
         ax_gt.stairs(c_gt, edges, fill=True, alpha=0.55, color=color, label=label)
+        c_diff = np.abs(c_pred.astype(np.int64) - c_gt.astype(np.int64))
+        ax_diff.stairs(c_diff, edges, fill=True, alpha=0.55, color=color, label=label)
+        ymax = max(ymax, int(c_pred.max()), int(c_gt.max()))
+    ax_pred.set_ylim(0, ymax * 1.05)
+    ax_gt.set_ylim(0, ymax * 1.05)
     ax_pred.set_ylabel("pixel count")
     ax_pred.set_title(f"{stem} — Pred")
     ax_pred.legend(loc="upper right")
-    ax_gt.set_xlabel("pixel value (linear HDR)")
     ax_gt.set_ylabel("pixel count")
     ax_gt.set_title(f"{stem} — GT")
     ax_gt.legend(loc="upper right")
+    ax_diff.set_xlabel("pixel value (linear HDR)")
+    ax_diff.set_ylabel("pixel count")
+    ax_diff.set_title(f"{stem} — |Pred − GT|")
+    ax_diff.legend(loc="upper right")
     fig.tight_layout()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=110)
@@ -1783,9 +1927,13 @@ def _step2b_render_train_images(cfg: PipelineConfig,
           f"metrics_summary.txt, bias_scatter_all.png")
 
 
-def _step3_posttrain_assets(cfg: PipelineConfig,
-                             transforms_extended_path: Path,
-                             optix_mod) -> dict:
+def _step3_posttrain_assets(
+    cfg: PipelineConfig,
+    transforms_extended_path: Path,
+    optix_mod,
+    tb_logger=None,
+    timer=None,
+) -> dict:
     """Esegue IUM/visibility/color_texture/irradiance/indirect/albedo e aggiorna
     transforms_extended.json in-place con le nuove chiavi.
     """
@@ -1809,6 +1957,7 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
     ium_result_data: dict = output_json.get("ium", {})
 
     if rc.render_ium:
+        _t3_ium = time.perf_counter()
         # Dimensione IUM: potrebbe essere adattata alla risoluzione della normale esterna
         # se external_normal_resolution_mode == "adapt" (o se l'utente lo sceglie a runtime).
         default_ium_w, default_ium_h = rc.ium_texture_size[0], rc.ium_texture_size[1]
@@ -1822,6 +1971,8 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
         ium_gen.render()
         ium_res = ium_gen.get_result()
         print("[Step 3] IUM rendering completato")
+        if timer is not None:
+            timer.record("step3/ium", time.perf_counter() - _t3_ium)
 
         # Se è stata fornita una normale esterna, decodificala e iniettala nel buffer
         # C++ di IUM_Generator::Result prima di qualsiasi uso a valle.
@@ -1862,6 +2013,7 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
         # ── Visibility ───────────────────────────────────────────────────────
         visibility_map = None
         if rc.render_visibility and ium_res.has_positions() and ium_res.has_masks():
+            _t3_vis = time.perf_counter()
             print("[Step 3] Calcolo Visibilità telecamere…")
             vis_gen = optix_mod.VisibilityGenerator()
             vis_gen.set_traversable(model)
@@ -1881,78 +2033,100 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
                 _save_layer(vis_arr, vis_path, rc.visibility_format, DataLayer.VISIBILITY)
 
             ium_result_data["visibility_path"] = _as_relative_to(vis_path, json_dir_str)
+            if timer is not None:
+                timer.record("step3/visibility", time.perf_counter() - _t3_vis)
 
         # ── Color Texture ────────────────────────────────────────────────────
-        ct_result = None
+        # color_by_source: sorgente → colors_np float32 (copia esplicita per liberare
+        # il result della sorgente corrente prima di caricare la successiva ed evitare
+        # un picco RAM dovuto a due camera_colors_np di dimensione ~frames×texel in RAM).
+        color_by_source: dict[str, np.ndarray] = {}
         if (rc.render_color_texture and rc.render_ium and rc.render_visibility
                 and visibility_map is not None):
-            print("[Step 3] Calcolo Color Texture…")
+            _t3_ct = time.perf_counter()
 
-            nerf_pred_dir = None
-            if rc.color_texture_image_source == "nerf":
-                base_root = Path(cfg.nerf_render_train_images_dir or
-                                 json_dir / "nerf_render_images")
-                nerf_pred_dir = _find_nerf_pred_dir(base_root, rc.color_texture_nerf_iter)
-                if nerf_pred_dir is None:
-                    print("    ⚠  Nessuna cartella pred NeRF trovata → uso immagini GT")
-                else:
-                    print(f"[Step 3] Color texture da pred NeRF: {nerf_pred_dir}")
-
-            optix_frames = []
-            for i, frame in enumerate(tf.frames):
-                cam = all_cameras[i]
-                img_path = frame.file_path
-                if nerf_pred_dir is not None:
-                    pred_path = _nerf_pred_path(nerf_pred_dir, i)
-                    if pred_path.exists():
-                        img_path = pred_path.as_posix()
-                    else:
-                        print(f"    ⚠  pred NeRF mancante per frame {i} ({pred_path.name}), uso GT")
-                img_flat = _load_image_as_vec3(img_path, intr.w, intr.h)
-                peak = _compute_peak(img_flat.reshape(intr.h, intr.w, 3),
-                                     rc.color_texture_peak_percentile)
-                optix_frames.append(optix_mod.Frame(cam, peak, img_flat))
-
-            ct_gen = optix_mod.ColorTexGenerator()
-            ct_gen.set_inputs(ium_res, visibility_map, optix_frames,
-                              grazing_max_deg=rc.color_texture_grazing_max_deg)
-            ct_gen.render()
-            ct_result = ct_gen.get_result()
+            # Sorgenti effettive: lista esplicita o fallback alla sorgente singola storica
+            ct_sources = rc.color_texture_image_sources or [rc.color_texture_image_source]
+            ct_primary = (rc.color_texture_image_source
+                          if rc.color_texture_image_source in ct_sources
+                          else ct_sources[0])
 
             ct_out_dir = json_dir / "color_texture"
             os.makedirs(ct_out_dir, exist_ok=True)
-            ct_path = (ct_out_dir / f"color_texture{rc.color_texture_format.extension}").resolve().as_posix()
-            ct_arr = _reshape_flat(ct_result.colors_np.astype(np.float32), ium_w, ium_h)
-            _save_layer(ct_arr, ct_path, rc.color_texture_format, DataLayer.POSITION)
-            ium_result_data["color_texture_path"] = _as_relative_to(ct_path, json_dir_str)
 
-            if rc.render_pixel_change:
-                pc_dir = json_dir / "pixel_change"
-                pc_dir.mkdir(parents=True, exist_ok=True)
-                min_arr   = _reshape_flat(ct_result.color_min_np.astype(np.float32), ium_w, ium_h)
-                max_arr   = _reshape_flat(ct_result.color_max_np.astype(np.float32), ium_w, ium_h)
-                range_arr = np.clip(max_arr - min_arr, 0.0, None)
-                var_arr   = _reshape_flat(ct_result.color_variance_np.astype(np.float32), ium_w, ium_h)
-                ext = rc.color_texture_format
-                _save_layer(min_arr,   (pc_dir / f"color_min{ext.extension}").as_posix(),      ext, DataLayer.POSITION)
-                _save_layer(max_arr,   (pc_dir / f"color_max{ext.extension}").as_posix(),      ext, DataLayer.POSITION)
-                _save_layer(range_arr, (pc_dir / f"color_range{ext.extension}").as_posix(),    ext, DataLayer.POSITION)
-                _save_layer(var_arr,   (pc_dir / f"color_variance{ext.extension}").as_posix(), ext, DataLayer.POSITION)
-                if rc.debug_pixel_change:
-                    _save_debug_pixel_change(min_arr, max_arr, range_arr, json_dir / "debug_pixel_change")
+            for src in ct_sources:
+                ct_path = (ct_out_dir / f"color_texture_{src}{rc.color_texture_format.extension}").resolve().as_posix()
+                # Cartella per-camera di questa sorgente: gt → camera_texture/, altre → camera_texture_{src}/
+                cam_tex_dir = json_dir / ("camera_texture" if src == ct_primary else f"camera_texture_{src}")
 
-            cam_tex_dir = json_dir / "camera_texture"
-            os.makedirs(cam_tex_dir, exist_ok=True)
-            cam_colors = ct_result.camera_colors_np
-            for cam_idx, frame in enumerate(tf.frames):
-                cam_slice = cam_colors[:, cam_idx, :]
-                cam_arr   = _reshape_flat(cam_slice.astype(np.float32), ium_w, ium_h)
-                cam_path  = (cam_tex_dir / f"{frame.stem}{rc.color_texture_format.extension}").resolve().as_posix()
-                _save_layer(cam_arr, cam_path, rc.color_texture_format, DataLayer.POSITION)
-                if rc.debug_camera_texture:
-                    src_img_path = images_out_dir_ct / Path(frame.file_path).name
-                    _save_debug_comparison(src_img_path, cam_arr, frame.stem,
-                                           json_dir / "debug_camera_texture")
+                if os.path.exists(ct_path) and cam_tex_dir.is_dir():
+                    print(f"[Step 3] Color texture trovata su disco ({src}): {ct_path}")
+                    loaded = _load_exr_as_flat(ct_path)
+                    if loaded is not None:
+                        color_by_source[src] = loaded
+                        ium_result_data[f"color_texture_path_{src}"] = _as_relative_to(ct_path, json_dir_str)
+                        if src == ct_primary:
+                            ium_result_data["color_texture_path"] = _as_relative_to(ct_path, json_dir_str)
+                        continue
+
+                print(f"[Step 3] Calcolo Color Texture (sorgente: {src})…")
+                optix_frames = _build_optix_frames_for_source(
+                    src, tf, all_cameras, intr, rc, cfg, json_dir, optix_mod)
+
+                ct_gen = optix_mod.ColorTexGenerator()
+                ct_gen.set_inputs(ium_res, visibility_map, optix_frames,
+                                  grazing_max_deg=rc.color_texture_grazing_max_deg)
+                ct_gen.render()
+                _ct_res = ct_gen.get_result()
+
+                # Salva color_texture_{src}
+                ct_arr = _reshape_flat(_ct_res.colors_np.astype(np.float32), ium_w, ium_h)
+                _save_layer(ct_arr, ct_path, rc.color_texture_format, DataLayer.POSITION)
+                ium_result_data[f"color_texture_path_{src}"] = _as_relative_to(ct_path, json_dir_str)
+
+                # Copia leggera di colors_np per il calcolo albedo a valle
+                color_by_source[src] = np.array(_ct_res.colors_np, dtype=np.float32)
+
+                # Texture per-camera per questa sorgente (cam_tex_dir già calcolato sopra):
+                #   gt (primary) → camera_texture/   ;   nerf → camera_texture_nerf/   ecc.
+                os.makedirs(cam_tex_dir, exist_ok=True)
+                cam_colors = _ct_res.camera_colors_np
+                for cam_idx, frame in enumerate(tf.frames):
+                    cam_slice = cam_colors[:, cam_idx, :]
+                    cam_arr   = _reshape_flat(cam_slice.astype(np.float32), ium_w, ium_h)
+                    cam_path  = (cam_tex_dir / f"{frame.stem}{rc.color_texture_format.extension}").resolve().as_posix()
+                    _save_layer(cam_arr, cam_path, rc.color_texture_format, DataLayer.POSITION)
+                    if rc.debug_camera_texture and src == ct_primary:
+                        src_img_path = images_out_dir_ct / Path(frame.file_path).name
+                        _save_debug_comparison(src_img_path, cam_arr, frame.stem,
+                                               json_dir / "debug_camera_texture")
+
+                # Solo per la sorgente principale: pixel_change, JSON retro-compat
+                if src == ct_primary:
+                    ium_result_data["color_texture_path"] = _as_relative_to(ct_path, json_dir_str)
+
+                    if rc.render_pixel_change:
+                        pc_dir = json_dir / "pixel_change"
+                        pc_dir.mkdir(parents=True, exist_ok=True)
+                        min_arr   = _reshape_flat(_ct_res.color_min_np.astype(np.float32), ium_w, ium_h)
+                        max_arr   = _reshape_flat(_ct_res.color_max_np.astype(np.float32), ium_w, ium_h)
+                        range_arr = np.clip(max_arr - min_arr, 0.0, None)
+                        var_arr   = _reshape_flat(_ct_res.color_variance_np.astype(np.float32), ium_w, ium_h)
+                        ext = rc.color_texture_format
+                        _save_layer(min_arr,   (pc_dir / f"color_min{ext.extension}").as_posix(),      ext, DataLayer.POSITION)
+                        _save_layer(max_arr,   (pc_dir / f"color_max{ext.extension}").as_posix(),      ext, DataLayer.POSITION)
+                        _save_layer(range_arr, (pc_dir / f"color_range{ext.extension}").as_posix(),    ext, DataLayer.POSITION)
+                        _save_layer(var_arr,   (pc_dir / f"color_variance{ext.extension}").as_posix(), ext, DataLayer.POSITION)
+                        if rc.debug_pixel_change:
+                            _save_debug_pixel_change(min_arr, max_arr, range_arr, json_dir / "debug_pixel_change")
+
+                # TensorBoard per questa sorgente
+                if tb_logger is not None:
+                    tb_logger.log_image(f"texture/color_texture_{src}", ct_arr, step=0, tonemap=True)
+                    tb_logger.flush()
+
+            if timer is not None:
+                timer.record("step3/color_texture", time.perf_counter() - _t3_ct)
 
         # ── Irradiance (Monte Carlo skybox) ──────────────────────────────────
         irr_res = None
@@ -1960,6 +2134,7 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
         if (rc.render_irradiance
                 and (rc.skybox_path or rc.skybox_source == "nerf")
                 and ium_res.has_positions() and ium_res.has_normals()):
+            _t3_irr = time.perf_counter()
             print(f"[Step 3] Calcolo Irradiance "
                   f"({rc.irradiance_sample_side}×{rc.irradiance_sample_side} samples)…")
             sky_w, sky_h = rc.skybox_size[0], rc.skybox_size[1]
@@ -1977,6 +2152,8 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
             irr_arr = _reshape_flat(irr_res.irradiance_np.astype(np.float32), ium_w, ium_h)
             _save_layer(irr_arr, irr_path, rc.irradiance_format, DataLayer.IRRADIANCE)
             ium_result_data["irradiance_path"] = _as_relative_to(irr_path, json_dir_str)
+            if timer is not None:
+                timer.record("step3/irradiance", time.perf_counter() - _t3_irr)
 
         # ── Confronto skybox GT vs NeRF-baked ────────────────────────────────
         # Richiede: compare_skybox_to_gt=True + skybox_path non-vuoto (GT HDR) +
@@ -2004,6 +2181,7 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
         # ── Indirect Irradiance via NeRF ─────────────────────────────────────
         irr_indirect_flat = None
         if rc.precompute_indirect and ium_res.has_positions() and ium_res.has_normals():
+            _t3_ind = time.perf_counter()
             ind_out_dir = json_dir / "irradiance"
             os.makedirs(ind_out_dir, exist_ok=True)
             ind_path = (ind_out_dir / f"irradiance_indirect{rc.indirect_format.extension}").resolve().as_posix()
@@ -2017,10 +2195,13 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
             if ind_arr is not None:
                 irr_indirect_flat = ind_arr
                 ium_result_data["irradiance_indirect_path"] = _as_relative_to(ind_path, json_dir_str)
+            if timer is not None:
+                timer.record("step3/indirect", time.perf_counter() - _t3_ind)
 
         # ── Specular cone L_j(r) via envmap + NeRF ───────────────────────────
         if (rc.precompute_spec_cone and ium_res.has_positions()
                 and ium_res.has_normals() and visibility_map is not None):
+            _t3_spec = time.perf_counter()
             sky_w, sky_h = rc.skybox_size[0], rc.skybox_size[1]
             if skybox_flat_step3 is None and (rc.skybox_path or rc.skybox_source == "nerf"):
                 skybox_flat_step3 = _resolve_skybox_flat(rc, output_json, json_dir, sky_w, sky_h)
@@ -2033,9 +2214,12 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
                                   skybox_flat_step3, [sky_w, sky_h], spec_dir)
             ium_result_data["spec_cone_dir"] = _as_relative_to(
                 spec_dir.resolve().as_posix(), json_dir_str)
+            if timer is not None:
+                timer.record("step3/spec_cone", time.perf_counter() - _t3_spec)
 
         # ── PBR maps (metallic / roughness dal fit spec-cone) ────────────────
         if rc.render_pbr_maps:
+            _t3_pbr = time.perf_counter()
             spec_meta = json_dir / "spec_cone" / "spec_cone_meta.json"
             cmin_path = json_dir / "pixel_change" / "color_min.exr"
             if spec_meta.exists() and cmin_path.exists():
@@ -2051,29 +2235,55 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
                     pbr_out["metallic_path"], json_dir_str)
                 ium_result_data["roughness_path"] = _as_relative_to(
                     pbr_out["roughness_path"], json_dir_str)
+                if timer is not None:
+                    timer.record("step3/pbr", time.perf_counter() - _t3_pbr)
             else:
                 print("    ⚠  render_pbr_maps: mancano spec_cone_meta.json o "
                       "pixel_change/color_min.exr → skip "
                       "(servono precompute_spec_cone e render_pixel_change)")
 
         # ── Albedo ───────────────────────────────────────────────────────────
-        if (rc.render_albedo and ct_result is not None and irr_res is not None):
+        # Generata per ogni sorgente in color_by_source; l'irradianza è condivisa.
+        if (rc.render_albedo and color_by_source and irr_res is not None):
+            _t3_alb = time.perf_counter()
             print(f"[Step 3] Calcolo Albedo = π · color / max(irradiance, {rc.albedo_eps})…")
-            color_flat = ct_result.colors_np.astype(np.float32)
-            irr_flat   = irr_res.irradiance_np.astype(np.float32)
+
+            # Denominatore condiviso tra tutte le sorgenti
+            irr_flat = irr_res.irradiance_np.astype(np.float32)
             if irr_indirect_flat is not None:
                 irr_flat = irr_flat + irr_indirect_flat
             denom = np.maximum(irr_flat, rc.albedo_eps)
-            albedo_flat = (np.float32(np.pi) * color_flat) / denom
-            if ium_res.has_masks():
-                albedo_flat[~ium_res.masks_np.astype(bool)] = 0.0
-            albedo_flat = np.clip(albedo_flat, 0.0, 1.0)
+
+            ct_sources = rc.color_texture_image_sources or [rc.color_texture_image_source]
+            ct_primary = (rc.color_texture_image_source
+                          if rc.color_texture_image_source in ct_sources
+                          else ct_sources[0])
+
             alb_out_dir = json_dir / "albedo"
             os.makedirs(alb_out_dir, exist_ok=True)
-            alb_path = (alb_out_dir / f"albedo{rc.albedo_format.extension}").resolve().as_posix()
-            alb_arr = _reshape_flat(albedo_flat, ium_w, ium_h)
-            _save_layer(alb_arr, alb_path, rc.albedo_format, DataLayer.ALBEDO)
-            ium_result_data["albedo_path"] = _as_relative_to(alb_path, json_dir_str)
+
+            mask_flat = ium_res.masks_np.astype(bool) if ium_res.has_masks() else None
+
+            for src, color_flat in color_by_source.items():
+                albedo_flat = (np.float32(np.pi) * color_flat) / denom
+                if mask_flat is not None:
+                    albedo_flat[~mask_flat] = 0.0
+                albedo_flat = np.clip(albedo_flat, 0.0, 1.0)
+                alb_path = (alb_out_dir / f"albedo_{src}{rc.albedo_format.extension}").resolve().as_posix()
+                alb_arr = _reshape_flat(albedo_flat, ium_w, ium_h)
+                _save_layer(alb_arr, alb_path, rc.albedo_format, DataLayer.ALBEDO)
+                ium_result_data[f"albedo_path_{src}"] = _as_relative_to(alb_path, json_dir_str)
+                if src == ct_primary:
+                    # chiave retro-compatibile per i consumer esistenti
+                    ium_result_data["albedo_path"] = _as_relative_to(alb_path, json_dir_str)
+
+                # — TensorBoard: albedo è già in [0,1] → no tonemap —
+                if tb_logger is not None:
+                    tb_logger.log_image(f"texture/albedo_{src}", alb_arr, step=0, tonemap=False)
+                    tb_logger.flush()
+
+            if timer is not None:
+                timer.record("step3/albedo", time.perf_counter() - _t3_alb)
 
     # Aggiorna il JSON in-place e riscrivi
     if ium_result_data:
@@ -2084,85 +2294,149 @@ def _step3_posttrain_assets(cfg: PipelineConfig,
     return output_json
 
 
-def run_pipeline(cfg: PipelineConfig) -> dict:
+def run_pipeline(
+    cfg: PipelineConfig,
+    *,
+    tb_run_dir: str | None = None,
+    tb_enabled: bool = True,
+) -> dict:
     """Orchestratore a tre step. Ogni step può essere abilitato/disabilitato.
 
     Step 1 (run_step1): depth+mask per frame + copia immagini + transforms_extended.json minimo.
     Step 2 (run_step2): training NeRF via nerf/train.py, salva checkpoint.
     Step 3 (run_step3): IUM/visibility/color_texture/irradiance/indirect/albedo.
+
+    ``tb_run_dir`` è la cartella in cui scrivere gli event file TensorBoard.
+    Se None, viene usata <output_dir>/tensorboard.
+    ``tb_enabled=False`` disabilita completamente il logging TB (no-op).
     """
+    sys.path.insert(0, str(Path(__file__).parent))
+    from monitoring import RunLogger, StageTimer, log_timing_breakdown
+
     import OptixProgrammablePasses as optix
     optix.LogManager.set_min_level(optix.LogLevel.Error)
     optix.OptixManager.instance().set_log_level(optix.LogLevel.Disabled)
 
-    transforms_extended = Path(cfg.render.output_dir) / "transforms_extended.json"
+    _tb_dir = tb_run_dir or str(Path(cfg.render.output_dir) / "tensorboard")
+    logger = RunLogger(_tb_dir, enabled=tb_enabled)
+    timer  = StageTimer()
 
-    if cfg.run_step1:
-        transforms_extended = _step1_pretrain_data(cfg, optix)
-    elif not transforms_extended.exists():
-        raise FileNotFoundError(
-            f"Step 1 disabilitato ma {transforms_extended} non esiste.\n"
-            "Attivare run_step1=True oppure eseguire Step 1 manualmente."
-        )
-    else:
-        # Validazione minima del JSON esistente
-        with open(transforms_extended, encoding="utf-8") as fh:
-            _probe = json.load(fh)
-        frames = _probe.get("frames", [])
-        if frames and ("depth_path" not in frames[0] or "mask_path" not in frames[0]):
-            raise ValueError(
-                f"{transforms_extended} non contiene depth_path/mask_path per frame.\n"
-                "Attivare run_step1=True per rigenerarlo."
+    # Log della config all'inizio del run
+    logger.log_text("run/config", json.dumps(asdict(cfg), indent=2, default=str), step=0)
+
+    transforms_extended = Path(cfg.render.output_dir) / "transforms_extended.json"
+    final_psnr = float("nan")
+
+    try:
+        if cfg.run_step1:
+            with timer("step1"):
+                transforms_extended = _step1_pretrain_data(cfg, optix)
+        elif not transforms_extended.exists():
+            raise FileNotFoundError(
+                f"Step 1 disabilitato ma {transforms_extended} non esiste.\n"
+                "Attivare run_step1=True oppure eseguire Step 1 manualmente."
+            )
+        else:
+            # Validazione minima del JSON esistente
+            with open(transforms_extended, encoding="utf-8") as fh:
+                _probe = json.load(fh)
+            frames = _probe.get("frames", [])
+            if frames and ("depth_path" not in frames[0] or "mask_path" not in frames[0]):
+                raise ValueError(
+                    f"{transforms_extended} non contiene depth_path/mask_path per frame.\n"
+                    "Attivare run_step1=True per rigenerarlo."
+                )
+
+        ckpt_path = Path(cfg.nerf_ckpt_path or
+                         Path(cfg.render.output_dir) / "model" / "nerf_model_cache.pt")
+
+        if cfg.run_step2:
+            while True:
+                with timer("step2"):
+                    ckpt_path, step2_psnr = _step2_train_nerf(
+                        cfg, transforms_extended, tb_logger=logger
+                    )
+                    if not math.isnan(step2_psnr):
+                        final_psnr = step2_psnr
+
+                if cfg.enable_nerf_render_train_images:
+                    with timer("step2b"):
+                        _step2b_render_train_images(cfg, transforms_extended, ckpt_path)
+                    render_dir = cfg.nerf_render_train_images_dir or \
+                                 str(Path(cfg.render.output_dir) / "nerf_render_images")
+                    print(f"  EXR/PNG salvati in: {render_dir}")
+
+                if not cfg.nerf_interactive_loop:
+                    break
+                try:
+                    ans = input("\nContinuare il training? [y/N]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    break
+                if ans != "y":
+                    break
+
+        elif (cfg.run_step3
+              and (cfg.render.precompute_indirect or cfg.render.precompute_spec_cone)
+              and not ckpt_path.exists()):
+            raise FileNotFoundError(
+                f"Step 2 disabilitato ma il checkpoint NeRF non esiste: {ckpt_path}\n"
+                "Attivare run_step2=True oppure fornire nerf_ckpt_path valido."
             )
 
-    ckpt_path = Path(cfg.nerf_ckpt_path or
-                     Path(cfg.render.output_dir) / "model" / "nerf_model_cache.pt")
+        # Libera la VRAM del training NeRF prima che OptiX allochi i buffer Step 3
+        import gc
+        gc.collect()
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
-    if cfg.run_step2:
-        while True:
-            ckpt_path = _step2_train_nerf(cfg, transforms_extended)
+        if cfg.run_step3:
+            if ((cfg.render.precompute_indirect or cfg.render.precompute_spec_cone)
+                    and not cfg.render.indirect_nerf_cache_path):
+                cfg.render.indirect_nerf_cache_path = str(ckpt_path)
 
-            if cfg.enable_nerf_render_train_images:
-                _step2b_render_train_images(cfg, transforms_extended, ckpt_path)
-                render_dir = cfg.nerf_render_train_images_dir or \
-                             str(Path(cfg.render.output_dir) / "nerf_render_images")
-                print(f"  EXR/PNG salvati in: {render_dir}")
+            with timer("step3"):
+                result = _step3_posttrain_assets(
+                    cfg, transforms_extended, optix,
+                    tb_logger=logger, timer=timer,
+                )
+        else:
+            with open(transforms_extended, encoding="utf-8") as fh:
+                result = json.load(fh)
 
-            if not cfg.nerf_interactive_loop:
-                break
-            try:
-                ans = input("\nContinuare il training? [y/N]: ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                break
-            if ans != "y":
-                break
+        # ── Timing breakdown e HParams ────────────────────────────────────────
+        top_times = {k: v for k, v in timer.timings.items() if "/" not in k}
+        total_s = sum(top_times.values())
 
-    elif (cfg.run_step3
-          and (cfg.render.precompute_indirect or cfg.render.precompute_spec_cone)
-          and not ckpt_path.exists()):
-        raise FileNotFoundError(
-            f"Step 2 disabilitato ma il checkpoint NeRF non esiste: {ckpt_path}\n"
-            "Attivare run_step2=True oppure fornire nerf_ckpt_path valido."
-        )
+        log_timing_breakdown(logger, timer.timings, step=0)
 
-    # Libera la VRAM del training NeRF prima che OptiX allochi i buffer Step 3
-    import gc
-    gc.collect()
-    try:
-        import torch
-        torch.cuda.empty_cache()
-    except Exception:
-        pass
+        hparams: dict = {
+            "loss_type":            cfg.nerf_loss_type,
+            "lr":                   cfg.nerf_lr,
+            "lr_decay_factor":      cfg.nerf_lr_decay,
+            "lr_decay_steps":       cfg.nerf_lr_decay_steps or cfg.nerf_num_iters,
+            "num_iters":            cfg.nerf_num_iters,
+            "rgb_activation":       cfg.nerf_rgb_activation,
+            "batch_size":           cfg.nerf_batch_size,
+            "depth_window_samples": cfg.nerf_depth_window_samples,
+            "indirect_sample_side": cfg.render.indirect_sample_side
+                                    if cfg.render.precompute_indirect else -1,
+            "irr_sample_side":      cfg.render.irradiance_sample_side
+                                    if cfg.render.render_irradiance else -1,
+        }
+        metrics: dict = {
+            "psnr/final_db": final_psnr,
+            "time/total_s":  total_s,
+            **{f"time/{k}_s": v for k, v in top_times.items()},
+        }
+        logger.log_hparams(hparams, metrics)
 
-    if cfg.run_step3:
-        if ((cfg.render.precompute_indirect or cfg.render.precompute_spec_cone)
-                and not cfg.render.indirect_nerf_cache_path):
-            cfg.render.indirect_nerf_cache_path = str(ckpt_path)
+        return result
 
-        return _step3_posttrain_assets(cfg, transforms_extended, optix)
-
-    with open(transforms_extended, encoding="utf-8") as fh:
-        return json.load(fh)
+    finally:
+        logger.close()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2196,6 +2470,10 @@ def run_pipeline_multi(
     scenes: list[SceneConfig],
     output_root: str,
     run_note: str = "",
+    *,
+    experiment_tag: str = "",
+    tb_log_root: str | None = None,
+    tb_enabled: bool = True,
 ) -> dict:
     """Esegue run_pipeline su ogni scena in sequenza, in sottocartelle distinte.
 
@@ -2203,15 +2481,41 @@ def run_pipeline_multi(
     - clona ``template`` (deep-copy, sicuro con i default_factory mutabili)
     - sovrascrive i path per-scena e ``output_dir = <output_root>/<scene.name>``
     - scrive ``run_manifest.json`` nella sottocartella
-    - chiama ``run_pipeline``
+    - chiama ``run_pipeline`` con un log_dir TensorBoard isolato
+
+    ``experiment_tag`` raggruppa i run correlati in TensorBoard sotto un unico prefisso.
+    Se vuoto, viene derivato dal nome base di ``output_root``.
+
+    ``tb_log_root`` è la radice dei log TensorBoard (deve corrispondere al volume
+    montato in docker/tensorboard/docker-compose.yml). Se None, viene letta dalla
+    variabile d'ambiente ``TB_LOG_ROOT``; se anche questa manca, il default è
+    ``D:/tesi_output/tb_logs``.
+
+    Ogni esecuzione di questa funzione crea sotto:
+      ``<tb_log_root>/<experiment_tag>/<scene.name>/<YYYYMMDD-HHMMSS>/``
+    in modo da isolare i re-run (niente curve fuse/zig-zag in TensorBoard).
+
+    Se un run fallisce, l'errore viene loggato e si prosegue con il successivo.
+    Al termine viene stampato un riepilogo con lo stato di ogni scena.
 
     ``nerf_ckpt_path`` / ``nerf_train_output_dir`` restano ``""`` nel template e vengono
     derivati automaticamente da ``output_dir`` per scena (un checkpoint per scena).
 
     Returns:
-        dict scena → risultato di run_pipeline
+        dict scena → risultato di run_pipeline (o None se il run è fallito)
     """
+    # ── Risolvi tb_log_root ────────────────────────────────────────────────────
+    _tb_root = (
+        tb_log_root
+        or os.environ.get("TB_LOG_ROOT")
+        or "D:/tesi_output/tb_logs"
+    )
+    _tag = experiment_tag or os.path.basename(output_root.rstrip("/\\"))
+    _run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
     results: dict = {}
+    statuses: dict = {}
+
     for scene in scenes:
         cfg = copy.deepcopy(template)
         cfg.render.transforms_path = scene.transforms_path
@@ -2226,11 +2530,44 @@ def run_pipeline_multi(
         full_note = scene.note if scene.note else run_note
         _write_run_manifest(cfg, scene, full_note)
 
-        print(f"\n{'='*70}")
-        print(f"  Scena : {scene.name}")
-        print(f"  Output: {cfg.render.output_dir}")
-        print(f"{'='*70}")
-        results[scene.name] = run_pipeline(cfg)
+        # Resume: salta il training NeRF se il checkpoint è già presente
+        if cfg.resume_skip_step2_if_ckpt and cfg.run_step2:
+            _ckpt_resume = Path(cfg.render.output_dir) / "model" / "nerf_model_cache.pt"
+            if _ckpt_resume.exists():
+                print(f"  ↻ Checkpoint NeRF già presente; salto Step 2 (run_step2=False): {_ckpt_resume}")
+                cfg.run_step2 = False
+
+        # Log dir TensorBoard per questa scena e questo run (isolato per run-id)
+        tb_run_dir = os.path.join(_tb_root, _tag, scene.name, _run_id)
+
+        _log_path = os.path.join(cfg.render.output_dir, "console.log")
+        with _console_to_file(_log_path):
+            print(f"\n{'='*70}")
+            print(f"  Scena       : {scene.name}")
+            print(f"  Output      : {cfg.render.output_dir}")
+            print(f"  TB log dir  : {tb_run_dir}")
+            print(f"  Console log : {_log_path}")
+            print(f"{'='*70}")
+
+            try:
+                results[scene.name] = run_pipeline(
+                    cfg, tb_run_dir=tb_run_dir, tb_enabled=tb_enabled
+                )
+                statuses[scene.name] = "ok"
+            except Exception as exc:
+                print(f"\n  ✗ [{scene.name}] errore: {exc}")
+                import traceback
+                traceback.print_exc()
+                results[scene.name] = None
+                statuses[scene.name] = f"error: {exc}"
+
+    # ── Riepilogo ──────────────────────────────────────────────────────────────
+    print(f"\n{'='*70}")
+    print("  Riepilogo run_pipeline_multi:")
+    for name, status in statuses.items():
+        icon = "✓" if status == "ok" else "✗"
+        print(f"    {icon} {name}: {status}")
+    print(f"{'='*70}")
 
     return results
 
@@ -2250,6 +2587,7 @@ if __name__ == "__main__":
         run_step1 = True,
         run_step2 = True,
         run_step3 = True,
+        resume_skip_step2_if_ckpt = True,   # salta il training NeRF se il checkpoint esiste già
 
         render = RenderConfig(
             # path per-scena (sovrascritta da SceneConfig — non modificare qui)
@@ -2278,7 +2616,7 @@ if __name__ == "__main__":
             irradiance_sample_side = 512,
 
             precompute_indirect            = True,
-            indirect_sample_side           = 64,
+            indirect_sample_side           = 32,
             indirect_tile_size             = 1024,
             indirect_override_depth_window = False,
 
@@ -2295,7 +2633,8 @@ if __name__ == "__main__":
             ium_texture_size = [4096, 4096],
             apply_scale      = False,
 
-            color_texture_image_source = "nerf",  # "nerf" | "gt"
+            color_texture_image_source  = "gt",         # sorgente principale (camera_texture, pixel_change)
+            color_texture_image_sources = ["gt", "nerf"], # produce entrambe le varianti di color_texture e albedo
 
             precompute_spec_cone = False,
             render_pbr_maps      = False,
@@ -2307,9 +2646,10 @@ if __name__ == "__main__":
 
         ),
 
-        nerf_num_iters     = 2,
-        nerf_batch_size    = 4096*24,
-        nerf_lr            = 5e-4,
+        nerf_num_iters       = 50000,
+        nerf_lr_decay_steps  = 100000,  # ancora fissa = lunghezza pianificata; resume corretto
+        nerf_batch_size      = 4096*24,
+        nerf_lr              = 5e-4,
         nerf_display_every = 100,
         nerf_seed          = 9458,
 
@@ -2317,13 +2657,13 @@ if __name__ == "__main__":
         nerf_interactive_loop           = False,
 
         nerf_depth_window_samples      = 5,
-        nerf_depth_window              = 0.1,
-        nerf_depth_window_end          = 0.1,
+        nerf_depth_window              = 0.05,
+        nerf_depth_window_end          = 0.05,
         nerf_opacity_weight            = 1.0,
         nerf_raw_noise_std             = 1.0,
         nerf_bg_radius_mult            = 3.0,
-        nerf_bg_depth_window           = 0.1,
-        nerf_bg_depth_window_end       = 0.1,
+        nerf_bg_depth_window           = 0.05,
+        nerf_bg_depth_window_end       = 0.05,
         # nerf_multires = 12,
         # nerf_multires_views = 6,
 
@@ -2346,14 +2686,22 @@ if __name__ == "__main__":
         #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
         #     skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # ),
+        # SceneConfig(
+        #     name             = "TableAndOtherInterior",
+        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
+        #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+        #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
+        #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
+        #     skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+        # ),
         SceneConfig(
             name             = "TableAndOtherInterior",
-            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
+            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenExrSmoothNoDiffuse/transforms.json",
             model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
-            external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
+            external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmoothNoDiffuse/BakedMaterial_normal.exr",
             # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
             skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
-        ),
+        )
         # SceneConfig(
         #     name            = "SwordShield",
         #     transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
@@ -2362,14 +2710,37 @@ if __name__ == "__main__":
     ]
 
     # ── Esecuzione ────────────────────────────────────────────────────────────
-    # run_note descrive le modifiche fatte al codice per questo run.
-    # Viene salvato in run_manifest.json di ogni scena.
-    run_pipeline_multi(
-        template,
-        SCENES,
-        output_root = "D:/tesi_output/ttttt",
-        run_note    = (
-            "expo + rel_mse_raw loss, 100k iter smooth scene + decay 0.2 + no perturb 5 samples"
-        ),
-    )
+    # Sweep fattoriale 2×2×2: attivazione × loss × decay — 8 run in totale.
+    # Ogni run ottiene il proprio output_root (checkpoint isolati: exp/softplus
+    # non sono compatibili tra loro e non devono fare resume incrociato).
+    # TB_LOG_ROOT viene letta da docker/tensorboard/.env — non serve cambiarla qui.
+    # Per un sweep pulito da zero, cambiare SWEEP_ROOT o svuotare la cartella.
+
+    # (tag_base, rgb_activation, loss_type) — fattoriale 2×2 attivazione × loss
+    EXPERIMENTS = [
+        # ("exp_relmseraw",      "exp",      "rel_mse_raw"),
+        # ("softplus_relmseraw", "softplus", "rel_mse_raw"),
+        ("exp_l1",             "exp",      "l1"),
+        # ("softplus_l1",        "softplus", "l1"),
+    ]
+    DECAYS     = (0.2,)
+    SWEEP_ROOT = "D:/tesi_output/nerf_sweep_nodiffuse_tangent"
+
+    for name, act, loss in EXPERIMENTS:
+        for decay in DECAYS:
+            
+            cfg = copy.deepcopy(template)
+            cfg.nerf_num_iters       = 75000
+            cfg.nerf_lr_decay_steps  = 100000  # ancora fissa allineata a num_iters
+            cfg.nerf_rgb_activation  = act
+            cfg.nerf_loss_type       = loss
+            cfg.nerf_lr_decay        = decay
+            cfg.skybox_source        = "nerf"
+            tag = f"{name}_d{str(decay).replace('.', '')}"  # es. exp_l1_d01
+            run_pipeline_multi(
+                cfg, SCENES,
+                output_root    = f"{SWEEP_ROOT}/{tag}",
+                run_note       = f"75k iter | act={act} | loss={loss} | decay={decay} (full pipeline)",
+                experiment_tag = tag,
+            )
     

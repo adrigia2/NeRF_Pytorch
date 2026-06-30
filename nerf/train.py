@@ -44,11 +44,15 @@ LOSSES = {
 
 def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: str,
           num_iters: int, batch_size: int, lr: float, seed: int,
-          display_every: int) -> None:
+          display_every: int, tb_logger=None) -> float:
     """Train a single-network depth-guided NeRF from transforms_extended.json.
 
     Uses render_unified with a single fixed-shape batch (fg+bg together via in_mask).
     Saves a checkpoint to ckpt_path; resumes if it already exists.
+
+    Returns the PSNR (dB) from the last display block, or float('nan') if the
+    training ran for fewer than ``display_every`` iterations.
+    ``tb_logger`` accepts a monitoring.RunLogger (or None to disable TB logging).
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -101,11 +105,12 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Decay spalmato sull'intero run (incluso l'eventuale resume):
-    # lr → 0.2·lr all'ultima iterazione pianificata.
-    decay_steps = iter_start + num_iters
+    # Decay ancorato a un orizzonte FISSO in iterazioni assolute (lr_decay_steps):
+    # schedule = funzione pura di i, continuo attraverso i resume. 0 = auto → num_iters.
+    decay_steps = cfg.lr_decay_steps if cfg.lr_decay_steps > 0 else num_iters
     loss_window: deque[torch.Tensor] = deque(maxlen=display_every)
     mse_window:  deque[torch.Tensor] = deque(maxlen=display_every)
+    _final_psnr: float = float("nan")  # aggiornato ad ogni display block, ritornato a fine
 
     # ── profiling state ──────────────────────────────────────────────────────
     use_cuda      = device.type == "cuda"
@@ -129,7 +134,7 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
         _profiling = _prof_active and (i - iter_start) < cfg.profile_iters
 
         # ── LR schedule ─────────────────────────────────────────────────────
-        new_lr = lr * (0.2 ** (i / decay_steps))
+        new_lr = lr * (cfg.lr_decay_factor ** min(i / decay_steps, 1.0))
         for pg in optimizer.param_groups:
             pg["lr"] = new_lr
 
@@ -199,12 +204,22 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
             recent_loss = torch.stack(list(loss_window)).mean().item()
             recent_mse  = torch.stack(list(mse_window)).mean().item()
             psnr = -10.0 * np.log10(recent_mse + 1e-10)
+            _final_psnr = psnr  # tracciamo il PSNR dell'ultimo block per il ritorno
 
             win_times   = list(_iter_times)
             iters_per_s = len(win_times) / max(sum(win_times), 1e-9)
             rays_per_s  = batch_size * iters_per_s
             print(f"  iter {i + 1}  {cfg.loss_type}={recent_loss:.4f}  PSNR≈{psnr:.2f} dB  "
                   f"lr={new_lr:.2e}  {iters_per_s:.1f} it/s  {rays_per_s/1e3:.0f}k rays/s")
+
+            # — TensorBoard scalars (no-op se tb_logger è None) —
+            if tb_logger is not None:
+                tb_logger.log_scalars("nerf", {
+                    "loss":        recent_loss,
+                    "psnr_db":     psnr,
+                    "lr":          new_lr,
+                    "iters_per_s": iters_per_s,
+                }, step=i + 1)
 
             with torch.no_grad():
                 _ro, _rd, _rgb_gt, _dep, _msk = dataset.sample_natural(min(512, batch_size))
@@ -217,7 +232,14 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
                       f"pred=[{_rgb_pred.min():.3f},{_rgb_pred.mean():.3f},{_rgb_pred.max():.3f}]  "
                       f"target=[{_rgb_gt.min():.3f},{_rgb_gt.mean():.3f},{_rgb_gt.max():.3f}]")
 
-            _save_preview(model_bundle, dataset, cfg, out_dir / f"preview_iter_{i+1:06d}.exr")
+            # Preview: _save_preview ora ritorna l'array per il log TB
+            preview_img = _save_preview(
+                model_bundle, dataset, cfg, out_dir / f"preview_iter_{i+1:06d}.exr"
+            )
+            if tb_logger is not None and preview_img is not None:
+                tb_logger.log_image("nerf/preview", preview_img, step=i + 1, tonemap=True)
+                tb_logger.flush()
+
             # Checkpoint periodico: permette il watch-mode di nerf_viewer e il
             # resume da crash. Scrittura atomica, costo trascurabile vs preview.
             save_checkpoint(ckpt_path, model, optimizer, i + 1, cfg,
@@ -229,9 +251,17 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
     save_checkpoint(ckpt_path, model, optimizer, iter_start + num_iters, cfg,
                     scene_center=center, sphere_radius=sphere_radius)
     print(f"  Checkpoint salvato: {ckpt_path}")
+    return _final_psnr
 
 
-def _save_preview(model_bundle, dataset: NerfDataset, cfg: NerfConfig, path: Path):
+def _save_preview(
+    model_bundle, dataset: NerfDataset, cfg: NerfConfig, path: Path
+) -> np.ndarray | None:
+    """Render a preview frame, save it as EXR, and return the float32 HxWx3 array.
+
+    The returned array can be passed directly to RunLogger.log_image() for
+    TensorBoard without triggering a second render.  Returns None on failure.
+    """
     import OpenEXR, Imath
     model = model_bundle[0]
     _, _, _, test_pose, test_dep = dataset.get_test_frame()
@@ -246,3 +276,4 @@ def _save_preview(model_bundle, dataset: NerfDataset, cfg: NerfConfig, path: Pat
     f = OpenEXR.OutputFile(str(path), header)
     f.writePixels({"R": img[..., 0].tobytes(), "G": img[..., 1].tobytes(), "B": img[..., 2].tobytes()})
     f.close()
+    return img

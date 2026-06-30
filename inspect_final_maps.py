@@ -10,10 +10,22 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, str(Path(__file__).parent))
 from pbr_solver import _read_exr
 
+
+def _find_variant(folder: Path, stem: str, primary: str = "nerf") -> Path:
+    """Cerca {stem}_{primary}.exr, poi la prima variante {stem}_*.exr, poi {stem}.exr."""
+    p = folder / f"{stem}_{primary}.exr"
+    if p.exists():
+        return p
+    variants = sorted(folder.glob(f"{stem}_*.exr"))
+    if variants:
+        return variants[0]
+    return folder / f"{stem}.exr"   # fallback legacy
+
+
 out = Path(sys.argv[1] if len(sys.argv) > 1 else "D:/tesi_output/testNewApproach")
 met = _read_exr(out / "metallic" / "metallic.exr")
 rgh = _read_exr(out / "roughness" / "roughness.exr")
-col = _read_exr(out / "color_texture" / "color_texture.exr")
+col = _read_exr(_find_variant(out / "color_texture", "color_texture"))
 
 
 def tm(x):

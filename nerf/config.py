@@ -40,9 +40,18 @@ class NerfConfig:
     chunk: int = 1024 * 32
 
     # Training optimiser
-    # LR schedule: exponential decay to 0.1·lrate spread over the full planned
-    # run (iter_start + num_iters) — no separate horizon parameter.
+    # LR schedule: new_lr = lr * (lr_decay_factor ** min(i / decay_steps, 1.0))
+    # where decay_steps = lr_decay_steps if > 0 else num_iters.
+    # The exponent is clamped to 1 so the LR plateaus at lr*lr_decay_factor beyond the
+    # horizon (no freeze when continuing after the planned iteration count).
+    # lr_decay_factor=0.2 → lr decays to 20 % of its initial value at decay_steps;
+    # 0.1 is more aggressive, 0.5 is gentler.
     lrate: float = 5e-4
+    lr_decay_factor: float = 0.2  # sweepable via PipelineConfig.nerf_lr_decay
+    # Orizzonte (in iterazioni ASSOLUTE) su cui si spalma il decay. Ancora FISSA,
+    # indipendente da num_iters/iter_start: garantisce uno schedule continuo quando si
+    # riprende il training. 0 = auto → usa num_iters (orizzonte del run fresh).
+    lr_decay_steps: int = 0  # sweepable via PipelineConfig.nerf_lr_decay_steps
 
     # Foreground depth-window (mesh surface)
     depth_window: float = 0.5        # samples span [t_hit - window, t_hit + window_end]

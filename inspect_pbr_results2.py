@@ -10,13 +10,25 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, str(Path(__file__).parent))
 from pbr_solver import _read_exr
 
+
+def _find_variant(folder: Path, stem: str, primary: str = "nerf") -> Path:
+    """Cerca {stem}_{primary}.exr, poi la prima variante {stem}_*.exr, poi {stem}.exr."""
+    p = folder / f"{stem}_{primary}.exr"
+    if p.exists():
+        return p
+    variants = sorted(folder.glob(f"{stem}_*.exr"))
+    if variants:
+        return variants[0]
+    return folder / f"{stem}.exr"   # fallback legacy
+
+
 out = Path(sys.argv[1] if len(sys.argv) > 1 else "D:/tesi_output/testNewApproach")
 
 X        = _read_exr(out / "pbr" / "diffuse_weight.exr")    # peso diffuso del fit
 cone_r   = _read_exr(out / "pbr" / "spec_cone_r.exr")
 residual = _read_exr(out / "pbr" / "residual.exr")
 n_views  = _read_exr(out / "pbr" / "n_views.exr")
-color    = _read_exr(out / "color_texture" / "color_texture.exr")
+color    = _read_exr(_find_variant(out / "color_texture", "color_texture"))
 cvar     = _read_exr(out / "pixel_change" / "color_variance.exr").mean(-1)
 
 valid = n_views > 0
