@@ -1,43 +1,69 @@
-"""Fit PBR multi-vista (prima versione, modello a cono):
+"""Fit PBR multi-vista con lobi speculari parametrici:
 
-    C_j = X · D + (1 - X) · L_j(r)
+    C_j = X · D + (1 - X) · L_j
 
-    C_j    colore osservato dalla camera j   (camera_texture/<stem>.exr)
-    D      termine diffuso vista-indipendente (pixel_change/color_min.exr)
-    L_j(r) radianza media del cono attorno al raggio riflesso
-           (spec_cone/cam_jjj_rkk.exr, precompute di images_generator.py)
-    X      peso del termine DIFFUSO (X=1 → nessuna dipendenza dalla vista);
-           la specularità/metallic è 1−X. Forma chiusa per ogni r della griglia.
-    r      apertura del cono: scelta per scan (residuo minimo)
+    C_j   colore osservato dalla camera j    (sources/{source}/camera_texture/<stem>.exr)
+    D     termine diffuso vista-indipendente (sources/{source}/pixel_change/color_min.exr)
+    L_j   radianza dell'ambiente attorno al raggio riflesso, ricostruita dalle
+          medie per-anello del bake (spec_cone/cam_jjj_ringkk.exr + counts,
+          format "rings" di images_generator.py) pesando gli anelli col kernel:
+            - "phong" (default): lobo cos^s θ_R; candidati = specchio + griglia
+              di esponenti s; roughness = α GGX = √(2/(s+2)), calibrata
+            - "tophat": coni troncati alle aperture della griglia (schema
+              storico, per confronto); roughness = apertura/180
+    X     peso del termine DIFFUSO (X=1 → nessuna dipendenza dalla vista);
+          la specularità/metallic è 1−X. Forma chiusa per ogni candidato.
 
-Per ogni livello r_k il residuo è una parabola in X:
+Pesi per anello in forma chiusa (b = semi-aperture, c = cos b clampato a ≥0):
+    phong:  W_i(s) = 2π/(s+1) · (c_{i-1}^{s+1} − c_i^{s+1})  su tutti gli anelli
+    tophat: W_i    = 2π · (c_{i-1} − c_i)  per i ≤ k, 0 oltre
+    L = Σ_i W_i·mean_i·valid_i / Σ_i W_i·valid_i   (pesa la frazione visibile)
+Nota: il peso è medio per anello → la risoluzione sui lobi stretti è
+quantizzata dalla larghezza degli anelli (s ≳ 800 ≈ specchio con la griglia
+di aperture default).
+
+Per ogni candidato il residuo è una parabola in X:
     res(X) = S_cc - 2·X·S_cd + X²·S_dd
     S_cc = Σ_{j,c} w_j (C-L)²,  S_cd = Σ w_j (C-L)(D-L),  S_dd = Σ w_j (D-L)²
-quindi X*(r_k) = clip(S_cd / S_dd, 0, 1) e il residuo si valuta senza
-ripassare sui dati. Si tiene il livello con residuo minimo per texel.
+quindi X* = clip(S_cd / S_dd, 0, 1). Il loop è streaming per camera: carica
+C_j + anelli, accumula S_cc/S_cd/S_dd per tutti i candidati, libera — la RAM
+non scala col numero di camere.
 
 Gate e validità:
   - gate diffuso scale-invariant sul coefficiente di variazione tra camere:
-    sqrt(var) < cv_gate · luminanza(D)  →  X=1, metallic=0, r non vincolato;
-  - r è attendibile solo dove la specularità supera spec_threshold: sotto,
-    roughness viene posta a 1.0 (nessun riflesso nitido) e il texel è
-    marcato in pbr/r_valid.png.
+    sqrt(var) < cv_gate · luminanza(D)  →  X=1, metallic=0, lobo non vincolato;
+  - il lobo è attendibile solo dove la specularità supera spec_threshold:
+    sotto, roughness viene posta a 1.0 e il texel è marcato in pbr/r_valid.png.
 
-Mappe finali (come l'albedo, cartelle dedicate, EXR):
-  <out>/metallic/metallic.exr    = 1−X   (0=diffuso, 1=tutto speculare)
-  <out>/roughness/roughness.exr  = r/180 dove valido, 1.0 altrove
-Diagnostica in <out>/pbr/: diffuse_weight.exr (X), spec_cone_r.exr (gradi),
-residual.exr, n_views.exr, r_valid.png + preview PNG a scala assoluta.
+Mappe finali, per la sorgente `source` (chiamare una volta per ogni sorgente da
+processare: le uscite vivono sotto sources/{source}/, i nomi interni non sono
+suffissati):
+  <out>/sources/{source}/metallic/metallic.exr      = 1−X   (0=diffuso, 1=tutto speculare)
+  <out>/sources/{source}/roughness/roughness.exr    = α GGX del candidato vincente, 1.0 altrove
+  <out>/sources/{source}/albedo_pbr/albedo_pbr.exr  = π·(X·D)/max(E_sky+E_ind, albedo_eps):
+    albedo diffusa depurata dallo speculare (coesiste con l'albedo Lambertiana
+    classica in <out>/sources/{source}/albedo/). Richiede irradiance/irradiance.exr
+    su disco (irradiance_indirect.exr sommata se presente; input condiviso, non
+    per-source); se manca, la mappa è saltata con warning. Sui texel non
+    risolvibili si assume X=1 (diffuso).
+Diagnostica in <out>/sources/{source}/pbr/: diffuse_weight.exr (X), lobe_param.exr
+(esponente s, -1 = specchio; con kernel tophat: apertura in gradi), residual.exr,
+n_views.exr, r_valid.png + preview PNG a scala assoluta.
+
+Input condivisi (source-indipendenti, non sotto sources/{source}/): spec_cone/,
+ium/ium_masks.exr, visibility/visibility.exr, irradiance/.
 
 Uso:
-    python pbr_solver.py <output_dir> [--cv-gate 0.05] [--spec-threshold 0.2]
-                         [--min-views 2]
+    python pbr_solver.py <output_dir> [--source gt] [--cv-gate 0.05]
+                         [--spec-threshold 0.2] [--min-views 2] [--albedo-eps 1e-3]
+                         [--kernel phong|tophat] [--lobe-exponents 800,200,...]
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -83,30 +109,86 @@ def _read_mask_png(path: Path) -> np.ndarray:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Kernel dei lobi: pesi per anello in forma chiusa
+# ──────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_LOBE_EXPONENTS = [800.0, 200.0, 60.0, 20.0, 6.0, 2.0, 0.0]
+
+
+def ring_weights_phong(cos_edges: np.ndarray, s: float) -> np.ndarray:
+    """Lobo cos^s θ_R integrato sull'anello [b_{i-1}, b_i]:
+    W_i = 2π/(s+1)·(c_{i-1}^{s+1} − c_i^{s+1}), con c = max(cos b, 0)
+    (il lobo è nullo oltre 90° dall'asse del raggio riflesso)."""
+    c = np.clip(np.asarray(cos_edges, dtype=np.float64), 0.0, 1.0)
+    p = s + 1.0
+    return 2.0 * np.pi / p * (c[:-1] ** p - c[1:] ** p)
+
+
+def ring_weights_tophat(cos_edges: np.ndarray, k: int) -> np.ndarray:
+    """Cono top-hat troncato all'anello k (angolo solido puro):
+    W_i = 2π(c_{i-1} − c_i) per i ≤ k, 0 oltre (k in 1..K-1)."""
+    c = np.asarray(cos_edges, dtype=np.float64)
+    w = 2.0 * np.pi * (c[:-1] - c[1:])
+    w[k:] = 0.0
+    return w
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Solver
 # ──────────────────────────────────────────────────────────────────────────────
 
 def solve_pbr(output_dir: str,
+              source: str = "gt",
               cv_gate: float = 0.05,
               spec_threshold: float = 0.2,
               min_views: int = 2,
+              albedo_eps: float = 1e-3,
+              kernel: str = "phong",
+              lobe_exponents: "list[float] | None" = None,
               eps: float = 1e-12) -> dict:
     out = Path(output_dir)
-    spec_dir = out / "spec_cone"
+    src_dir = out / "sources" / source     # artefatti source-dipendenti (camera_texture/, pixel_change/, uscite PBR)
+    spec_dir = out / "spec_cone"           # condiviso (source-indipendente)
 
     with open(spec_dir / "spec_cone_meta.json", encoding="utf-8") as fh:
         meta = json.load(fh)
     with open(out / "transforms_extended.json", encoding="utf-8") as fh:
         tjson = json.load(fh)
 
+    if meta.get("format") != "rings":
+        raise ValueError(
+            "spec_cone_meta.json in formato legacy (coni cumulativi): il solver "
+            "richiede il formato 'rings' (medie per-anello + counts). "
+            "Ri-eseguire il precompute spec_cone.")
+
     apertures = np.asarray(meta["apertures_deg"], dtype=np.float32)
     cams      = meta["cameras"]
     K         = meta["num_levels"]
     stems     = [Path(f["file_path"]).stem for f in tjson["frames"]]
 
-    # ── Input vista-indipendenti ─────────────────────────────────────────────
-    D_img = _read_exr(out / "pixel_change" / "color_min.exr")          # (H, W, 3)
-    var   = _read_exr(out / "pixel_change" / "color_variance.exr")     # (H, W, 3)
+    # ── Candidati del lobo: [specchio] + kernel parametrico ──────────────────
+    # Tupla: (label, pesi per anello — None per lo specchio, roughness, param)
+    cos_edges = np.asarray(meta.get("ring_edges_cos")
+                           or np.cos(np.radians(apertures) * 0.5),
+                           dtype=np.float64)
+    if kernel == "phong":
+        exps = list(DEFAULT_LOBE_EXPONENTS if lobe_exponents is None
+                    else lobe_exponents)
+        candidates = [("mirror", None, 0.0, -1.0)]
+        candidates += [(f"s={s:g}", ring_weights_phong(cos_edges, s),
+                        math.sqrt(2.0 / (s + 2.0)), float(s)) for s in exps]
+    elif kernel == "tophat":
+        candidates = [("mirror", None, 0.0, 0.0)]
+        candidates += [(f"r={apertures[k]:g}°", ring_weights_tophat(cos_edges, k),
+                        float(apertures[k]) / 180.0, float(apertures[k]))
+                       for k in range(1, K)]
+    else:
+        raise ValueError(f"kernel sconosciuto: {kernel!r} (usare 'phong' o 'tophat')")
+    n_cand = len(candidates)
+
+    # ── Input vista-indipendenti (per la sorgente `source`) ──────────────────
+    D_img = _read_exr(src_dir / "pixel_change" / "color_min.exr")          # (H, W, 3)
+    var   = _read_exr(src_dir / "pixel_change" / "color_variance.exr")     # (H, W, 3)
     H, W  = D_img.shape[:2]
     N     = H * W
     D     = D_img.reshape(N, 3).astype(np.float64)
@@ -120,57 +202,74 @@ def solve_pbr(output_dir: str,
     vis_path = out / "visibility" / "visibility.exr"
     vis = _read_exr(vis_path).reshape(N, -1) > 0.5 if vis_path.exists() else None
 
-    # ── Osservazioni e pesi per camera (costanti rispetto a r) ───────────────
-    C_list, w_list = [], []
+    print(f"[pbr_solver] {N} texel, {len(cams)} camere, kernel={kernel}, "
+          f"{n_cand} candidati ({K - 1} anelli + specchio)")
+
+    # ── Scan streaming: una camera alla volta, statistiche per candidato ─────
+    S_cc = np.zeros((N, n_cand))
+    S_cd = np.zeros((N, n_cand))
+    S_dd = np.zeros((N, n_cand))
+    n_views = np.zeros(N, dtype=np.int32)
+
     for j in cams:
-        C_j = _read_exr(out / "camera_texture" / f"{stems[j]}.exr")
-        C_list.append(C_j.reshape(N, 3).astype(np.float64))
+        C_j = _read_exr(src_dir / "camera_texture" / f"{stems[j]}.exr")
+        C_j = C_j.reshape(N, 3).astype(np.float64)
         w_j = mask.copy()
         if vis is not None:
             w_j &= vis[:, j]
         w_j &= _read_mask_png(spec_dir / meta["valid_file_pattern"].format(cam=j)).reshape(N)
-        w_list.append(w_j)
+        n_views += w_j
 
-    n_views = np.sum(np.stack(w_list), axis=0).astype(np.int32)        # (N,)
+        means = np.stack([_read_exr(spec_dir / meta["ring_file_pattern"]
+                                    .format(cam=j, level=k)).reshape(N, 3)
+                          for k in range(K)], axis=1)               # (N, K, 3)
+        counts = _read_exr(spec_dir / meta["counts_file_pattern"].format(cam=j))
+        counts = counts.reshape(N, K).astype(np.float64)
+
+        wf = w_j.astype(np.float64)[:, None]
+        for c_idx, (_label, w_rings, _rough, _param) in enumerate(candidates):
+            if w_rings is None:                    # specchio puro (livello 0)
+                L = means[:, 0].astype(np.float64)
+            else:                                  # lobo: anelli 1..K-1 pesati
+                wc  = w_rings[None, :] * counts[:, 1:]              # (N, K-1)
+                den = wc.sum(axis=1)
+                num = np.einsum("nk,nkc->nc", wc,
+                                means[:, 1:].astype(np.float64))
+                L = np.zeros((N, 3))
+                ok = den > 0
+                L[ok] = num[ok] / den[ok, None]
+            dC = C_j - L; dD = D - L
+            S_cc[:, c_idx] += (wf * dC * dC).sum(axis=-1)
+            S_cd[:, c_idx] += (wf * dC * dD).sum(axis=-1)
+            S_dd[:, c_idx] += (wf * dD * dD).sum(axis=-1)
+        print(f"  cam {j}: statistiche accumulate")
+
     solvable = mask & (n_views >= min_views)
 
     # Gate diffuso scale-invariant: variazione tra camere piccola rispetto
-    # alla luminanza del texel → X=1, metallic=0, r non vincolato
+    # alla luminanza del texel → X=1, metallic=0, lobo non vincolato
     lum_D   = D.mean(axis=-1)
     lum_std = np.sqrt(np.maximum(var.reshape(N, 3).mean(axis=-1), 0.0))
     diffuse_gate = solvable & (lum_std < cv_gate * np.maximum(lum_D, 1e-6))
 
-    print(f"[pbr_solver] {N} texel, {len(cams)} camere, {K} livelli r")
     print(f"  texel risolvibili: {int(solvable.sum())}, "
           f"di cui gated come diffusi (CV<{cv_gate}): {int(diffuse_gate.sum())}")
 
-    # ── Scan sui livelli r ────────────────────────────────────────────────────
-    best_res = np.full(N, np.inf)
-    best_X   = np.ones(N)
-    best_k   = np.zeros(N, dtype=np.int32)
+    # ── Selezione del candidato a residuo minimo ─────────────────────────────
+    X_all   = np.clip(S_cd / np.maximum(S_dd, eps), 0.0, 1.0)       # (N, n_cand)
+    res_all = S_cc - 2.0 * X_all * S_cd + X_all * X_all * S_dd
+    res_all /= np.maximum(3.0 * n_views, 1.0)[:, None]  # residuo medio per equazione
 
-    target = solvable & ~diffuse_gate
-    for k in range(K):
-        S_cc = np.zeros(N); S_cd = np.zeros(N); S_dd = np.zeros(N)
-        for j, C_j, w_j in zip(cams, C_list, w_list):
-            L = _read_exr(spec_dir / meta["level_file_pattern"].format(cam=j, level=k))
-            L = L.reshape(N, 3).astype(np.float64)
-            dC = (C_j - L); dD = (D - L)
-            wf = w_j.astype(np.float64)[:, None]
-            S_cc += (wf * dC * dC).sum(axis=-1)
-            S_cd += (wf * dC * dD).sum(axis=-1)
-            S_dd += (wf * dD * dD).sum(axis=-1)
+    target   = solvable & ~diffuse_gate
+    best_k   = np.argmin(res_all, axis=1).astype(np.int32)
+    _idx     = np.arange(N)
+    best_res = res_all[_idx, best_k]
+    best_X   = X_all[_idx, best_k]
 
-        X_k = np.clip(S_cd / np.maximum(S_dd, eps), 0.0, 1.0)
-        res_k = S_cc - 2.0 * X_k * S_cd + X_k * X_k * S_dd
-        res_k /= np.maximum(3.0 * n_views, 1.0)   # residuo medio per equazione
-
-        better = target & (res_k < best_res)
-        best_res[better] = res_k[better]
-        best_X[better]   = X_k[better]
-        best_k[better]   = k
-        print(f"  livello r={apertures[k]:6.1f}° → migliore per "
-              f"{int(better.sum())} texel")
+    for c_idx, (label, _w, rough, _param) in enumerate(candidates):
+        n_best = int(((best_k == c_idx) & target & np.isfinite(best_res)).sum())
+        print(f"  candidato {label:>9} (roughness={rough:.3f}) → migliore per "
+              f"{n_best} texel")
 
     # ── Composizione output ───────────────────────────────────────────────────
     fitted = target & np.isfinite(best_res)
@@ -182,13 +281,16 @@ def solve_pbr(output_dir: str,
     metallic = np.zeros(N, dtype=np.float32)      # 1−X (specularità)
     metallic[fitted] = (1.0 - best_X[fitted]).astype(np.float32)
 
-    cone_r = np.zeros(N, dtype=np.float32)
-    cone_r[fitted] = apertures[best_k[fitted]]
+    rough_vals = np.asarray([c[2] for c in candidates], dtype=np.float32)
+    param_vals = np.asarray([c[3] for c in candidates], dtype=np.float32)
 
-    # r attendibile solo con specularità sufficiente; altrove roughness=1
+    lobe_param = np.zeros(N, dtype=np.float32)
+    lobe_param[fitted] = param_vals[best_k[fitted]]
+
+    # lobo attendibile solo con specularità sufficiente; altrove roughness=1
     r_valid = fitted & (metallic >= spec_threshold)
     roughness = np.where(mask, 1.0, 0.0).astype(np.float32)
-    roughness[r_valid] = cone_r[r_valid] / 180.0
+    roughness[r_valid] = rough_vals[best_k[r_valid]]
 
     residual = np.zeros(N, dtype=np.float32)
     residual[fitted] = best_res[fitted].astype(np.float32)
@@ -198,19 +300,19 @@ def solve_pbr(output_dir: str,
 
     # ── Mappe finali (cartelle dedicate, come l'albedo) ───────────────────────
     fmt = ImageFormat.OPENEXR
-    met_dir = out / "metallic";  met_dir.mkdir(parents=True, exist_ok=True)
-    rgh_dir = out / "roughness"; rgh_dir.mkdir(parents=True, exist_ok=True)
+    met_dir = src_dir / "metallic";  met_dir.mkdir(parents=True, exist_ok=True)
+    rgh_dir = src_dir / "roughness"; rgh_dir.mkdir(parents=True, exist_ok=True)
     metallic_path  = (met_dir / "metallic.exr").resolve().as_posix()
     roughness_path = (rgh_dir / "roughness.exr").resolve().as_posix()
     _save_layer(metallic.reshape(H, W), metallic_path, fmt, DataLayer.METALLIC)
     _save_layer(roughness.reshape(H, W), roughness_path, fmt, DataLayer.ROUGHNESS)
 
     # ── Diagnostica ───────────────────────────────────────────────────────────
-    pbr_dir = out / "pbr"
+    pbr_dir = src_dir / "pbr"
     pbr_dir.mkdir(parents=True, exist_ok=True)
     _save_layer(diffuse_w.reshape(H, W), (pbr_dir / "diffuse_weight.exr").as_posix(),
                 fmt, DataLayer.METALLIC)
-    _save_layer(cone_r.reshape(H, W), (pbr_dir / "spec_cone_r.exr").as_posix(),
+    _save_layer(lobe_param.reshape(H, W), (pbr_dir / "lobe_param.exr").as_posix(),
                 fmt, DataLayer.SPEC_CONE_R)
     _save_layer(residual.reshape(H, W), (pbr_dir / "residual.exr").as_posix(),
                 fmt, DataLayer.SPEC_CONE_R)
@@ -227,16 +329,51 @@ def solve_pbr(output_dir: str,
     Image.fromarray((np.clip(roughness, 0, 1).reshape(H, W) * 255).astype(np.uint8)
                     ).save(pbr_dir / "roughness_preview.png")
 
+    # ── Albedo PBR: π·(X·D)/max(E_sky+E_ind, albedo_eps) ─────────────────────
+    # Numeratore = radianza diffusa stimata dal fit (vista-indipendente, depurata
+    # dallo speculare); coesiste con l'albedo Lambertiana classica in <out>/albedo/.
+    albedo_pbr_path = None
+    albedo_pbr = None
+    irr_path = out / "irradiance" / "irradiance.exr"
+    if irr_path.exists():
+        E = _read_exr(irr_path).reshape(N, 3).astype(np.float64)
+        ind_path = out / "irradiance" / "irradiance_indirect.exr"
+        if ind_path.exists():
+            E += _read_exr(ind_path).reshape(N, 3).astype(np.float64)
+        denom = np.maximum(E, albedo_eps)
+
+        # X completo: dove il fit non è possibile si assume diffuso (X=1),
+        # come roughness=1 altrove, così la mappa è definita su tutta la mask
+        X_full = diffuse_w.astype(np.float64)
+        X_full[mask & ~fitted & ~diffuse_gate] = 1.0
+
+        alb_flat = np.clip(np.pi * X_full[:, None] * D / denom, 0.0, 1.0)
+        alb_flat[~mask] = 0.0
+        albedo_pbr = alb_flat.reshape(H, W, 3).astype(np.float32)
+
+        alb_dir = src_dir / "albedo_pbr"; alb_dir.mkdir(parents=True, exist_ok=True)
+        albedo_pbr_path = (alb_dir / "albedo_pbr.exr").resolve().as_posix()
+        _save_layer(albedo_pbr, albedo_pbr_path, fmt, DataLayer.ALBEDO)
+        Image.fromarray((albedo_pbr * 255).astype(np.uint8)
+                        ).save(pbr_dir / "albedo_pbr_preview.png")
+        print(f"✓ albedo_pbr: {albedo_pbr_path} (indirect: "
+              f"{'sì' if ind_path.exists() else 'no'})")
+    else:
+        print(f"    ⚠  albedo_pbr saltata: {irr_path} non trovata "
+              "(serve il pass irradiance)")
+
     print(f"✓ metallic:  {metallic_path}")
     print(f"✓ roughness: {roughness_path}")
     print(f"✓ diagnostica in {pbr_dir}")
     return {
         "metallic_path": metallic_path,
         "roughness_path": roughness_path,
+        "albedo_pbr_path": albedo_pbr_path,
+        "albedo_pbr": albedo_pbr,
         "metallic": metallic.reshape(H, W),
         "roughness": roughness.reshape(H, W),
         "diffuse_weight": diffuse_w.reshape(H, W),
-        "cone_r": cone_r.reshape(H, W),
+        "lobe_param": lobe_param.reshape(H, W),
         "residual": residual.reshape(H, W),
         "n_views": n_views.reshape(H, W),
         "r_valid": r_valid.reshape(H, W),
@@ -247,11 +384,25 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description="Fit PBR C_j = X·D + (1-X)·L_j(r) → metallic/roughness")
     ap.add_argument("output_dir", help="output_dir del pipeline (contiene spec_cone/, ...)")
+    ap.add_argument("--source", type=str, default="gt",
+                    help="sorgente da processare (sources/{source}/, es. gt o nerf)")
     ap.add_argument("--cv-gate", type=float, default=0.05,
                     help="gate diffuso: std tra camere < cv_gate·luminanza → metallic=0")
     ap.add_argument("--spec-threshold", type=float, default=0.2,
                     help="metallic minimo perché r sia attendibile (sotto: roughness=1)")
     ap.add_argument("--min-views", type=int, default=2,
                     help="minimo di camere valide per texel")
+    ap.add_argument("--albedo-eps", type=float, default=1e-3,
+                    help="clamp minimo dell'irradiance nell'albedo_pbr")
+    ap.add_argument("--kernel", choices=["phong", "tophat"], default="phong",
+                    help="kernel del lobo speculare (phong=cos^s, tophat=coni)")
+    ap.add_argument("--lobe-exponents", type=str, default=None,
+                    help="esponenti s del kernel phong, separati da virgola "
+                         f"(default: {DEFAULT_LOBE_EXPONENTS})")
     args = ap.parse_args()
-    solve_pbr(args.output_dir, args.cv_gate, args.spec_threshold, args.min_views)
+    exps = ([float(x) for x in args.lobe_exponents.split(",")]
+            if args.lobe_exponents else None)
+    solve_pbr(args.output_dir, source=args.source,
+              cv_gate=args.cv_gate, spec_threshold=args.spec_threshold,
+              min_views=args.min_views, albedo_eps=args.albedo_eps,
+              kernel=args.kernel, lobe_exponents=exps)

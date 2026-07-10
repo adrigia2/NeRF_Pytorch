@@ -1,4 +1,9 @@
-"""Vista ravvicinata: specularità (1-X), cone_r mascherato, sanity checks."""
+"""Vista ravvicinata: specularità (1-X), cone_r mascherato, sanity checks.
+
+DEPRECATO: legge i vecchi percorsi non annidati (pixel_change/, camera_texture/,
+metallic/, ...). Dopo l'introduzione del layout sources/{source}/ questi percorsi
+non vengono più prodotti dalla pipeline. Script non aggiornato/mantenuto.
+"""
 import sys
 from pathlib import Path
 

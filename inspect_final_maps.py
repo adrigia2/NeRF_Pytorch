@@ -1,4 +1,8 @@
-"""Figura riassuntiva delle mappe PBR finali (metallic/roughness)."""
+"""Figura riassuntiva delle mappe PBR finali (metallic/roughness).
+
+Uso: python inspect_final_maps.py <output_dir> [source]   (source default: "gt")
+Legge sotto <output_dir>/sources/{source}/.
+"""
 import sys
 from pathlib import Path
 
@@ -23,9 +27,11 @@ def _find_variant(folder: Path, stem: str, primary: str = "nerf") -> Path:
 
 
 out = Path(sys.argv[1] if len(sys.argv) > 1 else "D:/tesi_output/testNewApproach")
-met = _read_exr(out / "metallic" / "metallic.exr")
-rgh = _read_exr(out / "roughness" / "roughness.exr")
-col = _read_exr(_find_variant(out / "color_texture", "color_texture"))
+source = sys.argv[2] if len(sys.argv) > 2 else "gt"
+src_dir = out / "sources" / source
+met = _read_exr(src_dir / "metallic" / "metallic.exr")
+rgh = _read_exr(src_dir / "roughness" / "roughness.exr")
+col = _read_exr(_find_variant(src_dir / "color_texture", "color_texture"))
 
 
 def tm(x):
@@ -44,5 +50,5 @@ axs[2].set_title("color_texture (riferimento)")
 for a in axs:
     a.axis("off")
 fig.tight_layout()
-fig.savefig(out / "pbr" / "final_maps.png", dpi=110)
-print("salvato:", out / "pbr" / "final_maps.png")
+fig.savefig(src_dir / "pbr" / "final_maps.png", dpi=110)
+print("salvato:", src_dir / "pbr" / "final_maps.png")

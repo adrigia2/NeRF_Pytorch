@@ -2,11 +2,14 @@
 
 Verifiche:
   1. il pass gira su tutti i tile e i buffer hanno shape/range coerenti;
-  2. con envmap costante, ogni livello L(r_k) dei texel senza hit vale
-     esattamente il valore dell'envmap (la media pesata è esatta);
+  2. con envmap costante, la media di ogni anello dei texel senza hit vale
+     esattamente il valore dell'envmap;
   3. con envmap funzione dell'elevazione, il livello 0 (raggio specchio)
      coincide con l'envmap valutata lungo R = reflect(v, n) calcolato in
-     NumPy (valida direzione riflessa + convenzione equirettangolare).
+     NumPy (valida direzione riflessa + convenzione equirettangolare);
+  4. la ricostruzione a lobi di pbr_solver (ring_weights_*): il top-hat
+     completo coincide con la formula cumulativa storica, e lo smoothing
+     è monotono dallo specchio al lobo s=0.
 
 Uso:  python test_spec_cone_smoke.py
 """
@@ -129,16 +132,37 @@ print(f"[gradient] specchio vs NumPy su {len(L0)} texel: "
       f"max err={err.max():.4f}, mean={err.mean():.4f}")
 assert err.max() < 0.05, "livello 0 non coincide con envmap(reflect(v,n))"
 
-# ── Coerenza cumulativa: il cono massimo media più direzioni → meno estremo ──
+# ── Ricostruzione a lobi (helper pbr_solver) su medie per-anello ─────────────
+from pbr_solver import ring_weights_phong, ring_weights_tophat
+
 cos_b = np.cos(np.radians(np.asarray(APERTURES)) * 0.5)
+sky_all = masks & (hit_cnt.sum(axis=1) == 0) & (valid > 0).all(axis=1)
+means = ring_sum[sky_all] / valid[sky_all][..., None]              # (n, K, 3)
+cnts  = valid[sky_all].astype(np.float64)                          # (n, K)
+
+def lobe(w):
+    """L = Σ_i W_i·mean_i·valid_i / Σ_i W_i·valid_i sugli anelli 1..K-1."""
+    wc = w[None, :] * cnts[:, 1:]
+    return (np.einsum("nk,nkc->nc", wc, means[:, 1:])
+            / wc.sum(axis=1)[:, None])
+
+# (a) top-hat completo ≡ formula cumulativa storica
 omega = 2.0 * np.pi * (cos_b[:-1] - cos_b[1:])
-w_sum = np.cumsum(omega[None, :, None] * ring_sum[:, 1:], axis=1)
-w_cnt = np.cumsum(omega[None, :] * valid[:, 1:], axis=1)
-sky_all = masks & (hit_cnt.sum(axis=1) == 0) & (valid[:, 1:] > 0).all(axis=1)
-L_wide = w_sum[sky_all, -1, 0] / w_cnt[sky_all, -1]
-spread_mirror = np.std(ring_sum[sky_all, 0, 0] / np.maximum(valid[sky_all, 0], 1))
-spread_wide = np.std(L_wide)
-print(f"[gradient] std specchio={spread_mirror:.4f}  std cono 180°={spread_wide:.4f}")
-assert spread_wide < spread_mirror, "il cono largo dovrebbe mediare (std minore)"
+w_sum = np.cumsum(omega[None, :, None] * ring_sum[sky_all][:, 1:], axis=1)
+w_cnt = np.cumsum(omega[None, :] * valid[sky_all][:, 1:], axis=1)
+L_old = w_sum[:, -1] / w_cnt[:, -1, None]
+L_new = lobe(ring_weights_tophat(cos_b, K - 1))
+err = np.abs(L_new - L_old).max()
+print(f"[lobi] tophat(180°) vs cumulativa storica: max err={err:.2e}")
+assert err < 1e-9, "helper top-hat ≠ formula cumulativa storica"
+
+# (b) smoothing monotono: specchio → lobi via via più larghi (std decrescente)
+spreads = [np.std(means[:, 0, 0])]
+for s in [200.0, 20.0, 2.0, 0.0]:
+    spreads.append(np.std(lobe(ring_weights_phong(cos_b, s))[:, 0]))
+print("[lobi] std specchio→s=0: " + "  ".join(f"{x:.4f}" for x in spreads))
+assert spreads[-1] < spreads[0], "il lobo largo dovrebbe mediare (std minore)"
+assert all(spreads[i + 1] <= spreads[i] * 1.05 for i in range(len(spreads) - 1)), \
+    "lo smoothing dovrebbe essere ~monotono con l'allargarsi del lobo"
 
 print("\n✓ Tutti i check del pass SpecCone superati")

@@ -708,18 +708,15 @@ class RenderConfig:
     color_texture_format: ImageFormat = ImageFormat.OPENEXR
     # Percentile usato per calcolare il peak (default 95° = scarta il top 5% più luminoso)
     color_texture_peak_percentile: float = 100.0
-    # Sorgente immagine per la color/camera texture (tutte le prospettive).
-    # "gt"   → immagini ground-truth (default storico)
+    # Sorgenti da cui produrre TUTTE le uscite source-dipendenti dello Step 3.
+    # Ogni source viene processata per intero e in modo identico, sotto sources/{src}/:
+    # color_texture/, camera_texture/, pixel_change/, albedo/, metallic/, roughness/,
+    # albedo_pbr/, pbr/. I nomi interni NON sono suffissati (il src è nel nome cartella).
+    # I passi source-indipendenti (ium, visibility, irradiance, spec_cone, indirect)
+    # restano al livello superiore, condivisi.
+    # "gt"   → immagini ground-truth
     # "nerf" → pred EXR salvati dallo Step 2b in nerf_render_images/iter_*/
-    color_texture_image_source: str = "gt"
-    # Lista di sorgenti da cui produrre color_texture e albedo in parallelo.
-    # Se non None, sovrascrive color_texture_image_source per la scelta dei file ma
-    # color_texture_image_source rimane la sorgente "principale" (quella che produce
-    # camera_texture/, pixel_change/ e la chiave JSON color_texture_path).
-    # Esempio: ["gt", "nerf"] → color_texture_gt.exr + color_texture_nerf.exr,
-    #           albedo_gt.exr + albedo_nerf.exr.
-    # None → comportamento storico (sorgente singola = color_texture_image_source).
-    color_texture_image_sources: list[str] | None = None
+    color_texture_image_sources: list[str] = field(default_factory=lambda: ["gt"])
     # Iterazione Step 2b da cui leggere i pred NeRF. -1 = usa l'ultima disponibile.
     color_texture_nerf_iter: int = -1
     # Angolo massimo (in gradi) dalla normale del texel oltre il quale il contributo
@@ -773,7 +770,9 @@ class RenderConfig:
     spec_cone_apertures_deg: list[float] = field(
         default_factory=lambda: [0.0, 10.0, 25.0, 50.0, 90.0, 130.0, 180.0])
     spec_cone_samples_per_ring: int = 32
-    spec_cone_tile_size: int = 1024
+    # Texel per lancio OptiX: tile grandi = meno overhead di launch/sync e batch
+    # NeRF più grandi (query_radiance spezza comunque in cfg.chunk). ~40 MB VRAM.
+    spec_cone_tile_size: int = 8192
     spec_cone_cameras: list[int] | None = None  # indici frame da processare (None = tutti)
     spec_cone_format: ImageFormat = ImageFormat.OPENEXR
 
@@ -920,6 +919,11 @@ def _resolve_skybox_flat(cfg: RenderConfig, output_json: dict, json_dir: Path,
     lo skybox normalizzato dal JSON (stessa scala di color+NeRF) se presente.
     """
     if cfg.skybox_source == "nerf":
+        baked = json_dir / "skybox_nerf_baked.exr"
+        if baked.exists():
+            print(f"[Step 3] Skybox NeRF riusata da disco: {baked} "
+                  "(cancellare il file per forzare il re-bake)")
+            return _load_image_as_vec3(baked.as_posix(), sky_w, sky_h)
         return _bake_skybox_from_nerf(cfg, sky_w, sky_h, json_dir)
     norm_sky_rel = output_json.get("normalization", {}).get("normalized_skybox_path", "")
     if norm_sky_rel:
@@ -1021,18 +1025,19 @@ def _precompute_spec_cone(
     sky_size: list[int],
     out_dir: Path,
 ) -> None:
-    """Precompute L_j(r_k): radianza media su coni concentrici attorno al raggio
-    riflesso R_j = reflect(v_j, n), per ogni camera selezionata e ogni apertura
-    della griglia. Serve al fit PBR  C_j = X·D + (1-X)·L_j(r)  (pbr_solver.py).
+    """Precompute per-anello per il fit PBR  C_j = X·D + (1-X)·L_j  (pbr_solver.py).
 
-    Campionamento ad anelli (deviceProgramsSpecCone.cu): ogni raggio è tracciato
-    e interrogato sul NeRF una volta sola; i coni si ricostruiscono per somma
-    cumulativa pesata sugli angoli solidi degli anelli:
-        L(r_k) = Σ_{i≤k} Ω_i·sum_i / Σ_{i≤k} Ω_i·valid_i
-    Livello 0 = raggio specchio puro. Miss → envmap (su GPU), hit → query NeRF.
+    Campionamento ad anelli concentrici attorno al raggio riflesso
+    R_j = reflect(v_j, n) (deviceProgramsSpecCone.cu): ogni raggio è tracciato e
+    interrogato sul NeRF una volta sola. Il bake è kernel-agnostico: salva le
+    MEDIE PER-ANELLO (livello 0 = raggio specchio puro) e i conteggi validi;
+    la ricostruzione del lobo (top-hat, cos^s, …) avviene nel solver come somma
+    degli anelli pesata dal kernel scelto. Miss → envmap (su GPU), hit → NeRF.
 
-    Output in out_dir: cam_{j:03d}_r{k:02d}.exr (K livelli per camera),
-    cam_{j:03d}_valid.png (texel con almeno un campione) e spec_cone_meta.json.
+    Output in out_dir per camera: cam_{j:03d}_ring{k:02d}.exr (K medie),
+    cam_{j:03d}_counts.exr ((H, W, K) valid_count per livello),
+    cam_{j:03d}_valid.png (texel con almeno un campione) e
+    spec_cone_meta.json (format "rings").
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
@@ -1065,9 +1070,8 @@ def _precompute_spec_cone(
     n_tiles = gen.num_tiles()
     tile_sz = cfg.spec_cone_tile_size
 
-    # Angoli solidi degli anelli (semi-apertura = apertura totale / 2)
+    # Bordi degli anelli: coseni delle semi-aperture (nel meta, per il solver)
     cos_b = np.cos(np.radians(np.asarray(apertures)) * 0.5)
-    omega = 2.0 * np.pi * (cos_b[:-1] - cos_b[1:])      # (K-1,) anelli 1..K-1
 
     ium_positions_np = ium_res.positions_np.astype(np.float32)
     ium_normals_np   = ium_res.normals_np.astype(np.float32)
@@ -1081,10 +1085,12 @@ def _precompute_spec_cone(
     fmt = cfg.spec_cone_format
 
     for j in cam_indices:
-        level_paths = [out_dir / f"cam_{j:03d}_r{k:02d}{fmt.extension}"
-                       for k in range(K)]
-        valid_path = out_dir / f"cam_{j:03d}_valid.png"
-        if all(p.exists() for p in level_paths) and valid_path.exists():
+        ring_paths = [out_dir / f"cam_{j:03d}_ring{k:02d}{fmt.extension}"
+                      for k in range(K)]
+        counts_path = out_dir / f"cam_{j:03d}_counts{fmt.extension}"
+        valid_path  = out_dir / f"cam_{j:03d}_valid.png"
+        if (all(p.exists() for p in ring_paths) and counts_path.exists()
+                and valid_path.exists()):
             print(f"    cam {j}: già su disco, skip")
             continue
 
@@ -1113,43 +1119,48 @@ def _precompute_spec_cone(
                               + ium_normals_np[global_idx] * eps)
                 colors = query_radiance(model_bundle, origins_np, dirs_np,
                                         nerf_cfg, t_hits_np=t_hit_np)
-                np.add.at(ring_sum, (global_idx, ring_idx),
-                          np.asarray(colors, dtype=np.float64))
+                colors = np.asarray(colors, dtype=np.float64)
+                # accumulo via bincount locale al tile (np.add.at è unbuffered
+                # e molto più lento su milioni di indici)
+                flat_idx = local_idx.astype(np.int64) * K + ring_idx
+                n_bins   = tt * K
+                tile_acc = ring_sum[off:off + tt].reshape(n_bins, 3)
+                for c in range(3):
+                    tile_acc[:, c] += np.bincount(flat_idx, weights=colors[:, c],
+                                                  minlength=n_bins)
 
             if (tile_idx + 1) % max(1, n_tiles // 10) == 0:
                 print(f"    cam {j}: tile {tile_idx + 1}/{n_tiles}, "
                       f"raggi hit: {tile_res.count}")
 
-        L = np.zeros((num_pix, K, 3), dtype=np.float32)
+        # Medie per-anello (livello 0 = raggio specchio); 0 dove nessun campione
+        means = np.zeros((num_pix, K, 3), dtype=np.float32)
+        has = valid > 0
+        means[has] = (ring_sum[has] / valid[has][:, None]).astype(np.float32)
 
-        # Livello 0: raggio specchio puro
-        mirror_ok = valid[:, 0] > 0
-        L[mirror_ok, 0] = (ring_sum[mirror_ok, 0]
-                           / valid[mirror_ok, 0][:, None]).astype(np.float32)
-
-        # Coni 1..K-1: cumulativa pesata sugli angoli solidi degli anelli
-        w_sum = np.cumsum(omega[None, :, None] * ring_sum[:, 1:], axis=1)
-        w_cnt = np.cumsum(omega[None, :] * valid[:, 1:], axis=1)
-        ok = w_cnt > 0
-        L[:, 1:][ok] = (w_sum[ok] / w_cnt[ok][:, None]).astype(np.float32)
-
-        cam_valid = (mirror_ok | ok[:, -1]).astype(np.uint8)
+        cam_valid = has.any(axis=1).astype(np.uint8)
 
         for k in range(K):
-            _save_layer(_reshape_flat(L[:, k], ium_w, ium_h),
-                        level_paths[k].resolve().as_posix(), fmt,
+            _save_layer(_reshape_flat(means[:, k], ium_w, ium_h),
+                        ring_paths[k].resolve().as_posix(), fmt,
                         DataLayer.SPEC_CONE)
+        _save_layer(_reshape_flat(valid.astype(np.float32), ium_w, ium_h),
+                    counts_path.resolve().as_posix(), fmt,
+                    DataLayer.SPEC_CONE)
         _save_layer(_reshape_flat(cam_valid, ium_w, ium_h),
                     valid_path.resolve().as_posix(), ImageFormat.PNG,
                     DataLayer.MASK)
-        print(f"    ✓ cam {j}: {K} livelli salvati")
+        print(f"    ✓ cam {j}: {K} anelli + counts salvati")
 
     meta = {
+        "format": "rings",
         "apertures_deg": apertures,
+        "ring_edges_cos": [float(c) for c in cos_b],
         "samples_per_ring": M,
         "cameras": [int(j) for j in cam_indices],
         "num_levels": K,
-        "level_file_pattern": "cam_{cam:03d}_r{level:02d}" + fmt.extension,
+        "ring_file_pattern": "cam_{cam:03d}_ring{level:02d}" + fmt.extension,
+        "counts_file_pattern": "cam_{cam:03d}_counts" + fmt.extension,
         "valid_file_pattern": "cam_{cam:03d}_valid.png",
         "skybox_yaw_degrees": cfg.skybox_yaw_degrees,
     }
@@ -2045,19 +2056,17 @@ def _step3_posttrain_assets(
                 and visibility_map is not None):
             _t3_ct = time.perf_counter()
 
-            # Sorgenti effettive: lista esplicita o fallback alla sorgente singola storica
-            ct_sources = rc.color_texture_image_sources or [rc.color_texture_image_source]
-            ct_primary = (rc.color_texture_image_source
-                          if rc.color_texture_image_source in ct_sources
-                          else ct_sources[0])
-
-            ct_out_dir = json_dir / "color_texture"
-            os.makedirs(ct_out_dir, exist_ok=True)
+            # Ogni source viene processata per intero e in modo identico, sotto sources/{src}/
+            ct_sources = rc.color_texture_image_sources
+            if not ct_sources:
+                raise ValueError("color_texture_image_sources non può essere vuota")
 
             for src in ct_sources:
-                ct_path = (ct_out_dir / f"color_texture_{src}{rc.color_texture_format.extension}").resolve().as_posix()
-                # Cartella per-camera di questa sorgente: gt → camera_texture/, altre → camera_texture_{src}/
-                cam_tex_dir = json_dir / ("camera_texture" if src == ct_primary else f"camera_texture_{src}")
+                src_dir = json_dir / "sources" / src
+                ct_dir = src_dir / "color_texture"
+                os.makedirs(ct_dir, exist_ok=True)
+                ct_path = (ct_dir / f"color_texture{rc.color_texture_format.extension}").resolve().as_posix()
+                cam_tex_dir = src_dir / "camera_texture"
 
                 if os.path.exists(ct_path) and cam_tex_dir.is_dir():
                     print(f"[Step 3] Color texture trovata su disco ({src}): {ct_path}")
@@ -2065,8 +2074,6 @@ def _step3_posttrain_assets(
                     if loaded is not None:
                         color_by_source[src] = loaded
                         ium_result_data[f"color_texture_path_{src}"] = _as_relative_to(ct_path, json_dir_str)
-                        if src == ct_primary:
-                            ium_result_data["color_texture_path"] = _as_relative_to(ct_path, json_dir_str)
                         continue
 
                 print(f"[Step 3] Calcolo Color Texture (sorgente: {src})…")
@@ -2079,7 +2086,7 @@ def _step3_posttrain_assets(
                 ct_gen.render()
                 _ct_res = ct_gen.get_result()
 
-                # Salva color_texture_{src}
+                # Salva color_texture per questa sorgente
                 ct_arr = _reshape_flat(_ct_res.colors_np.astype(np.float32), ium_w, ium_h)
                 _save_layer(ct_arr, ct_path, rc.color_texture_format, DataLayer.POSITION)
                 ium_result_data[f"color_texture_path_{src}"] = _as_relative_to(ct_path, json_dir_str)
@@ -2087,8 +2094,7 @@ def _step3_posttrain_assets(
                 # Copia leggera di colors_np per il calcolo albedo a valle
                 color_by_source[src] = np.array(_ct_res.colors_np, dtype=np.float32)
 
-                # Texture per-camera per questa sorgente (cam_tex_dir già calcolato sopra):
-                #   gt (primary) → camera_texture/   ;   nerf → camera_texture_nerf/   ecc.
+                # Texture per-camera per questa sorgente: sources/{src}/camera_texture/
                 os.makedirs(cam_tex_dir, exist_ok=True)
                 cam_colors = _ct_res.camera_colors_np
                 for cam_idx, frame in enumerate(tf.frames):
@@ -2096,29 +2102,26 @@ def _step3_posttrain_assets(
                     cam_arr   = _reshape_flat(cam_slice.astype(np.float32), ium_w, ium_h)
                     cam_path  = (cam_tex_dir / f"{frame.stem}{rc.color_texture_format.extension}").resolve().as_posix()
                     _save_layer(cam_arr, cam_path, rc.color_texture_format, DataLayer.POSITION)
-                    if rc.debug_camera_texture and src == ct_primary:
+                    if rc.debug_camera_texture:
                         src_img_path = images_out_dir_ct / Path(frame.file_path).name
                         _save_debug_comparison(src_img_path, cam_arr, frame.stem,
-                                               json_dir / "debug_camera_texture")
+                                               src_dir / "debug_camera_texture")
 
-                # Solo per la sorgente principale: pixel_change, JSON retro-compat
-                if src == ct_primary:
-                    ium_result_data["color_texture_path"] = _as_relative_to(ct_path, json_dir_str)
-
-                    if rc.render_pixel_change:
-                        pc_dir = json_dir / "pixel_change"
-                        pc_dir.mkdir(parents=True, exist_ok=True)
-                        min_arr   = _reshape_flat(_ct_res.color_min_np.astype(np.float32), ium_w, ium_h)
-                        max_arr   = _reshape_flat(_ct_res.color_max_np.astype(np.float32), ium_w, ium_h)
-                        range_arr = np.clip(max_arr - min_arr, 0.0, None)
-                        var_arr   = _reshape_flat(_ct_res.color_variance_np.astype(np.float32), ium_w, ium_h)
-                        ext = rc.color_texture_format
-                        _save_layer(min_arr,   (pc_dir / f"color_min{ext.extension}").as_posix(),      ext, DataLayer.POSITION)
-                        _save_layer(max_arr,   (pc_dir / f"color_max{ext.extension}").as_posix(),      ext, DataLayer.POSITION)
-                        _save_layer(range_arr, (pc_dir / f"color_range{ext.extension}").as_posix(),    ext, DataLayer.POSITION)
-                        _save_layer(var_arr,   (pc_dir / f"color_variance{ext.extension}").as_posix(), ext, DataLayer.POSITION)
-                        if rc.debug_pixel_change:
-                            _save_debug_pixel_change(min_arr, max_arr, range_arr, json_dir / "debug_pixel_change")
+                # pixel_change per ogni sorgente: sources/{src}/pixel_change/
+                if rc.render_pixel_change:
+                    pc_dir = src_dir / "pixel_change"
+                    pc_dir.mkdir(parents=True, exist_ok=True)
+                    min_arr   = _reshape_flat(_ct_res.color_min_np.astype(np.float32), ium_w, ium_h)
+                    max_arr   = _reshape_flat(_ct_res.color_max_np.astype(np.float32), ium_w, ium_h)
+                    range_arr = np.clip(max_arr - min_arr, 0.0, None)
+                    var_arr   = _reshape_flat(_ct_res.color_variance_np.astype(np.float32), ium_w, ium_h)
+                    ext = rc.color_texture_format
+                    _save_layer(min_arr,   (pc_dir / f"color_min{ext.extension}").as_posix(),      ext, DataLayer.POSITION)
+                    _save_layer(max_arr,   (pc_dir / f"color_max{ext.extension}").as_posix(),      ext, DataLayer.POSITION)
+                    _save_layer(range_arr, (pc_dir / f"color_range{ext.extension}").as_posix(),    ext, DataLayer.POSITION)
+                    _save_layer(var_arr,   (pc_dir / f"color_variance{ext.extension}").as_posix(), ext, DataLayer.POSITION)
+                    if rc.debug_pixel_change:
+                        _save_debug_pixel_change(min_arr, max_arr, range_arr, src_dir / "debug_pixel_change")
 
                 # TensorBoard per questa sorgente
                 if tb_logger is not None:
@@ -2218,29 +2221,37 @@ def _step3_posttrain_assets(
                 timer.record("step3/spec_cone", time.perf_counter() - _t3_spec)
 
         # ── PBR maps (metallic / roughness dal fit spec-cone) ────────────────
+        # Eseguito per OGNI sorgente in color_texture_image_sources, sotto sources/{src}/.
         if rc.render_pbr_maps:
             _t3_pbr = time.perf_counter()
-            spec_meta = json_dir / "spec_cone" / "spec_cone_meta.json"
-            cmin_path = json_dir / "pixel_change" / "color_min.exr"
-            if spec_meta.exists() and cmin_path.exists():
+            spec_meta = json_dir / "spec_cone" / "spec_cone_meta.json"   # source-indipendente
+            if spec_meta.exists():
                 from pbr_solver import solve_pbr
-                print("[Step 3] Fit PBR → metallic/roughness "
-                      f"(cv_gate={rc.pbr_diffuse_cv_gate}, "
-                      f"spec_threshold={rc.pbr_spec_threshold})…")
-                pbr_out = solve_pbr(json_dir_str,
-                                    cv_gate=rc.pbr_diffuse_cv_gate,
-                                    spec_threshold=rc.pbr_spec_threshold,
-                                    min_views=rc.pbr_min_views)
-                ium_result_data["metallic_path"] = _as_relative_to(
-                    pbr_out["metallic_path"], json_dir_str)
-                ium_result_data["roughness_path"] = _as_relative_to(
-                    pbr_out["roughness_path"], json_dir_str)
+                for src in rc.color_texture_image_sources:
+                    cmin_path = json_dir / "sources" / src / "pixel_change" / "color_min.exr"
+                    if not cmin_path.exists():
+                        print(f"    ⚠  render_pbr_maps ({src}): manca {cmin_path} → skip "
+                              "(serve render_pixel_change)")
+                        continue
+                    print(f"[Step 3] Fit PBR ({src}) → metallic/roughness "
+                          f"(cv_gate={rc.pbr_diffuse_cv_gate}, "
+                          f"spec_threshold={rc.pbr_spec_threshold})…")
+                    pbr_out = solve_pbr(json_dir_str, source=src,
+                                        cv_gate=rc.pbr_diffuse_cv_gate,
+                                        spec_threshold=rc.pbr_spec_threshold,
+                                        min_views=rc.pbr_min_views)
+                    ium_result_data[f"metallic_path_{src}"] = _as_relative_to(
+                        pbr_out["metallic_path"], json_dir_str)
+                    ium_result_data[f"roughness_path_{src}"] = _as_relative_to(
+                        pbr_out["roughness_path"], json_dir_str)
+                    if pbr_out.get("albedo_pbr_path"):
+                        ium_result_data[f"albedo_pbr_path_{src}"] = _as_relative_to(
+                            pbr_out["albedo_pbr_path"], json_dir_str)
                 if timer is not None:
                     timer.record("step3/pbr", time.perf_counter() - _t3_pbr)
             else:
-                print("    ⚠  render_pbr_maps: mancano spec_cone_meta.json o "
-                      "pixel_change/color_min.exr → skip "
-                      "(servono precompute_spec_cone e render_pixel_change)")
+                print("    ⚠  render_pbr_maps: manca spec_cone_meta.json → skip "
+                      "(serve precompute_spec_cone)")
 
         # ── Albedo ───────────────────────────────────────────────────────────
         # Generata per ogni sorgente in color_by_source; l'irradianza è condivisa.
@@ -2254,14 +2265,6 @@ def _step3_posttrain_assets(
                 irr_flat = irr_flat + irr_indirect_flat
             denom = np.maximum(irr_flat, rc.albedo_eps)
 
-            ct_sources = rc.color_texture_image_sources or [rc.color_texture_image_source]
-            ct_primary = (rc.color_texture_image_source
-                          if rc.color_texture_image_source in ct_sources
-                          else ct_sources[0])
-
-            alb_out_dir = json_dir / "albedo"
-            os.makedirs(alb_out_dir, exist_ok=True)
-
             mask_flat = ium_res.masks_np.astype(bool) if ium_res.has_masks() else None
 
             for src, color_flat in color_by_source.items():
@@ -2269,13 +2272,12 @@ def _step3_posttrain_assets(
                 if mask_flat is not None:
                     albedo_flat[~mask_flat] = 0.0
                 albedo_flat = np.clip(albedo_flat, 0.0, 1.0)
-                alb_path = (alb_out_dir / f"albedo_{src}{rc.albedo_format.extension}").resolve().as_posix()
+                alb_dir = json_dir / "sources" / src / "albedo"
+                os.makedirs(alb_dir, exist_ok=True)
+                alb_path = (alb_dir / f"albedo{rc.albedo_format.extension}").resolve().as_posix()
                 alb_arr = _reshape_flat(albedo_flat, ium_w, ium_h)
                 _save_layer(alb_arr, alb_path, rc.albedo_format, DataLayer.ALBEDO)
                 ium_result_data[f"albedo_path_{src}"] = _as_relative_to(alb_path, json_dir_str)
-                if src == ct_primary:
-                    # chiave retro-compatibile per i consumer esistenti
-                    ium_result_data["albedo_path"] = _as_relative_to(alb_path, json_dir_str)
 
                 # — TensorBoard: albedo è già in [0,1] → no tonemap —
                 if tb_logger is not None:
@@ -2633,11 +2635,11 @@ if __name__ == "__main__":
             ium_texture_size = [4096, 4096],
             apply_scale      = False,
 
-            color_texture_image_source  = "gt",         # sorgente principale (camera_texture, pixel_change)
-            color_texture_image_sources = ["gt", "nerf"], # produce entrambe le varianti di color_texture e albedo
+            color_texture_image_sources = ["gt", "nerf"], # entrambe processate per intero sotto sources/
 
-            precompute_spec_cone = False,
-            render_pbr_maps      = False,
+            precompute_spec_cone = True,
+            render_pbr_maps      = True,
+            spec_cone_cameras=None,
 
             color_texture_grazing_max_deg = 75.0,
 
@@ -2686,21 +2688,21 @@ if __name__ == "__main__":
         #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
         #     skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # ),
-        # SceneConfig(
-        #     name             = "TableAndOtherInterior",
-        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
-        #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
-        #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
-        #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
-        #     skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
-        # ),
+        SceneConfig(
+            name             = "TableAndOtherInteriorWithSpecular",
+            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
+            model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+            external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
+            # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
+            # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+        ),
         SceneConfig(
             name             = "TableAndOtherInterior",
             transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenExrSmoothNoDiffuse/transforms.json",
             model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
             external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmoothNoDiffuse/BakedMaterial_normal.exr",
             # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
-            skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+            # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         )
         # SceneConfig(
         #     name            = "SwordShield",
@@ -2724,13 +2726,13 @@ if __name__ == "__main__":
         # ("softplus_l1",        "softplus", "l1"),
     ]
     DECAYS     = (0.2,)
-    SWEEP_ROOT = "D:/tesi_output/nerf_sweep_nodiffuse_tangent"
+    SWEEP_ROOT = "D:/tesi_output/experiments_specular"
 
     for name, act, loss in EXPERIMENTS:
         for decay in DECAYS:
             
             cfg = copy.deepcopy(template)
-            cfg.nerf_num_iters       = 75000
+            cfg.nerf_num_iters       = 50000
             cfg.nerf_lr_decay_steps  = 100000  # ancora fissa allineata a num_iters
             cfg.nerf_rgb_activation  = act
             cfg.nerf_loss_type       = loss
@@ -2740,7 +2742,8 @@ if __name__ == "__main__":
             run_pipeline_multi(
                 cfg, SCENES,
                 output_root    = f"{SWEEP_ROOT}/{tag}",
-                run_note       = f"75k iter | act={act} | loss={loss} | decay={decay} (full pipeline)",
+                run_note       = f"{cfg.nerf_num_iters}iter | act={act} | loss={loss} | decay={decay} (full pipeline)",
                 experiment_tag = tag,
+                # tb_enabled=False
             )
     

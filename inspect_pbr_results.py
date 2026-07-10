@@ -1,4 +1,10 @@
-"""Pannello diagnostico dei risultati pbr_solver per ispezione visiva."""
+"""Pannello diagnostico dei risultati pbr_solver per ispezione visiva.
+
+DEPRECATO: legge i vecchi percorsi non annidati (pixel_change/, camera_texture/,
+metallic/, ...). Dopo l'introduzione del layout sources/{source}/ questi percorsi
+non vengono più prodotti dalla pipeline. Script non aggiornato/mantenuto.
+"""
+import json
 import sys
 from pathlib import Path
 
@@ -8,7 +14,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).parent))
-from pbr_solver import _read_exr
+from pbr_solver import _read_exr, ring_weights_phong
 
 
 def _find_variant(folder: Path, stem: str, primary: str = "nerf") -> Path:
@@ -25,15 +31,28 @@ def _find_variant(folder: Path, stem: str, primary: str = "nerf") -> Path:
 out = Path(sys.argv[1] if len(sys.argv) > 1 else "D:/tesi_output/testNewApproach")
 
 metallic = _read_exr(out / "metallic" / "metallic.exr")   # = 1−X
-cone_r   = _read_exr(out / "pbr" / "spec_cone_r.exr")
+lobe_p   = _read_exr(out / "pbr" / "lobe_param.exr")
 residual = _read_exr(out / "pbr" / "residual.exr")
 n_views  = _read_exr(out / "pbr" / "n_views.exr")
 albedo   = _read_exr(_find_variant(out / "albedo", "albedo"))
 color    = _read_exr(_find_variant(out / "color_texture", "color_texture"))
 cmin     = _read_exr(out / "pixel_change" / "color_min.exr")
 cvar     = _read_exr(out / "pixel_change" / "color_variance.exr")
-L0       = _read_exr(out / "spec_cone" / "cam_000_r00.exr")
-L180     = _read_exr(out / "spec_cone" / "cam_000_r06.exr")
+
+# Estremi del lobo per cam0, ricostruiti dalle medie per-anello (format "rings")
+with open(out / "spec_cone" / "spec_cone_meta.json", encoding="utf-8") as fh:
+    _meta = json.load(fh)
+_K     = _meta["num_levels"]
+_rings = np.stack([_read_exr(out / "spec_cone"
+                             / _meta["ring_file_pattern"].format(cam=0, level=k))
+                   for k in range(_K)], axis=2)                   # (H, W, K, 3)
+_cnts  = _read_exr(out / "spec_cone" / _meta["counts_file_pattern"].format(cam=0))
+L0 = _rings[:, :, 0]                                              # specchio
+_w  = ring_weights_phong(np.asarray(_meta["ring_edges_cos"]), 0.0)  # lobo s=0
+_wc = _w[None, None, :] * _cnts[..., 1:]
+L180 = (np.einsum("hwk,hwkc->hwc", _wc, _rings[:, :, 1:])
+        / np.maximum(_wc.sum(-1), 1e-12)[..., None])
+
 C0       = _read_exr(out / "camera_texture" / sorted((out / "camera_texture").glob("*.exr"))[0].name)
 
 def tm(x):  # tonemap HDR per display
@@ -42,7 +61,7 @@ def tm(x):  # tonemap HDR per display
 fig, axs = plt.subplots(3, 4, figsize=(19, 14))
 panels = [
     (metallic, "metallic 1−X (0..1)", dict(cmap="viridis", vmin=0, vmax=1)),
-    (cone_r,   "cone r (gradi)",    dict(cmap="magma", vmin=0, vmax=180)),
+    (lobe_p,   "lobe param (s; -1=specchio)", dict(cmap="magma")),
     (np.log10(residual + 1e-8), "log10 residuo", dict(cmap="inferno")),
     (n_views,  "n_views",           dict(cmap="cividis")),
     (tm(color),  "color_texture (media)", {}),
@@ -50,8 +69,8 @@ panels = [
     (tm(cvar),   "color_variance",        {}),
     (tm(albedo), "albedo",                {}),
     (tm(C0),     "camera_texture cam0 (C_0)", {}),
-    (tm(L0),     "L_0(r=0) specchio cam0",    {}),
-    (tm(L180),   "L_0(r=180°) cam0",          {}),
+    (tm(L0),     "L specchio cam0",           {}),
+    (tm(L180),   "L lobo s=0 cam0",           {}),
     (np.log10(cvar.mean(-1) + 1e-9), "log10 varianza media", dict(cmap="inferno")),
 ]
 for ax, (img, title, kw) in zip(axs.flat, panels):
@@ -66,10 +85,10 @@ fig.savefig(out / "pbr" / "diagnostic_panel.png", dpi=110)
 print("salvato:", out / "pbr" / "diagnostic_panel.png")
 
 m = metallic[n_views > 0]
-r = cone_r[n_views > 0]
+r = lobe_p[n_views > 0]
 print(f"metallic: media={m.mean():.3f}  mediana={np.median(m):.3f}  "
       f">0.5: {(m > 0.5).mean() * 100:.1f}%")
-for lv in [0, 10, 25, 50, 90, 130, 180]:
-    print(f"  r={lv:5.1f}°: {(np.abs(r - lv) < 0.5).mean() * 100:5.1f}% dei texel")
+for lv in np.unique(r):
+    print(f"  lobe param={lv:8.1f}: {(r == lv).mean() * 100:5.1f}% dei texel")
 print(f"varianza media (texel validi): {cvar.mean(-1)[n_views > 0].mean():.3e}, "
       f"mediana={np.median(cvar.mean(-1)[n_views > 0]):.3e}")
