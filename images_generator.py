@@ -179,12 +179,17 @@ class _Tee:
 
     def write(self, data):
         self._orig.write(data)
-        self._file.write(data)
-        self._file.flush()
+        # Il file può essere già chiuso: colorama (init lazy via tqdm) registra un
+        # atexit reset legato al _Tee attivo in quel momento, che può scattare dopo
+        # l'uscita da _console_to_file.
+        if not self._file.closed:
+            self._file.write(data)
+            self._file.flush()
 
     def flush(self):
         self._orig.flush()
-        self._file.flush()
+        if not self._file.closed:
+            self._file.flush()
 
     # Propagate altri attributi al flusso originale (es. encoding, isatty)
     def __getattr__(self, name):
@@ -781,8 +786,8 @@ class RenderConfig:
     # roughness/roughness.exr (= r/180 dove attendibile, 1.0 altrove), come l'albedo.
     render_pbr_maps: bool = False
     pbr_min_views: int = 2
-    pbr_diffuse_cv_gate: float = 0.05  # std tra camere < gate·luminanza → diffuso
-    pbr_spec_threshold: float = 0.2    # metallic minimo perché r sia attendibile
+    pbr_diffuse_cv_gate: float = 0.05  # std tra camere < gate·luminanza → diffuso (0 = gate disattivato)
+    pbr_spec_threshold: float = 0.2    # metallic minimo perché r sia attendibile (0 = nessuna censura)
 
     # Albedo (color_texture / irradiance) — modello Lambertiano ρ = π · L / E
     render_albedo: bool = False
@@ -1029,10 +1034,10 @@ def _precompute_spec_cone(
 
     Campionamento ad anelli concentrici attorno al raggio riflesso
     R_j = reflect(v_j, n) (deviceProgramsSpecCone.cu): ogni raggio è tracciato e
-    interrogato sul NeRF una volta sola. Il bake è kernel-agnostico: salva le
-    MEDIE PER-ANELLO (livello 0 = raggio specchio puro) e i conteggi validi;
-    la ricostruzione del lobo (top-hat, cos^s, …) avviene nel solver come somma
-    degli anelli pesata dal kernel scelto. Miss → envmap (su GPU), hit → NeRF.
+    interrogato sul NeRF una volta sola. Il bake salva le MEDIE PER-ANELLO
+    (livello 0 = raggio specchio puro) e i conteggi validi; la ricostruzione
+    dell'integrale coscone ∫L·cosθ_R dω avviene nel solver (pbr_solver.py) come
+    somma pesata degli anelli. Miss → envmap (su GPU), hit → NeRF.
 
     Output in out_dir per camera: cam_{j:03d}_ring{k:02d}.exr (K medie),
     cam_{j:03d}_counts.exr ((H, W, K) valid_count per livello),
@@ -2048,9 +2053,10 @@ def _step3_posttrain_assets(
                 timer.record("step3/visibility", time.perf_counter() - _t3_vis)
 
         # ── Color Texture ────────────────────────────────────────────────────
-        # color_by_source: sorgente → colors_np float32 (copia esplicita per liberare
-        # il result della sorgente corrente prima di caricare la successiva ed evitare
-        # un picco RAM dovuto a due camera_colors_np di dimensione ~frames×texel in RAM).
+        # color_by_source: sorgente → colors_np float32 (copia esplicita: result,
+        # generatore e frames vengono rilasciati a fine iterazione, prima di caricare
+        # la sorgente successiva). Le texture per-camera vengono scaricate dalla GPU
+        # una camera alla volta: il blocco frames×texel non esiste mai in RAM host.
         color_by_source: dict[str, np.ndarray] = {}
         if (rc.render_color_texture and rc.render_ium and rc.render_visibility
                 and visibility_map is not None):
@@ -2096,10 +2102,9 @@ def _step3_posttrain_assets(
 
                 # Texture per-camera per questa sorgente: sources/{src}/camera_texture/
                 os.makedirs(cam_tex_dir, exist_ok=True)
-                cam_colors = _ct_res.camera_colors_np
                 for cam_idx, frame in enumerate(tf.frames):
-                    cam_slice = cam_colors[:, cam_idx, :]
-                    cam_arr   = _reshape_flat(cam_slice.astype(np.float32), ium_w, ium_h)
+                    cam_slice = ct_gen.download_camera_colors(cam_idx)  # (num_pix, 3) float32
+                    cam_arr   = _reshape_flat(cam_slice, ium_w, ium_h)
                     cam_path  = (cam_tex_dir / f"{frame.stem}{rc.color_texture_format.extension}").resolve().as_posix()
                     _save_layer(cam_arr, cam_path, rc.color_texture_format, DataLayer.POSITION)
                     if rc.debug_camera_texture:
@@ -2127,6 +2132,11 @@ def _step3_posttrain_assets(
                 if tb_logger is not None:
                     tb_logger.log_image(f"texture/color_texture_{src}", ct_arr, step=0, tonemap=True)
                     tb_logger.flush()
+
+                # Rilascio esplicito prima della sorgente successiva: result host
+                # (~4 layer da num_pix), generatore (che possiede il buffer VRAM
+                # camera_colors ~num_pix×frames e le immagini caricate) e frames.
+                del _ct_res, ct_gen, optix_frames
 
             if timer is not None:
                 timer.record("step3/color_texture", time.perf_counter() - _t3_ct)
@@ -2639,6 +2649,8 @@ if __name__ == "__main__":
 
             precompute_spec_cone = True,
             render_pbr_maps      = True,
+            pbr_diffuse_cv_gate  = 0.0,        # gate diffuso disattivato: fit ovunque
+            pbr_spec_threshold   = 0.0,        # roughness fittata scritta ovunque
             spec_cone_cameras=None,
 
             color_texture_grazing_max_deg = 75.0,
@@ -2726,7 +2738,7 @@ if __name__ == "__main__":
         # ("softplus_l1",        "softplus", "l1"),
     ]
     DECAYS     = (0.2,)
-    SWEEP_ROOT = "D:/tesi_output/experiments_specular"
+    SWEEP_ROOT = "D:/tesi_output/experiments_specular_coscone"
 
     for name, act, loss in EXPERIMENTS:
         for decay in DECAYS:

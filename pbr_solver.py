@@ -1,26 +1,27 @@
-"""Fit PBR multi-vista con lobi speculari parametrici:
+"""Fit PBR multi-vista con coni speculari a taglio netto (schema unico "coscone"):
 
     C_j = X · D + (1 - X) · L_j
 
     C_j   colore osservato dalla camera j    (sources/{source}/camera_texture/<stem>.exr)
     D     termine diffuso vista-indipendente (sources/{source}/pixel_change/color_min.exr)
-    L_j   radianza dell'ambiente attorno al raggio riflesso, ricostruita dalle
-          medie per-anello del bake (spec_cone/cam_jjj_ringkk.exr + counts,
-          format "rings" di images_generator.py) pesando gli anelli col kernel:
-            - "phong" (default): lobo cos^s θ_R; candidati = specchio + griglia
-              di esponenti s; roughness = α GGX = √(2/(s+2)), calibrata
-            - "tophat": coni troncati alle aperture della griglia (schema
-              storico, per confronto); roughness = apertura/180
+    L_j   INTEGRALE PURO ∫L·cosθ_R dω dell'ambiente sul cono attorno al raggio
+          riflesso, ricostruito dalle medie per-anello del bake
+          (spec_cone/cam_jjj_ringkk.exr + counts, format "rings" di
+          images_generator.py); candidati = specchio + un cono per apertura
+          della griglia; roughness = apertura/180
     X     peso del termine DIFFUSO (X=1 → nessuna dipendenza dalla vista);
           la specularità/metallic è 1−X. Forma chiusa per ogni candidato.
 
-Pesi per anello in forma chiusa (b = semi-aperture, c = cos b clampato a ≥0):
-    phong:  W_i(s) = 2π/(s+1) · (c_{i-1}^{s+1} − c_i^{s+1})  su tutti gli anelli
-    tophat: W_i    = 2π · (c_{i-1} − c_i)  per i ≤ k, 0 oltre
-    L = Σ_i W_i·mean_i·valid_i / Σ_i W_i·valid_i   (pesa la frazione visibile)
-Nota: il peso è medio per anello → la risoluzione sui lobi stretti è
-quantizzata dalla larghezza degli anelli (s ≳ 800 ≈ specchio con la griglia
-di aperture default).
+Pesi per anello del cono, in forma chiusa (b = semi-aperture, c = cos b ≥ 0):
+    W_i = π · (c_{i-1}² − c_i²)  per i ≤ k, 0 oltre
+    L = Σ_i W_i·mean_i·valid_i / M  (integrale puro; M = samples_per_ring dal
+        meta: denominatore fisso come nei pass irradiance, i raggi scartati
+        sotto l'orizzonte contribuiscono 0. L scala col fattore geometrico
+        π·sin²(semi-apertura) → X assorbe la scala e metallic = 1−X NON è la
+        frazione speculare assoluta; il candidato specchio resta in unità di
+        radianza, non di integrale.)
+Nota: la risoluzione sulla larghezza del cono è quantizzata dalla griglia di
+aperture del bake (spec_cone_apertures_deg).
 
 Per ogni candidato il residuo è una parabola in X:
     res(X) = S_cc - 2·X·S_cd + X²·S_dd
@@ -39,7 +40,9 @@ Mappe finali, per la sorgente `source` (chiamare una volta per ogni sorgente da
 processare: le uscite vivono sotto sources/{source}/, i nomi interni non sono
 suffissati):
   <out>/sources/{source}/metallic/metallic.exr      = 1−X   (0=diffuso, 1=tutto speculare)
-  <out>/sources/{source}/roughness/roughness.exr    = α GGX del candidato vincente, 1.0 altrove
+  <out>/sources/{source}/roughness/roughness.exr    = apertura/180 del cono vincente
+    (0 = specchio), 1.0 altrove — indice di larghezza del cono, NON α GGX:
+    per texture Disney-compliant serve una calibrazione apertura→α a valle
   <out>/sources/{source}/albedo_pbr/albedo_pbr.exr  = π·(X·D)/max(E_sky+E_ind, albedo_eps):
     albedo diffusa depurata dallo speculare (coesiste con l'albedo Lambertiana
     classica in <out>/sources/{source}/albedo/). Richiede irradiance/irradiance.exr
@@ -47,7 +50,7 @@ suffissati):
     per-source); se manca, la mappa è saltata con warning. Sui texel non
     risolvibili si assume X=1 (diffuso).
 Diagnostica in <out>/sources/{source}/pbr/: diffuse_weight.exr (X), lobe_param.exr
-(esponente s, -1 = specchio; con kernel tophat: apertura in gradi), residual.exr,
+(apertura del cono vincente in gradi, 0 = specchio), residual.exr,
 n_views.exr, r_valid.png + preview PNG a scala assoluta.
 
 Input condivisi (source-indipendenti, non sotto sources/{source}/): spec_cone/,
@@ -56,14 +59,12 @@ ium/ium_masks.exr, visibility/visibility.exr, irradiance/.
 Uso:
     python pbr_solver.py <output_dir> [--source gt] [--cv-gate 0.05]
                          [--spec-threshold 0.2] [--min-views 2] [--albedo-eps 1e-3]
-                         [--kernel phong|tophat] [--lobe-exponents 800,200,...]
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 from pathlib import Path
 
@@ -109,26 +110,15 @@ def _read_mask_png(path: Path) -> np.ndarray:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Kernel dei lobi: pesi per anello in forma chiusa
+# Pesi per anello del cono, in forma chiusa
 # ──────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_LOBE_EXPONENTS = [800.0, 200.0, 60.0, 20.0, 6.0, 2.0, 0.0]
-
-
-def ring_weights_phong(cos_edges: np.ndarray, s: float) -> np.ndarray:
-    """Lobo cos^s θ_R integrato sull'anello [b_{i-1}, b_i]:
-    W_i = 2π/(s+1)·(c_{i-1}^{s+1} − c_i^{s+1}), con c = max(cos b, 0)
-    (il lobo è nullo oltre 90° dall'asse del raggio riflesso)."""
+def ring_weights_coscone(cos_edges: np.ndarray, k: int) -> np.ndarray:
+    """Cono troncato all'anello k con peso cosθ_R (integrale puro, non media):
+    W_i = π(c_{i-1}² − c_i²) per i ≤ k, 0 oltre, con c = max(cos b, 0).
+    Σ_{i≤k} W_i = π(1 − c_k²) = π·sin²(semi-apertura_k)."""
     c = np.clip(np.asarray(cos_edges, dtype=np.float64), 0.0, 1.0)
-    p = s + 1.0
-    return 2.0 * np.pi / p * (c[:-1] ** p - c[1:] ** p)
-
-
-def ring_weights_tophat(cos_edges: np.ndarray, k: int) -> np.ndarray:
-    """Cono top-hat troncato all'anello k (angolo solido puro):
-    W_i = 2π(c_{i-1} − c_i) per i ≤ k, 0 oltre (k in 1..K-1)."""
-    c = np.asarray(cos_edges, dtype=np.float64)
-    w = 2.0 * np.pi * (c[:-1] - c[1:])
+    w = np.pi * (c[:-1] ** 2 - c[1:] ** 2)
     w[k:] = 0.0
     return w
 
@@ -143,8 +133,6 @@ def solve_pbr(output_dir: str,
               spec_threshold: float = 0.2,
               min_views: int = 2,
               albedo_eps: float = 1e-3,
-              kernel: str = "phong",
-              lobe_exponents: "list[float] | None" = None,
               eps: float = 1e-12) -> dict:
     out = Path(output_dir)
     src_dir = out / "sources" / source     # artefatti source-dipendenti (camera_texture/, pixel_change/, uscite PBR)
@@ -166,25 +154,19 @@ def solve_pbr(output_dir: str,
     K         = meta["num_levels"]
     stems     = [Path(f["file_path"]).stem for f in tjson["frames"]]
 
-    # ── Candidati del lobo: [specchio] + kernel parametrico ──────────────────
+    # ── Candidati: [specchio] + un cono coscone per apertura ─────────────────
     # Tupla: (label, pesi per anello — None per lo specchio, roughness, param)
     cos_edges = np.asarray(meta.get("ring_edges_cos")
                            or np.cos(np.radians(apertures) * 0.5),
                            dtype=np.float64)
-    if kernel == "phong":
-        exps = list(DEFAULT_LOBE_EXPONENTS if lobe_exponents is None
-                    else lobe_exponents)
-        candidates = [("mirror", None, 0.0, -1.0)]
-        candidates += [(f"s={s:g}", ring_weights_phong(cos_edges, s),
-                        math.sqrt(2.0 / (s + 2.0)), float(s)) for s in exps]
-    elif kernel == "tophat":
-        candidates = [("mirror", None, 0.0, 0.0)]
-        candidates += [(f"r={apertures[k]:g}°", ring_weights_tophat(cos_edges, k),
-                        float(apertures[k]) / 180.0, float(apertures[k]))
-                       for k in range(1, K)]
-    else:
-        raise ValueError(f"kernel sconosciuto: {kernel!r} (usare 'phong' o 'tophat')")
+    candidates = [("mirror", None, 0.0, 0.0)]
+    candidates += [(f"r={apertures[k]:g}°∫cos", ring_weights_coscone(cos_edges, k),
+                    float(apertures[k]) / 180.0, float(apertures[k]))
+                   for k in range(1, K)]
     n_cand = len(candidates)
+    # L = integrale puro con denominatore fisso (campioni lanciati per anello),
+    # non media pesata — vedi docstring
+    M_ring = float(meta["samples_per_ring"])
 
     # ── Input vista-indipendenti (per la sorgente `source`) ──────────────────
     D_img = _read_exr(src_dir / "pixel_change" / "color_min.exr")          # (H, W, 3)
@@ -202,7 +184,7 @@ def solve_pbr(output_dir: str,
     vis_path = out / "visibility" / "visibility.exr"
     vis = _read_exr(vis_path).reshape(N, -1) > 0.5 if vis_path.exists() else None
 
-    print(f"[pbr_solver] {N} texel, {len(cams)} camere, kernel={kernel}, "
+    print(f"[pbr_solver] {N} texel, {len(cams)} camere, "
           f"{n_cand} candidati ({K - 1} anelli + specchio)")
 
     # ── Scan streaming: una camera alla volta, statistiche per candidato ─────
@@ -230,14 +212,11 @@ def solve_pbr(output_dir: str,
         for c_idx, (_label, w_rings, _rough, _param) in enumerate(candidates):
             if w_rings is None:                    # specchio puro (livello 0)
                 L = means[:, 0].astype(np.float64)
-            else:                                  # lobo: anelli 1..K-1 pesati
+            else:                                  # cono: anelli 1..K-1 pesati
                 wc  = w_rings[None, :] * counts[:, 1:]              # (N, K-1)
-                den = wc.sum(axis=1)
                 num = np.einsum("nk,nkc->nc", wc,
                                 means[:, 1:].astype(np.float64))
-                L = np.zeros((N, 3))
-                ok = den > 0
-                L[ok] = num[ok] / den[ok, None]
+                L = num / M_ring    # integrale puro: denominatore fisso
             dC = C_j - L; dD = D - L
             S_cc[:, c_idx] += (wf * dC * dC).sum(axis=-1)
             S_cd[:, c_idx] += (wf * dC * dD).sum(axis=-1)
@@ -394,15 +373,7 @@ if __name__ == "__main__":
                     help="minimo di camere valide per texel")
     ap.add_argument("--albedo-eps", type=float, default=1e-3,
                     help="clamp minimo dell'irradiance nell'albedo_pbr")
-    ap.add_argument("--kernel", choices=["phong", "tophat"], default="phong",
-                    help="kernel del lobo speculare (phong=cos^s, tophat=coni)")
-    ap.add_argument("--lobe-exponents", type=str, default=None,
-                    help="esponenti s del kernel phong, separati da virgola "
-                         f"(default: {DEFAULT_LOBE_EXPONENTS})")
     args = ap.parse_args()
-    exps = ([float(x) for x in args.lobe_exponents.split(",")]
-            if args.lobe_exponents else None)
     solve_pbr(args.output_dir, source=args.source,
               cv_gate=args.cv_gate, spec_threshold=args.spec_threshold,
-              min_views=args.min_views, albedo_eps=args.albedo_eps,
-              kernel=args.kernel, lobe_exponents=exps)
+              min_views=args.min_views, albedo_eps=args.albedo_eps)

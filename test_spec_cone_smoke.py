@@ -7,9 +7,12 @@ Verifiche:
   3. con envmap funzione dell'elevazione, il livello 0 (raggio specchio)
      coincide con l'envmap valutata lungo R = reflect(v, n) calcolato in
      NumPy (valida direzione riflessa + convenzione equirettangolare);
-  4. la ricostruzione a lobi di pbr_solver (ring_weights_*): il top-hat
-     completo coincide con la formula cumulativa storica, e lo smoothing
-     è monotono dallo specchio al lobo s=0.
+  4. la ricostruzione a coni: la media ad angolo solido sull'intera semisfera
+     (pesi inline) coincide con la formula cumulativa storica, e lo smoothing
+     è monotono dallo specchio ai coni coscone via via più larghi;
+  5. il kernel coscone (integrale puro ∫L·cosθ_R dω, denominatore fisso M):
+     su envmap costante ≡ 1 e anelli non tagliati dall'orizzonte deve valere
+     la forma chiusa π·sin²(semi-apertura) per ogni cono, π a 180°.
 
 Uso:  python test_spec_cone_smoke.py
 """
@@ -133,7 +136,7 @@ print(f"[gradient] specchio vs NumPy su {len(L0)} texel: "
 assert err.max() < 0.05, "livello 0 non coincide con envmap(reflect(v,n))"
 
 # ── Ricostruzione a lobi (helper pbr_solver) su medie per-anello ─────────────
-from pbr_solver import ring_weights_phong, ring_weights_tophat
+from pbr_solver import ring_weights_coscone
 
 cos_b = np.cos(np.radians(np.asarray(APERTURES)) * 0.5)
 sky_all = masks & (hit_cnt.sum(axis=1) == 0) & (valid > 0).all(axis=1)
@@ -146,23 +149,52 @@ def lobe(w):
     return (np.einsum("nk,nkc->nc", wc, means[:, 1:])
             / wc.sum(axis=1)[:, None])
 
-# (a) top-hat completo ≡ formula cumulativa storica
+# (a) consistenza del bake: media ad angolo solido sull'intera semisfera
+#     (pesi inline, ex kernel top-hat) ≡ formula cumulativa storica
 omega = 2.0 * np.pi * (cos_b[:-1] - cos_b[1:])
 w_sum = np.cumsum(omega[None, :, None] * ring_sum[sky_all][:, 1:], axis=1)
 w_cnt = np.cumsum(omega[None, :] * valid[sky_all][:, 1:], axis=1)
 L_old = w_sum[:, -1] / w_cnt[:, -1, None]
-L_new = lobe(ring_weights_tophat(cos_b, K - 1))
+L_new = lobe(omega)
 err = np.abs(L_new - L_old).max()
-print(f"[lobi] tophat(180°) vs cumulativa storica: max err={err:.2e}")
-assert err < 1e-9, "helper top-hat ≠ formula cumulativa storica"
+print(f"[lobi] media angolo solido (180°) vs cumulativa storica: max err={err:.2e}")
+assert err < 1e-9, "media ad angolo solido ≠ formula cumulativa storica"
 
-# (b) smoothing monotono: specchio → lobi via via più larghi (std decrescente)
+# (b) smoothing monotono: specchio → coni coscone via via più larghi (std
+#     decrescente; qui si usa la media normalizzata, il contrasto non dipende
+#     dalla scala del cono)
 spreads = [np.std(means[:, 0, 0])]
-for s in [200.0, 20.0, 2.0, 0.0]:
-    spreads.append(np.std(lobe(ring_weights_phong(cos_b, s))[:, 0]))
-print("[lobi] std specchio→s=0: " + "  ".join(f"{x:.4f}" for x in spreads))
+for k in range(1, K):
+    spreads.append(np.std(lobe(ring_weights_coscone(cos_b, k))[:, 0]))
+print("[lobi] std specchio→180°: " + "  ".join(f"{x:.4f}" for x in spreads))
 assert spreads[-1] < spreads[0], "il lobo largo dovrebbe mediare (std minore)"
 assert all(spreads[i + 1] <= spreads[i] * 1.05 for i in range(len(spreads) - 1)), \
     "lo smoothing dovrebbe essere ~monotono con l'allargarsi del lobo"
+
+# (c) coscone: integrale puro su envmap costante ≡ 1 → forma chiusa
+#     Σ_{i≤k} W_i = π·(1 − c_k²) = π·sin²(semi-apertura_k),  π a 180°
+ring_sum_c, valid_c, hit_cnt_c = run_pass(make_envmap("constant"), cam_pos,
+                                          ium_res, num_pix)
+full = (masks & (hit_cnt_c.sum(axis=1) == 0)
+        & (valid_c[:, 1:] == M).all(axis=1))     # tutti gli anelli interi
+print(f"[lobi] coscone: texel solo-cielo con anelli non tagliati: {full.sum()}")
+means_c = ring_sum_c[full] / np.maximum(valid_c[full][..., None], 1)
+cnts_c  = valid_c[full].astype(np.float64)
+
+def lobe_integral(w):
+    """L = Σ_i W_i·mean_i·valid_i / M sugli anelli 1..K-1 (denominatore fisso)."""
+    wc = w[None, :] * cnts_c[:, 1:]
+    return np.einsum("nk,nkc->nc", wc, means_c[:, 1:]) / M
+
+if full.any():
+    semi = np.radians(np.asarray(APERTURES)) * 0.5
+    for k in range(1, K):
+        expected = np.pi * np.sin(semi[k]) ** 2
+        err = np.abs(lobe_integral(ring_weights_coscone(cos_b, k)) - expected).max()
+        print(f"[lobi] coscone r={APERTURES[k]:g}°: atteso {expected:.4f}, "
+              f"max err={err:.2e}")
+        assert err < 1e-5, \
+            f"integrale coscone r={APERTURES[k]}° ≠ π·sin²(semi-apertura)"
+    assert abs(np.pi * np.sin(semi[-1]) ** 2 - np.pi) < 1e-12  # 180° → π
 
 print("\n✓ Tutti i check del pass SpecCone superati")

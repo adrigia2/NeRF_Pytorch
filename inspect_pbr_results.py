@@ -14,7 +14,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).parent))
-from pbr_solver import _read_exr, ring_weights_phong
+from pbr_solver import _read_exr
 
 
 def _find_variant(folder: Path, stem: str, primary: str = "nerf") -> Path:
@@ -48,7 +48,8 @@ _rings = np.stack([_read_exr(out / "spec_cone"
                    for k in range(_K)], axis=2)                   # (H, W, K, 3)
 _cnts  = _read_exr(out / "spec_cone" / _meta["counts_file_pattern"].format(cam=0))
 L0 = _rings[:, :, 0]                                              # specchio
-_w  = ring_weights_phong(np.asarray(_meta["ring_edges_cos"]), 0.0)  # lobo s=0
+_edges = np.asarray(_meta["ring_edges_cos"], dtype=np.float64)
+_w  = 2.0 * np.pi * (_edges[:-1] - _edges[1:])  # angolo solido per anello: media su tutta la semisfera
 _wc = _w[None, None, :] * _cnts[..., 1:]
 L180 = (np.einsum("hwk,hwkc->hwc", _wc, _rings[:, :, 1:])
         / np.maximum(_wc.sum(-1), 1e-12)[..., None])
