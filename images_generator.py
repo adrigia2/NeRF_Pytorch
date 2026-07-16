@@ -1030,14 +1030,14 @@ def _precompute_spec_cone(
     sky_size: list[int],
     out_dir: Path,
 ) -> None:
-    """Precompute per-anello per il fit PBR  C_j = X·D + (1-X)·L_j  (pbr_solver.py).
+    """Precompute per-anello per il fit PBR  C_j = (a·x/π)·E + (1-x)·L_j  (pbr_solver.py).
 
     Campionamento ad anelli concentrici attorno al raggio riflesso
     R_j = reflect(v_j, n) (deviceProgramsSpecCone.cu): ogni raggio è tracciato e
     interrogato sul NeRF una volta sola. Il bake salva le MEDIE PER-ANELLO
     (livello 0 = raggio specchio puro) e i conteggi validi; la ricostruzione
-    dell'integrale coscone ∫L·cosθ_R dω avviene nel solver (pbr_solver.py) come
-    somma pesata degli anelli. Miss → envmap (su GPU), hit → NeRF.
+    della media pura sul cono avviene nel solver (pbr_solver.py) come media
+    pesata ad angolo solido degli anelli. Miss → envmap (su GPU), hit → NeRF.
 
     Output in out_dir per camera: cam_{j:03d}_ring{k:02d}.exr (K medie),
     cam_{j:03d}_counts.exr ((H, W, K) valid_count per livello),
@@ -2249,7 +2249,8 @@ def _step3_posttrain_assets(
                     pbr_out = solve_pbr(json_dir_str, source=src,
                                         cv_gate=rc.pbr_diffuse_cv_gate,
                                         spec_threshold=rc.pbr_spec_threshold,
-                                        min_views=rc.pbr_min_views)
+                                        min_views=rc.pbr_min_views,
+                                        albedo_eps=rc.albedo_eps)
                     ium_result_data[f"metallic_path_{src}"] = _as_relative_to(
                         pbr_out["metallic_path"], json_dir_str)
                     ium_result_data[f"roughness_path_{src}"] = _as_relative_to(
@@ -2596,9 +2597,9 @@ if __name__ == "__main__":
     # skybox_path) sono vuoti qui e vengono sovrascritti per ogni SceneConfig.
     # Tutti gli altri parametri di rendering/NeRF sono condivisi tra le scene.
     template = PipelineConfig(
-        run_step1 = True,
-        run_step2 = True,
-        run_step3 = True,
+        run_step1 = False,  # output Step 1 già su disco (exp_l1_d02)
+        run_step2 = False,  # checkpoint NeRF e render Step 2b già su disco
+        run_step3 = True,   # solo pass texture-space: fit PBR col nuovo modello
         resume_skip_step2_if_ckpt = True,   # salta il training NeRF se il checkpoint esiste già
 
         render = RenderConfig(
@@ -2754,7 +2755,7 @@ if __name__ == "__main__":
             run_pipeline_multi(
                 cfg, SCENES,
                 output_root    = f"{SWEEP_ROOT}/{tag}",
-                run_note       = f"{cfg.nerf_num_iters}iter | act={act} | loss={loss} | decay={decay} (full pipeline)",
+                run_note       = f"{cfg.nerf_num_iters}iter | act={act} | loss={loss} | decay={decay} (step 3 only — fit PBR a·E·x + (1−x)·L media pura)",
                 experiment_tag = tag,
                 # tb_enabled=False
             )

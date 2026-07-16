@@ -9,10 +9,11 @@ Verifiche:
      NumPy (valida direzione riflessa + convenzione equirettangolare);
   4. la ricostruzione a coni: la media ad angolo solido sull'intera semisfera
      (pesi inline) coincide con la formula cumulativa storica, e lo smoothing
-     è monotono dallo specchio ai coni coscone via via più larghi;
-  5. il kernel coscone (integrale puro ∫L·cosθ_R dω, denominatore fisso M):
-     su envmap costante ≡ 1 e anelli non tagliati dall'orizzonte deve valere
-     la forma chiusa π·sin²(semi-apertura) per ogni cono, π a 180°.
+     è monotono dallo specchio ai coni (media pura) via via più larghi;
+  5. la media pura sul cono (ring_weights_mean di pbr_solver.py, normalizzata
+     sui campioni validi): su envmap costante ≡ 1 e anelli non tagliati
+     dall'orizzonte vale esattamente 1 per ogni apertura, come il livello
+     specchio (unità di radianza omogenee tra tutti i candidati).
 
 Uso:  python test_spec_cone_smoke.py
 """
@@ -136,7 +137,7 @@ print(f"[gradient] specchio vs NumPy su {len(L0)} texel: "
 assert err.max() < 0.05, "livello 0 non coincide con envmap(reflect(v,n))"
 
 # ── Ricostruzione a lobi (helper pbr_solver) su medie per-anello ─────────────
-from pbr_solver import ring_weights_coscone
+from pbr_solver import ring_weights_mean
 
 cos_b = np.cos(np.radians(np.asarray(APERTURES)) * 0.5)
 sky_all = masks & (hit_cnt.sum(axis=1) == 0) & (valid > 0).all(axis=1)
@@ -150,8 +151,8 @@ def lobe(w):
             / wc.sum(axis=1)[:, None])
 
 # (a) consistenza del bake: media ad angolo solido sull'intera semisfera
-#     (pesi inline, ex kernel top-hat) ≡ formula cumulativa storica
-omega = 2.0 * np.pi * (cos_b[:-1] - cos_b[1:])
+#     (pesi inline = ring_weights_mean non troncato) ≡ formula cumulativa storica
+omega = ring_weights_mean(cos_b, K - 1)          # = 2π(c_{i-1} − c_i), nessun taglio
 w_sum = np.cumsum(omega[None, :, None] * ring_sum[sky_all][:, 1:], axis=1)
 w_cnt = np.cumsum(omega[None, :] * valid[sky_all][:, 1:], axis=1)
 L_old = w_sum[:, -1] / w_cnt[:, -1, None]
@@ -160,41 +161,43 @@ err = np.abs(L_new - L_old).max()
 print(f"[lobi] media angolo solido (180°) vs cumulativa storica: max err={err:.2e}")
 assert err < 1e-9, "media ad angolo solido ≠ formula cumulativa storica"
 
-# (b) smoothing monotono: specchio → coni coscone via via più larghi (std
-#     decrescente; qui si usa la media normalizzata, il contrasto non dipende
-#     dalla scala del cono)
+# (b) smoothing monotono: specchio → coni (media pura) via via più larghi (std
+#     decrescente; la media è già normalizzata, stesse unità a ogni apertura)
 spreads = [np.std(means[:, 0, 0])]
 for k in range(1, K):
-    spreads.append(np.std(lobe(ring_weights_coscone(cos_b, k))[:, 0]))
+    spreads.append(np.std(lobe(ring_weights_mean(cos_b, k))[:, 0]))
 print("[lobi] std specchio→180°: " + "  ".join(f"{x:.4f}" for x in spreads))
 assert spreads[-1] < spreads[0], "il lobo largo dovrebbe mediare (std minore)"
 assert all(spreads[i + 1] <= spreads[i] * 1.05 for i in range(len(spreads) - 1)), \
     "lo smoothing dovrebbe essere ~monotono con l'allargarsi del lobo"
 
-# (c) coscone: integrale puro su envmap costante ≡ 1 → forma chiusa
-#     Σ_{i≤k} W_i = π·(1 − c_k²) = π·sin²(semi-apertura_k),  π a 180°
+# (c) media pura su envmap costante ≡ 1: ogni cono troncato deve valere
+#     esattamente 1, come il livello specchio (unità di radianza omogenee)
 ring_sum_c, valid_c, hit_cnt_c = run_pass(make_envmap("constant"), cam_pos,
                                           ium_res, num_pix)
 full = (masks & (hit_cnt_c.sum(axis=1) == 0)
         & (valid_c[:, 1:] == M).all(axis=1))     # tutti gli anelli interi
-print(f"[lobi] coscone: texel solo-cielo con anelli non tagliati: {full.sum()}")
+print(f"[lobi] media pura: texel solo-cielo con anelli non tagliati: {full.sum()}")
 means_c = ring_sum_c[full] / np.maximum(valid_c[full][..., None], 1)
 cnts_c  = valid_c[full].astype(np.float64)
 
-def lobe_integral(w):
-    """L = Σ_i W_i·mean_i·valid_i / M sugli anelli 1..K-1 (denominatore fisso)."""
+def lobe_mean(w):
+    """L = Σ_i W_i·mean_i·valid_i / Σ_i W_i·valid_i sugli anelli 1..K-1
+    (media pesata ad angolo solido, come nel solver)."""
     wc = w[None, :] * cnts_c[:, 1:]
-    return np.einsum("nk,nkc->nc", wc, means_c[:, 1:]) / M
+    return (np.einsum("nk,nkc->nc", wc, means_c[:, 1:])
+            / wc.sum(axis=1)[:, None])
 
 if full.any():
-    semi = np.radians(np.asarray(APERTURES)) * 0.5
+    err0 = np.abs(means_c[valid_c[full][:, 0] > 0, 0] - 1.0).max() \
+        if (valid_c[full][:, 0] > 0).any() else 0.0
+    print(f"[lobi] specchio su envmap costante: max |L - 1| = {err0:.2e}")
+    assert err0 < 1e-5, "specchio ≠ envmap costante"
     for k in range(1, K):
-        expected = np.pi * np.sin(semi[k]) ** 2
-        err = np.abs(lobe_integral(ring_weights_coscone(cos_b, k)) - expected).max()
-        print(f"[lobi] coscone r={APERTURES[k]:g}°: atteso {expected:.4f}, "
+        err = np.abs(lobe_mean(ring_weights_mean(cos_b, k)) - 1.0).max()
+        print(f"[lobi] media pura r={APERTURES[k]:g}°: atteso 1, "
               f"max err={err:.2e}")
         assert err < 1e-5, \
-            f"integrale coscone r={APERTURES[k]}° ≠ π·sin²(semi-apertura)"
-    assert abs(np.pi * np.sin(semi[-1]) ** 2 - np.pi) < 1e-12  # 180° → π
+            f"media pura r={APERTURES[k]}° ≠ 1 su envmap costante"
 
 print("\n✓ Tutti i check del pass SpecCone superati")
