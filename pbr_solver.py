@@ -10,18 +10,19 @@
     x     peso del termine DIFFUSO (x=1 → nessuna dipendenza dalla vista);
           la specularità/metallic è 1−x
     L_j   MEDIA PURA ad angolo solido della radianza ambiente sul cono attorno
-          al raggio riflesso (nessun peso cosθ_R), ricostruita dalle medie
-          per-anello del bake (spec_cone/cam_jjj_ringkk.exr + counts, format
-          "rings" di images_generator.py); candidati = specchio + un cono per
-          apertura della griglia; roughness = apertura/180. Essendo una media,
-          L resta in unità di radianza a OGNI apertura (specchio compreso):
-          metallic = 1−x è una frazione speculare omogenea tra i candidati.
+          al raggio riflesso (nessun peso cosθ_R). Il solver NON la ricostruisce:
+          la legge dal bake, che scrive un canale RGB per candidato in
+          spec_cone/cam_{j:03d}.exr (format "cones" di images_generator.py).
+          Candidati = specchio + un cono per apertura della griglia;
+          roughness = apertura/180. Essendo una media, L resta in unità di
+          radianza a OGNI apertura (specchio compreso): metallic = 1−x è una
+          frazione speculare omogenea tra i candidati.
 
-Media sul cono troncato all'anello k (b = semi-apertura, c = cos b ≥ 0):
-    Ω_i = 2π·(c_{i-1} − c_i)  per i ≤ k, 0 oltre        (angolo solido anello)
-    L = Σ_i Ω_i·mean_i·valid_i / Σ_i Ω_i·valid_i
-(i raggi sotto l'orizzonte sono esclusi da numeratore e denominatore: è la
-media dei soli raggi validi. Il candidato specchio è la media del livello 0.)
+La media sul cono la chiude il bake (images_generator._cones_from_rings_*):
+qui basta sapere che il canale di un livello (cone_045deg, dal nome si legge
+l'apertura) è la media dei soli raggi validi entro
+l'apertura k, pesata per angolo solido, e che `valid` = raggi sopra l'orizzonte
+del texel (0 → il texel non è utilizzabile per quella camera).
 Nota: la risoluzione sulla larghezza del cono è quantizzata dalla griglia di
 aperture del bake (spec_cone_apertures_deg) — scelta deliberata, niente
 raffinamento sub-griglia in questa versione.
@@ -87,7 +88,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from images_generator import (  # noqa: E402
-    DataLayer, ImageFormat, _save_layer,
+    DataLayer, ImageFormat, _save_layer, spec_cone_level_name,
 )
 
 # Sotto questo x il texel è considerato completamente speculare: l'albedo
@@ -123,24 +124,39 @@ def _read_exr(path: Path) -> np.ndarray:
     return np.stack([chan(c) for c in chans], axis=-1)
 
 
-def _read_mask_png(path: Path) -> np.ndarray:
-    from PIL import Image
-    return (np.asarray(Image.open(path)) > 0)
+def read_cones(path: Path, apertures_deg) -> "tuple[np.ndarray, np.ndarray]":
+    """EXR dei coni di una camera → (L (N, K, 3), n_valid (N,)).
 
+    Un canale RGB per livello, con la media pura sul cono già chiusa dal bake,
+    più `valid`, il numero di raggi validi del texel. I nomi dei livelli portano
+    l'apertura (`cone_045deg`) e vengono generati da spec_cone_level_name a
+    partire dalle aperture del meta: writer e reader usano la stessa funzione,
+    quindi non possono divergere. Un solo file per camera e non uno per
+    apertura: il bake condiviso ha il loop sui tile all'esterno, quindi i writer
+    di tutte le camere restano aperti insieme e K+1 file per camera
+    supererebbero il limite stdio di MSVC.
+    """
+    import OpenEXR, Imath
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Pesi per anello del cono, in forma chiusa
-# ──────────────────────────────────────────────────────────────────────────────
+    exr = OpenEXR.InputFile(path.as_posix())
+    header = exr.header()
+    dw = header["dataWindow"]
+    w = dw.max.x - dw.min.x + 1
+    h = dw.max.y - dw.min.y + 1
+    pt = Imath.PixelType(Imath.PixelType.FLOAT)   # half convertito in lettura
+    names = set(header["channels"].keys())
 
-def ring_weights_mean(cos_edges: np.ndarray, k: int) -> np.ndarray:
-    """Pesi ad angolo solido del cono troncato all'anello k (media pura):
-    Ω_i = 2π(c_{i-1} − c_i) per i ≤ k, 0 oltre, con c = clip(cos b, 0, 1).
-    La normalizzazione per Σ_i Ω_i·valid_i avviene per-texel nel loop camere
-    (i raggi sotto l'orizzonte escono da numeratore e denominatore)."""
-    c = np.clip(np.asarray(cos_edges, dtype=np.float64), 0.0, 1.0)
-    w = 2.0 * np.pi * (c[:-1] - c[1:])
-    w[k:] = 0.0
-    return w
+    def chan(name):
+        if name not in names:
+            raise ValueError(f"{path}: canale {name!r} mancante "
+                             f"(bake incompleto o num_levels sbagliato nel meta)")
+        return np.frombuffer(exr.channel(name, pt), dtype=np.float32).reshape(h * w)
+
+    cones = np.stack(
+        [np.stack([chan(f"{spec_cone_level_name(apertures_deg, k)}.{c}") for c in "RGB"],
+                  axis=-1)
+         for k in range(len(apertures_deg))], axis=1)      # (N, K, 3)
+    return cones, chan("valid")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -163,11 +179,14 @@ def solve_pbr(output_dir: str,
     with open(out / "transforms_extended.json", encoding="utf-8") as fh:
         tjson = json.load(fh)
 
-    if meta.get("format") != "rings":
+    # Il bake scrive i coni già chiusi (un canale RGB per candidato), quindi qui
+    # non si ricostruisce nulla: L_j(r) si legge e basta. I bake in formato
+    # "rings"/"rings_shared" (medie per anello) non sono più supportati.
+    if meta.get("format") != "cones":
         raise ValueError(
-            "spec_cone_meta.json in formato legacy (coni cumulativi): il solver "
-            "richiede il formato 'rings' (medie per-anello + counts). "
-            "Ri-eseguire il precompute spec_cone.")
+            f"spec_cone_meta.json in formato {meta.get('format')!r}: il solver "
+            f"richiede il formato 'cones' (L_j(r) già chiusa dal bake). "
+            f"Ri-eseguire il precompute spec_cone.")
 
     apertures = np.asarray(meta["apertures_deg"], dtype=np.float32)
     cams      = meta["cameras"]
@@ -175,12 +194,10 @@ def solve_pbr(output_dir: str,
     stems     = [Path(f["file_path"]).stem for f in tjson["frames"]]
 
     # ── Candidati: [specchio] + un cono (media pura) per apertura ────────────
-    # Tupla: (label, pesi per anello — None per lo specchio, roughness, param)
-    cos_edges = np.asarray(meta.get("ring_edges_cos")
-                           or np.cos(np.radians(apertures) * 0.5),
-                           dtype=np.float64)
-    candidates = [("mirror", None, 0.0, 0.0)]
-    candidates += [(f"r={apertures[k]:g}°mean", ring_weights_mean(cos_edges, k),
+    # Sono i K canali del bake nell'ordine in cui li ha scritti: l'indice del
+    # candidato È l'indice del canale. Tupla: (label, roughness, param).
+    candidates = [("mirror", 0.0, 0.0)]
+    candidates += [(f"r={apertures[k]:g}°mean",
                     float(apertures[k]) / 180.0, float(apertures[k]))
                    for k in range(1, K)]
     n_cand = len(candidates)
@@ -218,27 +235,21 @@ def solve_pbr(output_dir: str,
         w_j = mask.copy()
         if vis is not None:
             w_j &= vis[:, j]
-        w_j &= _read_mask_png(spec_dir / meta["valid_file_pattern"].format(cam=j)).reshape(N)
-        n_views += w_j
 
-        means = np.stack([_read_exr(spec_dir / meta["ring_file_pattern"]
-                                    .format(cam=j, level=k)).reshape(N, 3)
-                          for k in range(K)], axis=1)               # (N, K, 3)
-        counts = _read_exr(spec_dir / meta["counts_file_pattern"].format(cam=j))
-        counts = counts.reshape(N, K).astype(np.float64)
+        cones, n_valid = read_cones(
+            spec_dir / meta["cam_file_pattern"].format(cam=j), apertures)
+        cones = cones.astype(np.float64)                    # (N, n_cand, 3)
+        # Un texel è valido per questa camera se almeno un raggio è finito sopra
+        # l'orizzonte: è la stessa maschera che il bake usa per azzerare i coni.
+        w_j &= n_valid > 0
+
+        n_views += w_j
 
         wf = w_j.astype(np.float64)
         SC  += wf[:, None] * C_j
         SCC += wf * (C_j * C_j).sum(axis=-1)
-        for c_idx, (_label, w_rings, _rough, _param) in enumerate(candidates):
-            if w_rings is None:                    # specchio puro (livello 0)
-                L = means[:, 0].astype(np.float64)
-            else:                                  # cono: media pesata anelli 1..K-1
-                wc  = w_rings[None, :] * counts[:, 1:]              # (N, K-1)
-                num = np.einsum("nk,nkc->nc", wc,
-                                means[:, 1:].astype(np.float64))
-                den = wc.sum(axis=1)
-                L = num / np.maximum(den, eps)[:, None]
+        for c_idx in range(n_cand):
+            L = cones[:, c_idx]
             SL[:, c_idx]  += wf[:, None] * L
             SLL[:, c_idx] += wf * (L * L).sum(axis=-1)
             SCL[:, c_idx] += wf * (C_j * L).sum(axis=-1)
@@ -271,7 +282,7 @@ def solve_pbr(output_dir: str,
     best_res  = res_all[_idx, best_k]
     best_beta = beta_all[_idx, best_k]
 
-    for c_idx, (label, _w, rough, _param) in enumerate(candidates):
+    for c_idx, (label, rough, _param) in enumerate(candidates):
         n_best = int(((best_k == c_idx) & target & np.isfinite(best_res)).sum())
         print(f"  candidato {label:>11} (roughness={rough:.3f}) → migliore per "
               f"{n_best} texel")
@@ -286,8 +297,8 @@ def solve_pbr(output_dir: str,
     metallic = np.zeros(N, dtype=np.float32)      # β = 1−x (specularità)
     metallic[fitted] = best_beta[fitted].astype(np.float32)
 
-    rough_vals = np.asarray([c[2] for c in candidates], dtype=np.float32)
-    param_vals = np.asarray([c[3] for c in candidates], dtype=np.float32)
+    rough_vals = np.asarray([c[1] for c in candidates], dtype=np.float32)
+    param_vals = np.asarray([c[2] for c in candidates], dtype=np.float32)
 
     lobe_param = np.zeros(N, dtype=np.float32)
     lobe_param[fitted] = param_vals[best_k[fitted]]

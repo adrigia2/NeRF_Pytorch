@@ -249,24 +249,32 @@ def bake_envmap(model_bundle, cfg: NerfConfig, width: int, height: int,
     return rgb.reshape(height, width, 3)
 
 
-def query_radiance(model_bundle, origins_np: np.ndarray, dirs_np: np.ndarray,
-                   cfg: NerfConfig, *, t_hits_np: np.ndarray | None = None) -> np.ndarray:
+def query_radiance(model_bundle, origins_np, dirs_np,
+                   cfg: NerfConfig, *, t_hits_np=None,
+                   return_torch: bool = False):
     """Query NeRF radiance for secondary rays (indirect irradiance pass).
 
     origins_np: (N, 3) — ray origins (surface point + eps·normal)
     dirs_np:    (N, 3) — hemisphere sample directions
     t_hits_np:  (N,)  — OptiX hit distance; rays with t_hit>0 use the mesh window,
                          rays that miss geometry use the spherical shell from centre.
-    Returns:    (N, 3) float32 RGB colour per ray
+
+    Gli input possono essere array NumPy oppure tensori torch già sul device:
+    `torch.as_tensor` non copia quando device e dtype coincidono già. Con
+    return_torch=True anche l'uscita resta sul device — serve al bake spec_cone
+    condiviso, dove le radianze vengono classificate per camera in torch e un
+    round-trip GPU→CPU→GPU costerebbe centinaia di MB per tile.
+
+    Returns:    (N, 3) float32 RGB per raggio (NumPy, o tensore se return_torch)
     """
     model, embed_fn, embeddirs_fn, device, center, sphere_radius = model_bundle
 
-    rays_o = torch.tensor(origins_np, device=device, dtype=torch.float32)
-    rays_d = torch.tensor(dirs_np,    device=device, dtype=torch.float32)
+    rays_o = torch.as_tensor(origins_np, device=device, dtype=torch.float32)
+    rays_d = torch.as_tensor(dirs_np,    device=device, dtype=torch.float32)
 
     t_hit = None
     if t_hits_np is not None:
-        t_hit = torch.tensor(t_hits_np, device=device, dtype=torch.float32)
+        t_hit = torch.as_tensor(t_hits_np, device=device, dtype=torch.float32)
 
     model.eval()
     results = []
@@ -301,4 +309,5 @@ def query_radiance(model_bundle, origins_np: np.ndarray, dirs_np: np.ndarray,
 
             results.append(chunk_rgb)
 
-    return torch.cat(results, 0).cpu().numpy().astype(np.float32)
+    out = torch.cat(results, 0)
+    return out if return_torch else out.cpu().numpy().astype(np.float32)

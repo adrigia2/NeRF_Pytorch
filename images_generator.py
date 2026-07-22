@@ -118,6 +118,87 @@ class ExrWriter:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Writer: OpenEXR incrementale (per blocchi di scanline)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class IncrementalExrWriter:
+    """EXR scritto per blocchi di scanline consecutive, senza mai tenere in RAM
+    l'immagine intera.
+
+    Serve al bake spec_cone condiviso, dove il loop esterno è sul tile e non sulla
+    camera: gli accumulatori di tutte le camere a piena risoluzione non ci starebbero
+    (a 4096², K=14, 58 camere sarebbero ~200 GiB), mentre un blocco di scanline per
+    camera costa qualche centinaio di KB.
+
+    channels: dict {nome: dtype}, con dtype np.float16 → canale HALF, altrimenti FLOAT.
+    Ogni write_block riceve {nome: array (rows, width)} e avanza di `rows` scanline;
+    i blocchi vanno scritti in ordine e devono coprire esattamente `height` righe.
+    """
+
+    def __init__(self, path: str, width: int, height: int,
+                 channels: "dict[str, type]", compression: str = "zip"):
+        import OpenEXR, Imath
+
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self.path    = path
+        self.width   = width
+        self.height  = height
+        self.channels = dict(channels)
+        self.row     = 0
+
+        half  = Imath.PixelType(Imath.PixelType.HALF)
+        flt   = Imath.PixelType(Imath.PixelType.FLOAT)
+        header = OpenEXR.Header(width, height)
+        header["channels"] = {
+            name: Imath.Channel(half if dt == np.float16 else flt)
+            for name, dt in self.channels.items()
+        }
+        comp = {"zip":  Imath.Compression.ZIP_COMPRESSION,
+                "zips": Imath.Compression.ZIPS_COMPRESSION,
+                "none": Imath.Compression.NO_COMPRESSION}[compression]
+        header["compression"] = Imath.Compression(comp)
+        self._file = OpenEXR.OutputFile(path, header)
+
+    def write_block(self, block: "dict[str, np.ndarray]") -> None:
+        rows = None
+        payload = {}
+        for name, dt in self.channels.items():
+            arr = np.ascontiguousarray(block[name], dtype=dt)
+            if arr.ndim != 2 or arr.shape[1] != self.width:
+                raise ValueError(f"IncrementalExrWriter: canale {name!r} ha shape "
+                                 f"{arr.shape}, attese (righe, {self.width})")
+            if rows is None:
+                rows = arr.shape[0]
+            elif arr.shape[0] != rows:
+                raise ValueError("IncrementalExrWriter: i canali di un blocco devono "
+                                 "avere lo stesso numero di righe")
+            payload[name] = arr.tobytes()
+
+        if self.row + rows > self.height:
+            raise ValueError(f"IncrementalExrWriter: {self.path} sforerebbe "
+                             f"{self.height} righe (riga {self.row} + {rows})")
+        self._file.writePixels(payload, rows)
+        self.row += rows
+
+    def close(self) -> None:
+        if self._file is None:
+            return
+        if self.row != self.height:
+            raise ValueError(f"IncrementalExrWriter: {self.path} chiuso a {self.row} "
+                             f"righe su {self.height} (file troncato)")
+        self._file.close()
+        self._file = None
+
+    def __enter__(self): return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.close()
+        else:                      # non validare l'altezza se stiamo già fallendo
+            self._file = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Writer: PNG
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -771,12 +852,54 @@ class RenderConfig:
     # (vedi _precompute_spec_cone). Richiede render_ium, render_visibility e il
     # checkpoint NeRF (come precompute_indirect); usa la stessa skybox dell'irradiance.
     precompute_spec_cone: bool = False
+    # Schema di campionamento:
+    #   "per_camera" → anelli concentrici attorno a R_j, rilanciati per ogni camera
+    #                  (spec_cone_samples_per_ring / _sample_alloc / _budget / _floor)
+    #   "shared"     → un set Fibonacci uniforme sull'emisfero sopra n, tracciato e
+    #                  interrogato UNA volta e classificato da ogni camera nel proprio
+    #                  anello. La radianza incidente non dipende dalla camera, quindi
+    #                  costa S + m raggi/texel invece di m·ΣN_i (m = camere che vedono
+    #                  il texel). Le aperture strette costano però risoluzione: un cono
+    #                  di apertura a riceve S·(1−cos(a/2)) campioni, quindi sotto ~7°
+    #                  (a S=16384) si va sotto i 30 campioni. In compenso raffinare la
+    #                  griglia di aperture non costa un raggio in più.
+    spec_cone_scheme: str = "per_camera"
+    # Campioni condivisi per texel (S), solo per scheme="shared"
+    spec_cone_shared_samples: int = 16384
+    # Texel per sotto-blocco torch: dirs + radianze costano 24 B/raggio, quindi un
+    # tile intero non ci starebbe in VRAM. Non cambia il risultato, solo il picco
+    # e l'efficienza: sotto-blocchi piccoli danno kernel torch piccoli e tanto
+    # overhead Python nel loop sulle camere.
+    spec_cone_chunk_texels: int = 256
+    # Raggi per batch nelle query NeRF del bake (override di NerfConfig.chunk, che
+    # arriva dal checkpoint e vale 32768). È il vero limite all'occupazione della
+    # GPU: il batch della rete è cappato lì, quindi alzare spec_cone_chunk_texels
+    # da solo non riempie la scheda. None = usa il valore del checkpoint.
+    spec_cone_nerf_chunk: "int | None" = None
     # Aperture TOTALI dei coni in gradi, crescenti, primo elemento = 0 (raggio specchio)
     spec_cone_apertures_deg: list[float] = field(
-        default_factory=lambda: [0.0, 10.0, 25.0, 50.0, 90.0, 130.0, 180.0])
-    spec_cone_samples_per_ring: int = 32
+        default_factory=lambda: [0.0, 10.0, 20.0, 40.0, 60.0, 80.0,
+                                 100.0, 120.0, 140.0, 160.0, 180.0])
+    # Campioni per anello: int = stesso numero su ogni anello (comportamento
+    # storico), oppure list[int] con un valore per anello (len = aperture - 1;
+    # il livello 0, raggio specchio, è sempre un raggio solo).
+    spec_cone_samples_per_ring: int | list[int] = 32
+    # Allocazione automatica quando spec_cone_samples_per_ring è un int:
+    #   "uniform"     → stesso numero ovunque
+    #   "solid_angle" → N_i ∝ Ω_i, cioè densità angolare uniforme. L'anello
+    #                   esterno copre ~45× l'angolo solido del primo, quindi con
+    #                   M costante è di gran lunga il più rumoroso; il rumore su
+    #                   L attenua β e falsa l'argmin su r (errors-in-variables).
+    spec_cone_sample_alloc: str = "uniform"
+    # Σ_i N_i target per l'allocazione automatica (None → int × numero di anelli)
+    spec_cone_samples_budget: int | None = None
+    # Minimo per anello. Serve ai candidati stretti, che usano SOLO gli anelli
+    # interni: a 32 nessun candidato riceve meno campioni dell'allocazione
+    # uniforme storica, al costo del ~3% di raggi in più.
+    spec_cone_samples_floor: int = 32
     # Texel per lancio OptiX: tile grandi = meno overhead di launch/sync e batch
     # NeRF più grandi (query_radiance spezza comunque in cfg.chunk). ~40 MB VRAM.
+    # Da ridurre se si alza il budget: la RAM per tile scala con tile × raggi/texel.
     spec_cone_tile_size: int = 8192
     spec_cone_cameras: list[int] | None = None  # indici frame da processare (None = tutti)
     spec_cone_format: ImageFormat = ImageFormat.OPENEXR
@@ -1017,6 +1140,287 @@ def _precompute_indirect_irradiance(
     print(f"✓ irradiance_indirect salvato: {indirect_path}")
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Set Fibonacci condiviso — ricostruzione lato host delle direzioni del kernel
+#
+# Queste funzioni replicano BIT PER BIT sharedDirection()/buildONB()/
+# rotationFromIndex() di deviceProgramsHemiVis.cu: il kernel restituisce solo i
+# t_hit, indicizzati per posizione, quindi una divergenza appaierebbe ogni t_hit
+# alla direzione sbagliata senza alcun sintomo visibile se non una L_j errata.
+# La parità è verificata da test_hemivis_shared.py.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_HEMIVIS_INV_GOLDEN = 0.6180339887498948482   # 1/φ = (√5 − 1)/2
+_HEMIVIS_TWO_PI     = 6.283185307179586477
+
+
+def _hemivis_rotation(global_idx: np.ndarray) -> np.ndarray:
+    """Rotazione azimutale in [0, 1) per texel (hash lowbias32 di global_idx).
+
+    Decorrela il pattern QMC tra texel vicini: senza, tutti i texel userebbero le
+    stesse direzioni a meno della ONB e il rumore si allineerebbe in bande.
+    """
+    with np.errstate(over="ignore"):          # l'overflow uint32 È la semantica voluta
+        x = np.asarray(global_idx, dtype=np.uint32)
+        x = x ^ (x >> np.uint32(16))
+        x = x * np.uint32(0x7feb352d)
+        x = x ^ (x >> np.uint32(15))
+        x = x * np.uint32(0x846ca68b)
+        x = x ^ (x >> np.uint32(16))
+    return (x >> np.uint32(8)).astype(np.float64) * (1.0 / 16777216.0)
+
+
+def _hemivis_onb(n):
+    """ONB branchless di Frisvad 2012 attorno a n (torch, (..., 3) float32)."""
+    import torch
+    nz  = n[..., 2]
+    sgn = torch.copysign(torch.ones_like(nz), nz)
+    a   = -1.0 / (sgn + nz)
+    b   = n[..., 0] * n[..., 1] * a
+    T = torch.stack([1.0 + sgn * n[..., 0] * n[..., 0] * a, sgn * b, -sgn * n[..., 0]], dim=-1)
+    B = torch.stack([b, sgn + n[..., 1] * n[..., 1] * a, -n[..., 1]], dim=-1)
+    return T, B
+
+
+def _hemivis_directions(normals, global_idx: np.ndarray, num_samples: int):
+    """Direzioni condivise (n_texel, S, 3) float32 attorno alle normali date.
+
+    Uniformi in angolo solido sull'emisfero sopra n: cosθ_s = 1 − (s + 0.5)/S,
+    azimut sulla sequenza aurea con rotazione per texel. L'aritmetica dell'azimut
+    è in float64 e ridotta in [0, 2π) PRIMA della trigonometria, come nel kernel:
+    in float32 s·goldenAngle arriva a ~4·10⁴ rad, dove un ULP vale già 0.23°.
+    """
+    import torch
+    device = normals.device
+    S = int(num_samples)
+
+    n = normals / torch.clamp(torch.linalg.norm(normals, dim=-1, keepdim=True), min=1e-8)
+    T, B = _hemivis_onb(n)
+
+    s    = torch.arange(S, device=device, dtype=torch.float64)
+    cosT = (1.0 - (s + 0.5) / S).to(torch.float32)                    # (S,)
+    sinT = torch.sqrt(torch.clamp(1.0 - cosT * cosT, min=0.0))
+
+    rot = torch.as_tensor(_hemivis_rotation(global_idx),
+                          device=device, dtype=torch.float64)          # (n_texel,)
+    x   = s[None, :] * _HEMIVIS_INV_GOLDEN + rot[:, None]
+    x   = x - torch.floor(x)
+    phi = (x * _HEMIVIS_TWO_PI).to(torch.float32)                      # (n_texel, S)
+
+    return (T[:, None, :] * (sinT * torch.cos(phi))[..., None]
+            + B[:, None, :] * (sinT * torch.sin(phi))[..., None]
+            + n[:, None, :] * cosT[None, :, None])
+
+
+def _sample_envmap_torch(dirs, envmap, sky_size, yaw_offset_u: float):
+    """Lookup equirettangolare (torch), identico a sampleEnvmap() dei kernel CUDA.
+
+    Mondo Z-up, Y-forward (Blender): zenith = +Z, u = 0.5 − atan2(dy,dx)/2π.
+    envmap: (H*W, 3) float32 sul device; sky_size = [W, H].
+    """
+    import torch
+    w, h = int(sky_size[0]), int(sky_size[1])
+    dz = torch.clamp(dirs[..., 2], -1.0, 1.0)
+
+    u = 0.5 - torch.atan2(dirs[..., 1], dirs[..., 0]) * (1.0 / (2.0 * np.pi)) + yaw_offset_u
+    u = u - torch.floor(u)
+    v = 0.5 - torch.asin(dz) * (1.0 / np.pi)
+
+    px = torch.clamp((u * w).to(torch.int64), 0, w - 1)   # (int) tronca, u ≥ 0 ⇒ floor
+    py = torch.clamp((v * h).to(torch.int64), 0, h - 1)
+    return envmap[py * w + px]
+
+
+def spec_cone_shared_ring_samples(apertures_deg, num_samples: int) -> list[float]:
+    """Conteggi NOMINALI per anello del bake condiviso: N_i = S·Ω_i/(2π).
+
+    Con campionamento uniforme in angolo solido il numero atteso di campioni in un
+    anello è proporzionale al suo angolo solido, quindi i pesi del solver
+    W_i = Ω_i/N_i = 2π/S diventano costanti e `ring_weights_mean` collassa sulla
+    media cumulativa semplice L(k) = Σ_{i≤k} somma_i / Σ_{i≤k} conteggio_i.
+    Scrivere questi valori nel meta è ciò che rende il solver invariato.
+    """
+    c = np.cos(np.radians(np.asarray(apertures_deg, dtype=np.float64)) * 0.5)
+    return [float(num_samples) * float(c[i] - c[i + 1]) for i in range(c.size - 1)]
+
+
+def ring_weights_mean(cos_edges, k: int,
+                      ring_samples: "np.ndarray | None" = None) -> np.ndarray:
+    """Pesi ad angolo solido del cono troncato all'anello k (media pura):
+    W_i = Ω_i/N_i con Ω_i = 2π(c_{i-1} − c_i) per i ≤ k, 0 oltre, con
+    c = clip(cos b, 0, 1) e N_i = raggi lanciati sull'anello i.
+    La normalizzazione per Σ_i W_i·valid_i avviene per-texel al momento
+    dell'accumulo (i raggi sotto l'orizzonte escono da numeratore e denominatore).
+
+    ring_samples=None (o uniforme) riproduce ESATTAMENTE il comportamento
+    storico: con N costante il fattore 1/N si semplifica in num/den, e saltare
+    la divisione evita anche il suo errore di arrotondamento.
+
+    Vive qui e non in pbr_solver perché è matematica del bake: da quando
+    spec_cone scrive direttamente i coni, il solver non pesa più nulla. I test
+    del kernel la importano da questo modulo.
+    """
+    c = np.clip(np.asarray(cos_edges, dtype=np.float64), 0.0, 1.0)
+    w = 2.0 * np.pi * (c[:-1] - c[1:])
+    if ring_samples is not None:
+        n = np.asarray(ring_samples, dtype=np.float64)
+        if n.shape != w.shape:
+            raise ValueError(f"ring_samples: attesi {w.size} valori "
+                             f"(un anello ciascuno), ricevuti {n.size}")
+        if n.min() <= 0.0:
+            raise ValueError("ring_samples: ogni anello richiede N_i > 0")
+        if n.max() != n.min():      # uniforme → fattore globale, no-op esatto
+            w = w / n
+    w[k:] = 0.0
+    return w
+
+
+def spec_cone_ring_samples(apertures_deg, samples_per_ring, alloc="uniform",
+                           budget=None, floor=32) -> list[int]:
+    """Campioni da LANCIARE sugli anelli 1..K-1 (il livello 0 = raggio specchio
+    è sempre un raggio solo, quindi non compare qui).
+
+    Se samples_per_ring è una sequenza viene usata così com'è e `alloc` è
+    ignorato. Altrimenti l'allocazione è derivata dagli angoli solidi degli
+    anelli, Ω_i = 2π(c_{i-1} − c_i) con c = cos(apertura/2):
+      "uniform"     → N_i = samples_per_ring per ogni anello
+      "solid_angle" → N_i ∝ Ω_i, normalizzato al budget e con clamp al floor,
+                      così ogni raggio copre all'incirca lo stesso angolo solido.
+    """
+    ap = np.asarray(apertures_deg, dtype=np.float64)
+    n_rings = ap.size - 1
+    if n_rings < 1:
+        raise ValueError("spec_cone_apertures_deg richiede almeno 2 valori")
+
+    if not isinstance(samples_per_ring, (int, np.integer)):
+        n = [int(x) for x in samples_per_ring]
+        if len(n) != n_rings:
+            raise ValueError(f"spec_cone_samples_per_ring: {len(n)} valori, "
+                             f"attesi {n_rings} (aperture - 1)")
+        if min(n) < 1:
+            raise ValueError("spec_cone_samples_per_ring: ogni anello richiede "
+                             "almeno 1 campione")
+        return n
+
+    m = int(samples_per_ring)
+    if m < 1:
+        raise ValueError("spec_cone_samples_per_ring deve essere >= 1")
+    if alloc == "uniform":
+        return [m] * n_rings
+    if alloc != "solid_angle":
+        raise ValueError(f"spec_cone_sample_alloc sconosciuto: {alloc!r} "
+                         "(attesi 'uniform' o 'solid_angle')")
+
+    c = np.cos(np.radians(ap) * 0.5)
+    omega = 2.0 * np.pi * (c[:-1] - c[1:])
+    total = int(budget) if budget is not None else m * n_rings
+    n = np.rint(total * omega / omega.sum())
+    return [int(max(x, floor)) for x in n]
+
+
+def spec_cone_level_name(apertures_deg, k: int) -> str:
+    """Nome del livello k: l'APERTURA, non l'indice.
+
+    È il nome che si legge nel viewer (tev raggruppa i canali per prefisso e
+    mostra un layer per livello), quindi ci va il dato che serve: `cone_045deg`
+    e non `cone06`. Vincoli che spiegano la forma esatta:
+
+    - niente punti: nei nomi dei canali EXR il punto separa layer e canale, e
+      `cone_007.5deg.R` verrebbe letto come layer `cone_007`, sublayer `5deg`.
+      I gradi frazionari usano quindi `p` come separatore decimale;
+    - parte intera a 3 cifre con zero-padding, così l'ordine alfabetico dei
+      layer coincide con quello angolare (senza padding `cone_5deg` finirebbe
+      dopo `cone_180deg`);
+    - il livello 0 è il raggio specchio, una direzione delta e non
+      un'integrazione su un cono: si chiama per quello che è.
+    """
+    if k == 0:
+        return "cone_000_mirror"
+    a = float(apertures_deg[k])
+    if a == int(a):
+        return f"cone_{int(a):03d}deg"
+    frac = f"{a - int(a):.4f}".split(".")[1].rstrip("0")
+    return f"cone_{int(a):03d}p{frac}deg"
+
+
+def spec_cone_channels(apertures_deg) -> "dict[str, type]":
+    """Canali dell'EXR dei coni di una camera: L_j(r) per candidato + validità.
+
+    Un solo file per camera e non uno per apertura: nel bake condiviso il loop
+    esterno è sul tile, quindi i writer di tutte le camere restano aperti
+    contemporaneamente e K+1 file per camera farebbero 840 handle, oltre il
+    limite stdio di MSVC (512). I nomi dei livelli vengono da
+    spec_cone_level_name, così scrittura e lettura non possono divergere.
+
+    `valid` è il numero totale di raggi validi del texel (quelli sopra
+    l'orizzonte, su tutti i livelli): >0 è la stessa maschera per-camera che il
+    bake per anelli scriveva in valid.png.
+    """
+    ch: "dict[str, type]" = {}
+    for k in range(len(apertures_deg)):
+        name = spec_cone_level_name(apertures_deg, k)
+        for c in "RGB":
+            ch[f"{name}.{c}"] = np.float16   # radianza: half basta e dimezza il file
+    ch["valid"] = np.float32
+    return ch
+
+
+# L_j(r) per ogni candidato, dalle somme e dai conteggi grezzi per anello:
+#     candidato 0 = raggio specchio (livello 0 puro)
+#     candidato k = media pura ad angolo solido sul cono troncato all'anello k,
+#                   L_k = Σ_{i≤k} W_i·somma_i / Σ_{i≤k} W_i·conteggio_i
+# Numeratore e denominatore sono cumulativi negli anelli, quindi tutti i
+# candidati escono da una sola cumsum. `weights` sono i W_i = Ω_i/N_i NON
+# troncati (ring_weights_mean con k = K-1): il troncamento lo fa la cumsum.
+# Si parte dalle somme e non dalle medie per anello perché il vecchio percorso
+# (bake → medie in half su disco → solver che ri-mediava) quantizzava un
+# passaggio intermedio che qui non esiste.
+
+def _cones_from_rings_np(ring_sum: np.ndarray, ring_valid: np.ndarray,
+                         weights: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """(N, K, 3), (N, K), (K-1,) → (N, K, 3). Vedi il commento sopra."""
+    num = np.cumsum(ring_sum[:, 1:] * weights[None, :, None], axis=1)
+    den = np.cumsum(ring_valid[:, 1:] * weights[None, :], axis=1)
+    mirror = ring_sum[:, :1] / np.maximum(ring_valid[:, :1, None], 1.0)
+    return np.concatenate([mirror, num / np.maximum(den, eps)[..., None]], axis=1)
+
+
+def _cones_from_rings_torch(ring_sum, ring_valid, weights, eps: float = 1e-12):
+    """(…, K, 3), (…, K), (K-1,) → (…, K, 3), tutto su device. Vedi sopra."""
+    import torch
+    num = torch.cumsum(ring_sum[..., 1:, :] * weights[:, None], dim=-2)
+    den = torch.cumsum(ring_valid[..., 1:] * weights, dim=-1)
+    mirror = ring_sum[..., :1, :] / torch.clamp(ring_valid[..., :1, None], min=1.0)
+    return torch.cat([mirror, num / torch.clamp(den, min=eps)[..., None]], dim=-2)
+
+
+def _tile_bar(total: int, desc: str):
+    """Barra di avanzamento per i loop sui tile dei bake spec_cone.
+
+    Un bake dura ore e i print periodici non dicono né quanto è passato né
+    quanto manca; tqdm dà ETA e percentuale in un solo posto. L'output passa dal
+    _Tee di _console_to_file, quindi console.log raccoglie anche i frame
+    intermedi: mininterval li tiene a uno ogni due secondi.
+    """
+    from tqdm import tqdm
+    return tqdm(total=total, unit="tile", desc=desc, mininterval=2.0,
+                dynamic_ncols=True, smoothing=0.05)
+
+
+def _tile_bar_step(bar, rays_per_tile: int, n: int = 1) -> None:
+    """Avanza la barra di n tile aggiornando il throughput.
+
+    Il throughput è in raggi/s e non in tile/s: un tile vale tile_size × S raggi
+    nello schema condiviso e tile_size × (1 + Σ N_i) in quello per-camera, quindi
+    i tile/s non sono confrontabili tra configurazioni mentre i raggi/s sì.
+    """
+    bar.update(n)
+    elapsed = bar.format_dict["elapsed"]
+    if elapsed > 0:
+        bar.set_postfix_str(f"{rays_per_tile * bar.n / elapsed / 1e6:.1f} Mraggi/s",
+                            refresh=False)
+
+
 def _precompute_spec_cone(
     cfg: RenderConfig,
     ium_res,            # IUM_Generator.Result
@@ -1034,15 +1438,15 @@ def _precompute_spec_cone(
 
     Campionamento ad anelli concentrici attorno al raggio riflesso
     R_j = reflect(v_j, n) (deviceProgramsSpecCone.cu): ogni raggio è tracciato e
-    interrogato sul NeRF una volta sola. Il bake salva le MEDIE PER-ANELLO
-    (livello 0 = raggio specchio puro) e i conteggi validi; la ricostruzione
-    della media pura sul cono avviene nel solver (pbr_solver.py) come media
-    pesata ad angolo solido degli anelli. Miss → envmap (su GPU), hit → NeRF.
+    interrogato sul NeRF una volta sola. Gli anelli restano il modo in cui si
+    accumula, ma il bake CHIUDE i coni prima di scrivere: su disco va la media
+    pura ad angolo solido L_j(r) di ogni candidato (livello 0 = raggio specchio),
+    cioè esattamente la grandezza che il solver mette in regressione.
+    Miss → envmap (su GPU), hit → NeRF.
 
-    Output in out_dir per camera: cam_{j:03d}_ring{k:02d}.exr (K medie),
-    cam_{j:03d}_counts.exr ((H, W, K) valid_count per livello),
-    cam_{j:03d}_valid.png (texel con almeno un campione) e
-    spec_cone_meta.json (format "rings").
+    Output in out_dir: cam_{j:03d}.exr con un canale RGB per livello, chiamato
+    con la sua apertura (cone_000_mirror, cone_005deg, …), più valid, e
+    spec_cone_meta.json (format "cones", scheme "per_camera").
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
@@ -1060,11 +1464,25 @@ def _precompute_spec_cone(
 
     apertures = [float(a) for a in cfg.spec_cone_apertures_deg]
     K = len(apertures)                  # livelli: 0 = specchio, 1..K-1 = coni
-    M = cfg.spec_cone_samples_per_ring
+
+    ring_samples = spec_cone_ring_samples(
+        apertures, cfg.spec_cone_samples_per_ring,
+        alloc=cfg.spec_cone_sample_alloc,
+        budget=cfg.spec_cone_samples_budget,
+        floor=cfg.spec_cone_samples_floor)
+    rays_per_texel = 1 + sum(ring_samples)
+    rays_per_tile  = rays_per_texel * cfg.spec_cone_tile_size
+    print(f"    campioni/anello {ring_samples} → {rays_per_texel} raggi/texel, "
+          f"{rays_per_tile:,} raggi/tile "
+          f"(~{rays_per_tile * 24 / 2**20:.0f} MB device, "
+          f"~{rays_per_tile * 84 / 2**20:.0f} MB RAM)")
+    if rays_per_tile > 4_000_000:
+        suggested = max(256, (4_000_000 // rays_per_texel) // 256 * 256)
+        print(f"    ⚠  raggi/tile elevato: valutare spec_cone_tile_size={suggested}")
 
     gen = optix.SpecConeGenerator()
     gen.set_traversable(model)
-    gen.set_inputs(ium_res, apertures, M, cfg.spec_cone_tile_size)
+    gen.set_inputs(ium_res, apertures, ring_samples, cfg.spec_cone_tile_size)
     if skybox_flat is not None:
         gen.set_envmap(skybox_flat.astype(np.float32), sky_size,
                        cfg.skybox_yaw_degrees)
@@ -1087,17 +1505,55 @@ def _precompute_spec_cone(
                    else list(range(len(frames))))
 
     os.makedirs(out_dir, exist_ok=True)
-    fmt = cfg.spec_cone_format
+    # I coni sono HDR multicanale e vengono scritti con IncrementalExrWriter:
+    # spec_cone_format resta solo come estensione dichiarata nel meta.
+    fmt = ImageFormat.OPENEXR
+
+    # Le camere già su disco vengono saltate, ma il meta è riscritto sempre:
+    # con un campionamento diverso si otterrebbero EXR vecchi descritti da
+    # ring_samples nuovi, cioè coni normalizzati per N diversi da quelli con cui
+    # sono stati chiusi, senza alcun segnale. Meglio fermarsi.
+    meta_path = out_dir / "spec_cone_meta.json"
+    if meta_path.exists():
+        with open(meta_path, encoding="utf-8") as fh:
+            old_meta = json.load(fh)
+        old_rs = old_meta.get("ring_samples")
+        old_ap = old_meta.get("apertures_deg")
+        if (old_meta.get("format") != "cones" or old_ap != apertures
+                or (old_rs is not None and list(old_rs) != ring_samples)):
+            raise RuntimeError(
+                f"spec_cone: {out_dir} contiene un bake incompatibile\n"
+                f"    su disco:  format={old_meta.get('format')}, "
+                f"aperture={old_ap}, ring_samples={old_rs}\n"
+                f"    richiesto: format=cones, aperture={apertures}, "
+                f"ring_samples={ring_samples}\n"
+                f"  Cancellare la cartella spec_cone/ oppure ripristinare la "
+                f"configurazione precedente. I bake in formato 'rings'/"
+                f"'rings_shared' (medie per anello) non sono più leggibili: da "
+                f"quando il bake scrive direttamente i coni il solver non li "
+                f"ricostruisce più, vanno rifatti.")
+
+    def _cam_path(j: int) -> Path:
+        return out_dir / f"cam_{j:03d}{fmt.extension}"
+
+    # Pesi Ω_i/N_i non troncati: il troncamento a ogni candidato lo fa la cumsum
+    # dentro _cones_from_rings_np. Qui gli N_i sono quelli davvero lanciati e in
+    # generale non uniformi, quindi il fattore 1/N_i conta.
+    cone_w = ring_weights_mean(cos_b, K - 1, np.asarray(ring_samples, dtype=np.float64))
+
+    # Una sola barra su camere × tile: una barra per camera si riaprirebbe 60
+    # volte senza mai dare un ETA sull'intero bake. Le camere già su disco
+    # restano fuori dal totale, altrimenti l'ETA iniziale conterebbe lavoro che
+    # non verrà mai fatto.
+    pending = [j for j in cam_indices if not _cam_path(j).exists()]
+    bar = _tile_bar(len(pending) * n_tiles, "spec_cone")
 
     for j in cam_indices:
-        ring_paths = [out_dir / f"cam_{j:03d}_ring{k:02d}{fmt.extension}"
-                      for k in range(K)]
-        counts_path = out_dir / f"cam_{j:03d}_counts{fmt.extension}"
-        valid_path  = out_dir / f"cam_{j:03d}_valid.png"
-        if (all(p.exists() for p in ring_paths) and counts_path.exists()
-                and valid_path.exists()):
+        cam_path = _cam_path(j)
+        if j not in pending:
             print(f"    cam {j}: già su disco, skip")
             continue
+        bar.set_description(f"spec_cone cam {j}", refresh=False)
 
         m = frames[j].transform_matrix
         cam_pos = [float(m[0][3]), float(m[1][3]), float(m[2][3])]
@@ -1108,6 +1564,12 @@ def _precompute_spec_cone(
 
         for tile_idx in range(n_tiles):
             tile_res = gen.render_tile(tile_idx)
+            if tile_res.overflow:
+                raise RuntimeError(
+                    f"spec_cone cam {j} tile {tile_idx}: overflow del buffer "
+                    f"compatto ({tile_res.requested} raggi richiesti). La "
+                    f"capacità è il worst case esatto, quindi il bake sarebbe "
+                    f"incompleto: interrotto invece di salvare medie parziali.")
             off = tile_idx * tile_sz
             tt  = tile_res.tile_texels
             ring_sum[off:off + tt] += tile_res.sky_sum_np.astype(np.float64)
@@ -1134,44 +1596,395 @@ def _precompute_spec_cone(
                     tile_acc[:, c] += np.bincount(flat_idx, weights=colors[:, c],
                                                   minlength=n_bins)
 
-            if (tile_idx + 1) % max(1, n_tiles // 10) == 0:
-                print(f"    cam {j}: tile {tile_idx + 1}/{n_tiles}, "
-                      f"raggi hit: {tile_res.count}")
+            _tile_bar_step(bar, rays_per_tile)
 
-        # Medie per-anello (livello 0 = raggio specchio); 0 dove nessun campione
-        means = np.zeros((num_pix, K, 3), dtype=np.float32)
-        has = valid > 0
-        means[has] = (ring_sum[has] / valid[has][:, None]).astype(np.float32)
+        # Chiusura dei coni: L_j(r) per candidato, 0 dove nessun campione
+        valid_f = valid.astype(np.float64)
+        cones = _cones_from_rings_np(ring_sum, valid_f, cone_w).astype(np.float32)
+        n_valid = valid_f.sum(axis=1)
+        cones[n_valid <= 0] = 0.0
 
-        cam_valid = has.any(axis=1).astype(np.uint8)
+        with IncrementalExrWriter(cam_path.resolve().as_posix(), ium_w, ium_h,
+                                  spec_cone_channels(apertures)) as wr:
+            block = {}
+            for k in range(K):
+                name = spec_cone_level_name(apertures, k)
+                for ci, c in enumerate("RGB"):
+                    block[f"{name}.{c}"] = _reshape_flat(cones[:, k, ci],
+                                                         ium_w, ium_h)
+            block["valid"] = _reshape_flat(n_valid.astype(np.float32), ium_w, ium_h)
+            wr.write_block(block)
+        print(f"    ✓ cam {j}: {K} coni salvati in {cam_path.name}")
 
-        for k in range(K):
-            _save_layer(_reshape_flat(means[:, k], ium_w, ium_h),
-                        ring_paths[k].resolve().as_posix(), fmt,
-                        DataLayer.SPEC_CONE)
-        _save_layer(_reshape_flat(valid.astype(np.float32), ium_w, ium_h),
-                    counts_path.resolve().as_posix(), fmt,
-                    DataLayer.SPEC_CONE)
-        _save_layer(_reshape_flat(cam_valid, ium_w, ium_h),
-                    valid_path.resolve().as_posix(), ImageFormat.PNG,
-                    DataLayer.MASK)
-        print(f"    ✓ cam {j}: {K} anelli + counts salvati")
+    bar.close()
 
     meta = {
-        "format": "rings",
+        "format": "cones",
+        "scheme": "per_camera",
         "apertures_deg": apertures,
         "ring_edges_cos": [float(c) for c in cos_b],
-        "samples_per_ring": M,
+        # samples_per_ring resta uno scalare informativo per i lettori storici;
+        # ring_samples sono gli N_i con cui il bake ha pesato gli anelli (Ω_i/N_i)
+        # nel chiudere i coni: documentazione del bake, non un input del solver.
+        "samples_per_ring": int(ring_samples[0]) if len(set(ring_samples)) == 1
+                            else int(max(ring_samples)),
+        "ring_samples": [int(x) for x in ring_samples],
+        "samples_total_per_texel": int(rays_per_texel),
+        "sample_alloc": cfg.spec_cone_sample_alloc,
         "cameras": [int(j) for j in cam_indices],
         "num_levels": K,
-        "ring_file_pattern": "cam_{cam:03d}_ring{level:02d}" + fmt.extension,
-        "counts_file_pattern": "cam_{cam:03d}_counts" + fmt.extension,
-        "valid_file_pattern": "cam_{cam:03d}_valid.png",
+        "cam_file_pattern": "cam_{cam:03d}" + fmt.extension,
         "skybox_yaw_degrees": cfg.skybox_yaw_degrees,
     }
     with open(out_dir / "spec_cone_meta.json", "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2)
     print(f"✓ spec_cone meta salvato: {out_dir / 'spec_cone_meta.json'}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bake spec_cone a campionamento CONDIVISO tra camere
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _precompute_spec_cone_shared(
+    cfg: RenderConfig,
+    ium_res,            # IUM_Generator.Result
+    model,              # OptixProgrammablePasses.TriangleMesh
+    ium_w: int,
+    ium_h: int,
+    frames,             # tf.frames (per le posizioni camera)
+    visibility_map: np.ndarray,   # flat (num_pix * n_cams) uint8
+    n_cams: int,
+    skybox_flat: "np.ndarray | None",
+    sky_size: list[int],
+    out_dir: Path,
+) -> None:
+    """Variante di _precompute_spec_cone con i raggi condivisi tra tutte le camere.
+
+    La radianza incidente lungo una direzione non dipende dalla camera, quindi un
+    unico set Fibonacci per texel (uniforme in angolo solido sull'emisfero sopra n)
+    serve tutte le camere che vedono quel texel: ogni raggio è tracciato e
+    interrogato sul NeRF UNA volta, e ogni camera lo classifica nel proprio anello
+    in base all'angolo con il suo R_j. Costo per texel `S + m` invece di `m · Σ N_i`
+    (m = camere che vedono il texel).
+
+    Il livello 0 (specchio) resta per-camera: è una direzione delta, non
+    condivisibile, e si ottiene dalla seconda passata del kernel.
+
+    Uscite in out_dir: cam_{j:03d}.exr con un canale RGB per livello, chiamato
+    con la sua apertura (cone_000_mirror, cone_005deg, …), che contiene la
+    radianza media sul cono, cioè direttamente la L_j(r) che il solver mette in
+    regressione, più valid (raggi validi totali del texel); scritti in streaming
+    per blocchi di scanline, e spec_cone_meta.json con format "cones".
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from nerf import load_checkpoint, query_radiance
+    import OptixProgrammablePasses as optix
+    import torch
+
+    cache_path = _resolve_nerf_ckpt_path(cfg)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_bundle, nerf_cfg = load_checkpoint(cache_path, device)
+    if cfg.indirect_override_depth_window:
+        nerf_cfg.depth_window     = cfg.indirect_depth_window
+        nerf_cfg.depth_window_end = cfg.indirect_depth_window_end
+    if cfg.spec_cone_nerf_chunk:
+        nerf_cfg.chunk = int(cfg.spec_cone_nerf_chunk)
+    print(f"✓ NeRF model caricato da: {cache_path} (query chunk {nerf_cfg.chunk})")
+
+    apertures = [float(a) for a in cfg.spec_cone_apertures_deg]
+    K = len(apertures)                       # livelli: 0 = specchio, 1..K-1 = anelli
+    S = int(cfg.spec_cone_shared_samples)
+    cos_b = np.cos(np.radians(np.asarray(apertures)) * 0.5)
+    ring_nominal = spec_cone_shared_ring_samples(apertures, S)
+
+    num_pix  = ium_w * ium_h
+    tile_sz  = int(cfg.spec_cone_tile_size)
+    if tile_sz % ium_w != 0:
+        raise ValueError(
+            f"spec_cone_tile_size={tile_sz} deve essere multiplo della larghezza IUM "
+            f"({ium_w}): il bake condiviso scrive gli EXR in streaming e ogni tile "
+            f"deve coprire un numero intero di scanline.")
+    chunk_texels = max(1, int(cfg.spec_cone_chunk_texels))
+
+    vis2d = np.asarray(visibility_map, dtype=np.uint8).reshape(num_pix, n_cams)
+    cam_indices = (list(cfg.spec_cone_cameras) if cfg.spec_cone_cameras
+                   else list(range(len(frames))))
+    n_sel = len(cam_indices)
+
+    # ── Diagnostica m: quante camere vedono in media un texel ────────────────
+    # È il numero che decide il costo relativo al bake per-camera: quello spende
+    # m·Σ N_i raggi per texel, questo S + m.
+    ium_mask = np.asarray(ium_res.masks_np).reshape(num_pix) > 0
+    if ium_mask.any():
+        m_per_texel = vis2d[np.ix_(ium_mask, cam_indices)].sum(axis=1)
+        m_mean = float(m_per_texel.mean())
+        print(f"    m (camere per texel): media {m_mean:.1f}, mediana "
+              f"{np.median(m_per_texel):.0f}, p10 {np.percentile(m_per_texel, 10):.0f}, "
+              f"p90 {np.percentile(m_per_texel, 90):.0f}")
+        try:
+            # confronto informativo col bake per-camera; i suoi parametri possono
+            # essere incoerenti con questa griglia (non sono usati da questo schema),
+            # e una diagnostica non deve far fallire il bake
+            per_cam_rays = 1 + sum(spec_cone_ring_samples(
+                apertures, cfg.spec_cone_samples_per_ring,
+                alloc=cfg.spec_cone_sample_alloc,
+                budget=cfg.spec_cone_samples_budget,
+                floor=cfg.spec_cone_samples_floor))
+            print(f"    costo atteso vs per-camera: {m_mean * per_cam_rays:.0f} → "
+                  f"{S + m_mean:.0f} raggi/texel "
+                  f"({m_mean * per_cam_rays / max(S + m_mean, 1.0):.2f}×)")
+        except ValueError:
+            print(f"    costo atteso: {S + m_mean:.0f} raggi/texel")
+
+    # Campioni attesi per candidato: dice quali aperture sono al limite del rumore
+    cum = [f"{apertures[k]:g}°:{S * (1.0 - cos_b[k]):.0f}" for k in range(1, K)]
+    print(f"    S={S} raggi/texel condivisi, campioni per candidato → {', '.join(cum)}")
+
+    # ── Guardia sul ri-bake incoerente ───────────────────────────────────────
+    # Come nel bake per-camera: il meta viene riscritto sempre, quindi un bake su
+    # disco con parametri diversi risulterebbe descritto da un meta nuovo e il
+    # solver normalizzerebbe per N sbagliati senza alcun segnale.
+    meta_path = out_dir / "spec_cone_meta.json"
+    cam_paths = {j: out_dir / f"cam_{j:03d}{ImageFormat.OPENEXR.extension}"
+                 for j in cam_indices}
+    if meta_path.exists():
+        with open(meta_path, encoding="utf-8") as fh:
+            old_meta = json.load(fh)
+        same = (old_meta.get("format") == "cones"
+                and old_meta.get("scheme") == "shared"
+                and old_meta.get("apertures_deg") == apertures
+                and old_meta.get("shared_samples") == S)
+        if not same:
+            raise RuntimeError(
+                f"spec_cone: {out_dir} contiene un bake incompatibile\n"
+                f"    su disco:  format={old_meta.get('format')}, "
+                f"scheme={old_meta.get('scheme')}, "
+                f"aperture={old_meta.get('apertures_deg')}, "
+                f"S={old_meta.get('shared_samples')}\n"
+                f"    richiesto: format=cones, scheme=shared, "
+                f"aperture={apertures}, S={S}\n"
+                f"  Cancellare la cartella spec_cone/ oppure ripristinare la "
+                f"configurazione precedente. I bake in formato 'rings'/"
+                f"'rings_shared' (medie per anello) non sono più leggibili: da "
+                f"quando il bake scrive direttamente i coni il solver non li "
+                f"ricostruisce più, vanno rifatti.")
+        if all(p.exists() for p in cam_paths.values()):
+            print(f"    tutte le {n_sel} camere già su disco, skip")
+            return
+
+    # ── Setup OptiX ──────────────────────────────────────────────────────────
+    gen = optix.HemiVisGenerator()
+    gen.set_traversable(model)
+    gen.set_inputs(ium_res, S, tile_sz)
+
+    cam_pos_list = []
+    for j in cam_indices:
+        m = frames[j].transform_matrix
+        cam_pos_list.append([float(m[0][3]), float(m[1][3]), float(m[2][3])])
+    gen.set_cameras(cam_pos_list)
+
+    if gen.num_pixels() != num_pix:
+        raise RuntimeError(f"spec_cone: IUM ha {gen.num_pixels()} texel, attesi "
+                           f"{num_pix} da ium_texture_size {ium_w}×{ium_h}")
+
+    n_tiles = gen.num_tiles()
+    rays_per_tile = tile_sz * S
+    print(f"    tile={tile_sz} texel ({tile_sz // ium_w} scanline), {n_tiles} tile, "
+          f"{rays_per_tile:,} raggi/tile (~{rays_per_tile * 4 / 2**20:.0f} MB t_hit), "
+          f"chunk torch={chunk_texels} texel "
+          f"(~{chunk_texels * S * 24 / 2**20:.0f} MB VRAM per dirs+radianze)")
+
+    if skybox_flat is None:
+        print("    ⚠  spec_cone senza skybox: i raggi miss contribuiscono 0")
+        envmap_t = None
+    else:
+        envmap_t = torch.as_tensor(np.ascontiguousarray(skybox_flat, dtype=np.float32),
+                                   device=device)
+    yaw_u = cfg.skybox_yaw_degrees / 360.0
+
+    pos_all = np.asarray(ium_res.positions_np, dtype=np.float32)
+    nrm_all = np.asarray(ium_res.normals_np,   dtype=np.float32)
+    eps = 1e-4
+
+    cos_edges_t = torch.as_tensor(cos_b, device=device, dtype=torch.float32)
+    asc_edges   = -cos_edges_t                       # crescente, per searchsorted
+    cam_pos_t   = torch.as_tensor(np.asarray(cam_pos_list, dtype=np.float32), device=device)
+    vis_sel     = np.ascontiguousarray(vis2d[:, cam_indices])       # (num_pix, n_sel)
+
+    # Pesi Ω_i/N_i non troncati: il troncamento a ogni candidato lo fa la cumsum
+    # dentro _cones_from_rings_torch. Nel bake condiviso gli N_i nominali rendono
+    # W_i costante, quindi la formula collassa sulla media cumulativa semplice.
+    cone_w_t = torch.as_tensor(
+        ring_weights_mean(cos_b, K - 1, np.asarray(ring_nominal)),
+        device=device, dtype=torch.float32)
+
+    # ── Writer in streaming, uno per camera ──────────────────────────────────
+    os.makedirs(out_dir, exist_ok=True)
+    channels = spec_cone_channels(apertures)
+    level_names = [spec_cone_level_name(apertures, k) for k in range(K)]
+    writers = {j: IncrementalExrWriter(cam_paths[j].resolve().as_posix(),
+                                       ium_w, ium_h, channels)
+               for j in cam_indices}
+
+    bar = _tile_bar(n_tiles, "spec_cone shared")
+    try:
+        for tile_idx in range(n_tiles):
+            tile_res = gen.render_tile(tile_idx)
+            off = tile_idx * tile_sz
+            tt  = tile_res.tile_texels
+            t_hit_tile = tile_res.t_hit_np          # (tt, S)
+            t_mir_tile = tile_res.t_hit_mirror_np   # (tt, n_sel)
+
+            sums   = torch.zeros((n_sel, tt, K, 3), device=device, dtype=torch.float32)
+            counts = torch.zeros((n_sel, tt, K),    device=device, dtype=torch.float32)
+
+            for c0 in range(0, tt, chunk_texels):
+                c1 = min(c0 + chunk_texels, tt)
+                M  = c1 - c0
+                gidx = np.arange(off + c0, off + c1, dtype=np.int64)
+
+                nrm = torch.as_tensor(nrm_all[gidx], device=device)
+                pos = torch.as_tensor(pos_all[gidx], device=device)
+                nlen = torch.linalg.norm(nrm, dim=-1, keepdim=True)
+                texel_ok = (torch.as_tensor(ium_mask[gidx], device=device)
+                            & (nlen[:, 0] > 1e-8))
+                if not bool(texel_ok.any()):
+                    continue
+                n_unit = nrm / torch.clamp(nlen, min=1e-8)
+                origin = pos + n_unit * eps
+
+                dirs = _hemivis_directions(nrm, gidx, S)                  # (M, S, 3)
+                th   = torch.as_tensor(t_hit_tile[c0:c1], device=device)  # (M, S)
+                rad  = _shared_ray_radiance(dirs, th, origin, envmap_t, sky_size,
+                                            yaw_u, model_bundle, nerf_cfg,
+                                            query_radiance)               # (M, S, 3)
+
+                # Raggi specchio: R_j per camera, radianza con la stessa logica
+                v = cam_pos_t[None, :, :] - pos[:, None, :]               # (M, n_sel, 3)
+                v = v / torch.clamp(torch.linalg.norm(v, dim=-1, keepdim=True), min=1e-8)
+                nv = (n_unit[:, None, :] * v).sum(-1, keepdim=True)
+                R  = n_unit[:, None, :] * (2.0 * nv) - v                  # (M, n_sel, 3)
+                thm = torch.as_tensor(t_mir_tile[c0:c1], device=device)   # (M, n_sel)
+                radm = _shared_ray_radiance(R, thm, origin, envmap_t, sky_size,
+                                            yaw_u, model_bundle, nerf_cfg,
+                                            query_radiance)               # (M, n_sel, 3)
+
+                vis_chunk = torch.as_tensor(vis_sel[gidx], device=device) > 0  # (M, n_sel)
+
+                for jj in range(n_sel):
+                    sel_mask = vis_chunk[:, jj] & texel_ok
+                    sel = sel_mask.nonzero(as_tuple=True)[0]
+                    if sel.numel() == 0:
+                        continue
+
+                    # Anelli 1..K-1 dai raggi condivisi. I campioni oltre il cono
+                    # più largo finiscono nel bin K, che viene poi scartato: così
+                    # si evita una gather booleana su M·S elementi.
+                    m_sel  = sel.numel()
+                    cosang = (dirs[sel] * R[sel, jj][:, None, :]).sum(-1)      # (m, S)
+                    # clamp a [1, K]: 0 è il livello specchio (mai raggiungibile
+                    # dai condivisi, ma cosang può sforare 1 per arrotondamento),
+                    # K è il bin di scarto per i campioni fuori dal cono più largo.
+                    ring = torch.searchsorted(asc_edges, -cosang.contiguous(),
+                                              right=True).clamp_(min=1, max=K)
+                    flat = (torch.arange(m_sel, device=device)[:, None] * (K + 1)
+                            + ring).reshape(-1)
+
+                    acc_s = torch.zeros((m_sel * (K + 1), 3), device=device)
+                    acc_c = torch.zeros(m_sel * (K + 1), device=device)
+                    acc_s.index_add_(0, flat, rad[sel].reshape(-1, 3))
+                    acc_c.index_add_(0, flat, torch.ones_like(flat, dtype=torch.float32))
+
+                    tgt = sel + c0
+                    sums[jj].index_add_(0, tgt, acc_s.view(m_sel, K + 1, 3)[:, :K])
+                    counts[jj].index_add_(0, tgt, acc_c.view(m_sel, K + 1)[:, :K])
+
+                    # Livello 0: raggio specchio (t_hit < 0 = camera dietro la superficie)
+                    mir_ok = sel[thm[sel, jj] >= 0.0]
+                    if mir_ok.numel() > 0:
+                        lvl0 = torch.zeros((mir_ok.numel(), K, 3), device=device)
+                        lvl0[:, 0] = radm[mir_ok, jj]
+                        cnt0 = torch.zeros((mir_ok.numel(), K), device=device)
+                        cnt0[:, 0] = 1.0
+                        sums[jj].index_add_(0, mir_ok + c0, lvl0)
+                        counts[jj].index_add_(0, mir_ok + c0, cnt0)
+
+            # ── Scrittura del blocco di scanline, una camera alla volta ──────
+            # I coni si chiudono qui, sulla GPU e dalle somme grezze: su disco va
+            # già L_j(r), la grandezza che il solver mette in regressione.
+            rows_out = tt // ium_w
+            for jj, j in enumerate(cam_indices):
+                cnt = counts[jj]
+                cones = _cones_from_rings_torch(sums[jj], cnt, cone_w_t)
+                cones_np = cones.cpu().numpy().reshape(rows_out, ium_w, K, 3)
+                valid_np = cnt.sum(dim=-1).cpu().numpy().reshape(rows_out, ium_w)
+                block = {}
+                for k in range(K):
+                    for ci, c in enumerate("RGB"):
+                        block[f"{level_names[k]}.{c}"] = cones_np[:, :, k, ci]
+                block["valid"] = valid_np
+                writers[j].write_block(block)
+
+            _tile_bar_step(bar, rays_per_tile)
+
+        bar.close()
+        for wr in writers.values():
+            wr.close()
+    except BaseException:
+        bar.close()
+        # Un EXR troncato ha comunque un header valido: se restasse su disco, un
+        # rerun con lo stesso meta lo scambierebbe per un bake completo e lo
+        # salterebbe. Meglio cancellarlo.
+        for wr in writers.values():
+            wr._file = None
+        for p in cam_paths.values():
+            p.unlink(missing_ok=True)
+        raise
+
+    meta = {
+        "format": "cones",
+        "scheme": "shared",
+        "apertures_deg": apertures,
+        "ring_edges_cos": [float(c) for c in cos_b],
+        "shared_samples": S,
+        # Conteggi NOMINALI N_i = S·Ω_i/2π usati per i pesi W_i = Ω_i/N_i del
+        # bake: qui sono costanti, quindi il cono è la media cumulativa semplice.
+        # Ormai è documentazione del bake, non un input del solver.
+        "ring_samples": ring_nominal,
+        "samples_total_per_texel": int(S + 1),
+        "sample_alloc": "shared_fibonacci",
+        "cameras": [int(j) for j in cam_indices],
+        "num_levels": K,
+        "cam_file_pattern": "cam_{cam:03d}" + ImageFormat.OPENEXR.extension,
+        "skybox_yaw_degrees": cfg.skybox_yaw_degrees,
+    }
+    with open(meta_path, "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, indent=2)
+    print(f"✓ spec_cone meta salvato: {meta_path}")
+
+
+def _shared_ray_radiance(dirs, t_hit, origin, envmap_t, sky_size, yaw_u,
+                         model_bundle, nerf_cfg, query_radiance):
+    """Radianza incidente per raggio: envmap sui miss, NeRF sugli hit.
+
+    dirs (M, R, 3), t_hit (M, R) con >0 hit, =0 miss, <0 raggio non lanciato;
+    origin (M, 3) è l'origine comune ai raggi dello stesso texel.
+    Restituisce (M, R, 3) sul device (zero dove il raggio non è stato lanciato).
+    """
+    import torch
+    rad = torch.zeros(dirs.shape, device=dirs.device, dtype=torch.float32)
+
+    miss = t_hit == 0.0
+    if envmap_t is not None and bool(miss.any()):
+        rad[miss] = _sample_envmap_torch(dirs[miss], envmap_t, sky_size, yaw_u)
+
+    hit = t_hit > 0.0
+    if bool(hit.any()):
+        origins = origin[:, None, :].expand(-1, dirs.shape[1], -1)
+        rad[hit] = query_radiance(model_bundle, origins[hit], dirs[hit], nerf_cfg,
+                                  t_hits_np=t_hit[hit], return_torch=True)
+    return rad
 
 
 def _find_nerf_pred_dir(base_root: Path, iter_sel: int) -> "Path | None":
@@ -2219,12 +3032,26 @@ def _step3_posttrain_assets(
             if skybox_flat_step3 is None and (rc.skybox_path or rc.skybox_source == "nerf"):
                 skybox_flat_step3 = _resolve_skybox_flat(rc, output_json, json_dir, sky_w, sky_h)
             spec_dir = json_dir / "spec_cone"
-            print(f"[Step 3] Precompute Specular Cone L_j(r) "
-                  f"(aperture={rc.spec_cone_apertures_deg}°, "
-                  f"M={rc.spec_cone_samples_per_ring}/anello)…")
-            _precompute_spec_cone(rc, ium_res, model, ium_w, ium_h, tf.frames,
-                                  visibility_map, len(all_cameras),
-                                  skybox_flat_step3, [sky_w, sky_h], spec_dir)
+            if rc.spec_cone_scheme == "shared":
+                print(f"[Step 3] Precompute Specular Cone L_j(r), raggi condivisi "
+                      f"(aperture={rc.spec_cone_apertures_deg}°, "
+                      f"S={rc.spec_cone_shared_samples})…")
+                _precompute_spec_cone_shared(
+                    rc, ium_res, model, ium_w, ium_h, tf.frames,
+                    visibility_map, len(all_cameras),
+                    skybox_flat_step3, [sky_w, sky_h], spec_dir)
+            elif rc.spec_cone_scheme == "per_camera":
+                print(f"[Step 3] Precompute Specular Cone L_j(r) "
+                      f"(aperture={rc.spec_cone_apertures_deg}°, "
+                      f"alloc={rc.spec_cone_sample_alloc}, "
+                      f"budget={rc.spec_cone_samples_budget})…")
+                _precompute_spec_cone(rc, ium_res, model, ium_w, ium_h, tf.frames,
+                                      visibility_map, len(all_cameras),
+                                      skybox_flat_step3, [sky_w, sky_h], spec_dir)
+            else:
+                raise ValueError(
+                    f"spec_cone_scheme sconosciuto: {rc.spec_cone_scheme!r} "
+                    "(attesi 'per_camera' o 'shared')")
             ium_result_data["spec_cone_dir"] = _as_relative_to(
                 spec_dir.resolve().as_posix(), json_dir_str)
             if timer is not None:
@@ -2654,6 +3481,34 @@ if __name__ == "__main__":
             pbr_spec_threshold   = 0.0,        # roughness fittata scritta ovunque
             spec_cone_cameras=None,
 
+            # Raggi condivisi tra le camere: la radianza incidente lungo una
+            # direzione non dipende dalla camera, quindi un solo set Fibonacci per
+            # texel (tracciato e interrogato sul NeRF una volta) serve tutte le m
+            # camere che vedono il texel. A S=16384 il costo pareggia il bake
+            # per-camera quando m≈11: il guadagno è reinvestito in risoluzione,
+            # non in tempo. La griglia di aperture è raffinata nella zona stretta
+            # perché con i raggi condivisi un candidato in più non costa raggi.
+            # Il candidato a 5° riceve ~16 campioni, cioè è al limite del rumore:
+            # se lobe_param/residual lo mostrano instabile, toglierlo dalla griglia.
+            spec_cone_scheme         = "shared",
+            spec_cone_shared_samples = 9216, # 96 x 96 Fibonacci samples per texel (shared)
+
+            spec_cone_apertures_deg  = [0.0, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0,
+                                        60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180.0],
+            # deve essere multiplo della larghezza IUM: ogni tile è un blocco di
+            # scanline intere, scritte in streaming negli EXR per camera
+            spec_cone_tile_size      = 4096,
+            # dirs + radianze costano ~0.6 MB per texel a S=16384: 1024 texel sono
+            # ~0.6 GB di picco. Alzare finché la VRAM regge — sotto-blocchi grandi
+            # riducono l'overhead del loop sulle camere.
+            spec_cone_chunk_texels   = 1024,
+            # il batch della rete è il collo di bottiglia dell'occupazione GPU
+            spec_cone_nerf_chunk     = 4096*24,
+
+            # Usati solo da spec_cone_scheme="per_camera"
+            spec_cone_sample_alloc   = "solid_angle",
+            spec_cone_samples_budget = 1440,
+
             color_texture_grazing_max_deg = 75.0,
 
             # Heatmap diagnostica skybox GT vs NeRF-baked (richiede skybox_path nella SceneConfig)
@@ -2739,7 +3594,7 @@ if __name__ == "__main__":
         # ("softplus_l1",        "softplus", "l1"),
     ]
     DECAYS     = (0.2,)
-    SWEEP_ROOT = "D:/tesi_output/experiments_specular_coscone"
+    SWEEP_ROOT = "D:/tesi_output/experiments_specular_coscone_fit_pbr_2"
 
     for name, act, loss in EXPERIMENTS:
         for decay in DECAYS:

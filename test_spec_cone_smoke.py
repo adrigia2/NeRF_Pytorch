@@ -13,7 +13,12 @@ Verifiche:
   5. la media pura sul cono (ring_weights_mean di pbr_solver.py, normalizzata
      sui campioni validi): su envmap costante ≡ 1 e anelli non tagliati
      dall'orizzonte vale esattamente 1 per ogni apertura, come il livello
-     specchio (unità di radianza omogenee tra tutti i candidati).
+     specchio (unità di radianza omogenee tra tutti i candidati);
+  6. campioni per anello NON uniformi: il kernel lancia davvero N_i raggi per
+     anello, e la ricostruzione con pesi Ω_i/N_i riproduce il riferimento
+     analitico su envmap lineare. Quest'ultimo è l'unico check che smaschera
+     un peso sbagliato: su envmap COSTANTE ogni mean_i vale 1, quindi qualsiasi
+     combinazione convessa dà 1 e i pesi non sono osservabili.
 
 Uso:  python test_spec_cone_smoke.py
 """
@@ -29,9 +34,10 @@ import OptixProgrammablePasses as optix
 REPO = Path(__file__).resolve().parents[1] / "OptixProjectCMake"
 MODEL = REPO / "Scenes" / "SwordShield" / "Models" / "SwordShield.obj"
 
-APERTURES = [0.0, 10.0, 25.0, 50.0, 90.0, 130.0, 180.0]
+APERTURES = [0.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180.0]
 K = len(APERTURES)
-M = 16
+RS_UNIFORM = [16] * (K - 1)                              # campionamento storico
+RS_VAR = [8, 8, 12, 16, 24, 32, 40, 48, 56, 64]          # crescente verso l'esterno
 IUM_RES = 64
 SKY_W, SKY_H = 256, 128
 
@@ -53,10 +59,11 @@ def env_value(d: np.ndarray) -> np.ndarray:
     return 0.5 + 0.5 * d[:, 2]
 
 
-def run_pass(envmap, cam_pos, ium_res_obj, num_pix):
+def run_pass(envmap, cam_pos, ium_res_obj, num_pix, ring_samples=None):
     gen = optix.SpecConeGenerator()
     gen.set_traversable(model)
-    gen.set_inputs(ium_res_obj, APERTURES, M, 1024)
+    gen.set_inputs(ium_res_obj, APERTURES,
+                   RS_UNIFORM if ring_samples is None else ring_samples, 1024)
     gen.set_envmap(envmap, [SKY_W, SKY_H], 0.0)
     gen.set_camera(list(cam_pos), np.empty(0, dtype=np.uint8))  # tutti visibili
 
@@ -103,9 +110,12 @@ cam_pos = center + np.array([0.6, -1.2, 0.9]) / np.linalg.norm([0.6, -1.2, 0.9])
 # ── Test 2: envmap costante ───────────────────────────────────────────────────
 ring_sum, valid, hit_cnt = run_pass(make_envmap("constant"), cam_pos, ium_res, num_pix)
 
-total_expected = 1 + (K - 1) * M
+total_expected = 1 + sum(RS_UNIFORM)
 assert valid[~masks].sum() == 0, "texel mascherati hanno campioni"
-assert valid.max() <= total_expected, "valid_count oltre il numero di campioni"
+assert valid.sum(axis=1).max() <= total_expected, "valid_count oltre i campioni lanciati"
+assert (valid[:, 1:] <= np.asarray(RS_UNIFORM)[None, :]).all(), \
+    "un anello ha più campioni validi di quanti ne siano stati lanciati"
+assert (valid[:, 0] <= 1).all(), "il livello 0 non è un singolo raggio"
 
 sky_only = masks & (hit_cnt.sum(axis=1) == 0) & (valid[:, 0] > 0)
 print(f"[constant] texel solo-cielo: {sky_only.sum()} / {masks.sum()}")
@@ -137,7 +147,7 @@ print(f"[gradient] specchio vs NumPy su {len(L0)} texel: "
 assert err.max() < 0.05, "livello 0 non coincide con envmap(reflect(v,n))"
 
 # ── Ricostruzione a lobi (helper pbr_solver) su medie per-anello ─────────────
-from pbr_solver import ring_weights_mean
+from images_generator import ring_weights_mean
 
 cos_b = np.cos(np.radians(np.asarray(APERTURES)) * 0.5)
 sky_all = masks & (hit_cnt.sum(axis=1) == 0) & (valid > 0).all(axis=1)
@@ -171,33 +181,121 @@ assert spreads[-1] < spreads[0], "il lobo largo dovrebbe mediare (std minore)"
 assert all(spreads[i + 1] <= spreads[i] * 1.05 for i in range(len(spreads) - 1)), \
     "lo smoothing dovrebbe essere ~monotono con l'allargarsi del lobo"
 
-# (c) media pura su envmap costante ≡ 1: ogni cono troncato deve valere
-#     esattamente 1, come il livello specchio (unità di radianza omogenee)
-ring_sum_c, valid_c, hit_cnt_c = run_pass(make_envmap("constant"), cam_pos,
-                                          ium_res, num_pix)
-full = (masks & (hit_cnt_c.sum(axis=1) == 0)
-        & (valid_c[:, 1:] == M).all(axis=1))     # tutti gli anelli interi
-print(f"[lobi] media pura: texel solo-cielo con anelli non tagliati: {full.sum()}")
-means_c = ring_sum_c[full] / np.maximum(valid_c[full][..., None], 1)
-cnts_c  = valid_c[full].astype(np.float64)
+# Profondità di taglio per texel: kmax = ultimo anello NON tagliato dall'orizzonte.
+# L'anello k è integro se ha esattamente gli N_k campioni lanciati. Nota: l'anello
+# più esterno arriva a 90° da R, quindi il suo campione più esterno cade sempre
+# sull'orizzonte e kmax non raggiunge mai K-1: è geometria, non un difetto.
+def cut_depth(valid_arr, rs):
+    uncut = valid_arr[:, 1:] == np.asarray(rs)[None, :]
+    return np.where(uncut.all(axis=1), K - 1, uncut.argmin(axis=1))
 
-def lobe_mean(w):
-    """L = Σ_i W_i·mean_i·valid_i / Σ_i W_i·valid_i sugli anelli 1..K-1
-    (media pesata ad angolo solido, come nel solver)."""
-    wc = w[None, :] * cnts_c[:, 1:]
-    return (np.einsum("nk,nkc->nc", wc, means_c[:, 1:])
+
+def lobe_of(w, means_sel, cnts_sel):
+    """L = Σ_i W_i·mean_i·valid_i / Σ_i W_i·valid_i sugli anelli 1..K-1."""
+    wc = w[None, :] * cnts_sel[:, 1:]
+    return (np.einsum("nk,nkc->nc", wc, means_sel[:, 1:])
             / wc.sum(axis=1)[:, None])
 
-if full.any():
-    err0 = np.abs(means_c[valid_c[full][:, 0] > 0, 0] - 1.0).max() \
-        if (valid_c[full][:, 0] > 0).any() else 0.0
-    print(f"[lobi] specchio su envmap costante: max |L - 1| = {err0:.2e}")
-    assert err0 < 1e-5, "specchio ≠ envmap costante"
-    for k in range(1, K):
-        err = np.abs(lobe_mean(ring_weights_mean(cos_b, k)) - 1.0).max()
-        print(f"[lobi] media pura r={APERTURES[k]:g}°: atteso 1, "
-              f"max err={err:.2e}")
-        assert err < 1e-5, \
-            f"media pura r={APERTURES[k]}° ≠ 1 su envmap costante"
+
+# (c) media pura su envmap costante ≡ 1: ogni cono troncato deve valere
+#     esattamente 1, come il livello specchio (unità di radianza omogenee).
+#     ATTENZIONE: questo NON verifica i pesi — con mean_i ≡ 1 qualsiasi
+#     combinazione convessa dà 1. Verifica solo l'omogeneità delle unità
+#     (media contro integrale). Il check sui pesi è il blocco (d).
+ring_sum_c, valid_c, hit_cnt_c = run_pass(make_envmap("constant"), cam_pos,
+                                          ium_res, num_pix)
+sky_c = masks & (hit_cnt_c.sum(axis=1) == 0) & (valid_c[:, 0] > 0)
+kmax_c = cut_depth(valid_c, RS_UNIFORM)
+means_c = ring_sum_c / np.maximum(valid_c[..., None], 1)
+cnts_c  = valid_c.astype(np.float64)
+
+err0 = np.abs(means_c[sky_c, 0] - 1.0).max()
+print(f"[lobi] specchio su envmap costante: max |L - 1| = {err0:.2e}")
+assert err0 < 1e-5, "specchio ≠ envmap costante"
+
+tested = 0
+for k in range(1, K):
+    sel = sky_c & (kmax_c >= k)
+    if sel.sum() == 0:
+        print(f"[lobi] media pura r={APERTURES[k]:g}°: nessun texel con anelli "
+              f"1..{k} integri, skip")
+        continue
+    err = np.abs(lobe_of(ring_weights_mean(cos_b, k), means_c[sel], cnts_c[sel])
+                 - 1.0).max()
+    print(f"[lobi] media pura r={APERTURES[k]:g}° su {sel.sum()} texel: "
+          f"atteso 1, max err={err:.2e}")
+    assert err < 1e-5, f"media pura r={APERTURES[k]}° ≠ 1 su envmap costante"
+    tested += 1
+assert tested >= 3, "il check sulla media pura ha coperto troppo pochi troncamenti"
+
+# ── (d) Campioni per anello NON uniformi + riferimento analitico ─────────────
+# Su make_envmap("gradient") vale env(d) = 0.5 + 0.5·d_z, LINEARE in d, quindi
+# la media pura sulla calotta di semi-apertura b attorno a R ha forma chiusa:
+#     L(k) = 0.5 + 0.5 · R_z · (1 + cos b_k)/2
+# La ricostruzione discreta la riproduce esattamente: la stratificazione
+# midpoint dà media (c_{i-1}+c_i)/2 per anello e con pesi ∝ (c_{i-1}−c_i) la
+# somma telescopa in (1−c_k²)/2 / (1−c_k) = (1+c_k)/2. Con pesi Ω_i·N_i (cioè
+# senza dividere per i campioni lanciati) la telescopia salta: è questo il
+# check che distingue un peso corretto da uno sbagliato.
+ring_sum_v, valid_v, hit_cnt_v = run_pass(make_envmap("gradient"), cam_pos,
+                                          ium_res, num_pix, RS_VAR)
+
+rs_v = np.asarray(RS_VAR)
+assert (valid_v[:, 1:] <= rs_v[None, :]).all(), \
+    "valid_count oltre i campioni lanciati con N variabile"
+reached = valid_v[:, 1:].max(axis=0)
+print(f"[var] N_i richiesti      : {RS_VAR}")
+print(f"[var] max valid raggiunto: {reached.tolist()}")
+assert (reached[:-1] == rs_v[:-1]).all(), \
+    "un anello interno non raggiunge N_i: il kernel non legge ring_samples[i]"
+
+# R = reflect(v, n) per tutti i texel, per il riferimento analitico
+n_len_all = np.linalg.norm(nrm, axis=1)
+ok_all = masks & (n_len_all > 1e-8)
+n_hat_all = np.zeros_like(nrm)
+n_hat_all[ok_all] = nrm[ok_all] / n_len_all[ok_all, None]
+v_all = cam_pos[None, :] - pos
+v_all /= np.maximum(np.linalg.norm(v_all, axis=1, keepdims=True), 1e-12)
+nv_all = (n_hat_all * v_all).sum(axis=1)
+R_all = 2.0 * nv_all[:, None] * n_hat_all - v_all
+Rz = R_all[:, 2]
+
+sky_v  = ok_all & (nv_all > 0) & (hit_cnt_v.sum(axis=1) == 0) & (valid_v[:, 0] > 0)
+kmax_v = cut_depth(valid_v, RS_VAR)
+means_v = ring_sum_v / np.maximum(valid_v[..., None], 1)
+cnts_v  = valid_v.astype(np.float64)
+
+ratios = []
+for k in range(1, K):
+    sel = sky_v & (kmax_v >= k)
+    if sel.sum() < 20:
+        print(f"[analitico] r={APERTURES[k]:g}°: solo {sel.sum()} texel, skip")
+        continue
+    ref = 0.5 + 0.5 * Rz[sel] * (1.0 + cos_b[k]) / 2.0
+    ok_w = lobe_of(ring_weights_mean(cos_b, k, RS_VAR),
+                   means_v[sel], cnts_v[sel])[:, 0]
+    bad_w = lobe_of(ring_weights_mean(cos_b, k, None),
+                    means_v[sel], cnts_v[sel])[:, 0]
+    e_ok, e_bad = np.abs(ok_w - ref).max(), np.abs(bad_w - ref).max()
+    print(f"[analitico] r={APERTURES[k]:g}° su {sel.sum():5d} texel: "
+          f"err(Ω/N)={e_ok:.2e}   err(Ω, sbagliato)={e_bad:.2e}   "
+          f"rapporto={e_bad / max(e_ok, 1e-12):.1f}×")
+    assert e_ok < 3e-2, \
+        f"media pura r={APERTURES[k]}° ≠ riferimento analitico: pesi o " \
+        f"stratificazione errati"
+    assert e_ok <= e_bad * 1.05, \
+        f"a r={APERTURES[k]}° il peso Ω_i/N_i è PEGGIORE di quello non normalizzato"
+    ratios.append((k, e_bad / max(e_ok, 1e-12)))
+
+assert len(ratios) >= 4, "il riferimento analitico ha coperto troppo pochi troncamenti"
+# A coni stretti gli anelli vedono radianze quasi identiche e il peso è quasi
+# irrilevante: la discriminazione esiste solo sui coni larghi, dove l'anello
+# esterno pesa molto e ha molti più campioni degli interni.
+k_wide, ratio_wide = ratios[-1]
+print(f"[analitico] discriminazione al troncamento più largo testato "
+      f"(r={APERTURES[k_wide]:g}°): {ratio_wide:.1f}×")
+assert ratio_wide > 3.0, \
+    "sul cono più largo la normalizzazione per N_i non migliora in modo " \
+    "significativo: la correzione Ω_i/N_i non è attiva"
 
 print("\n✓ Tutti i check del pass SpecCone superati")

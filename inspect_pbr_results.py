@@ -50,6 +50,9 @@ _cnts  = _read_exr(out / "spec_cone" / _meta["counts_file_pattern"].format(cam=0
 L0 = _rings[:, :, 0]                                              # specchio
 _edges = np.asarray(_meta["ring_edges_cos"], dtype=np.float64)
 _w  = 2.0 * np.pi * (_edges[:-1] - _edges[1:])  # angolo solido per anello: media su tutta la semisfera
+# Con campionamento non uniforme il peso è Ω_i/N_i (vedi ring_weights_mean in
+# pbr_solver.py): senza dividere, gli anelli più campionati peserebbero di più.
+_w = _w / np.asarray(_meta.get("ring_samples", 1.0), dtype=np.float64)
 _wc = _w[None, None, :] * _cnts[..., 1:]
 L180 = (np.einsum("hwk,hwkc->hwc", _wc, _rings[:, :, 1:])
         / np.maximum(_wc.sum(-1), 1e-12)[..., None])
