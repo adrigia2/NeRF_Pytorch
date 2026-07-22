@@ -920,15 +920,18 @@ class RenderConfig:
 
 @dataclass
 class PipelineConfig:
-    """Orchestratore a tre step toggle-abili.
+    """Orchestratore a quattro step toggle-abili.
 
     Step 1: genera depth+mask+immagini+transforms_extended.json (minimo per NeRF).
     Step 2: allena il NeRF (nerf/train.py) e salva il checkpoint.
-    Step 3: esegue IUM/visibility/color_texture/irradiance/indirect/albedo.
+    Step 3: esegue IUM/visibility/color_texture/irradiance/indirect/spec_cone (bake).
+    Step 4: ricostruzione (fit PBR + albedo) leggendo solo la cache su disco dello
+            Step 3 — separato per iterare sulla ricostruzione senza ri-bake dei coni.
     """
     run_step1: bool = True
     run_step2: bool = True
     run_step3: bool = True
+    run_step4: bool = True
     # Se True, e se run_step2=True, salta il training NeRF per una scena se il
     # checkpoint <output_dir>/model/nerf_model_cache.pt esiste già (utile per
     # riprendere uno sweep interrotto senza ripetere il training).
@@ -2763,8 +2766,11 @@ def _step3_posttrain_assets(
     tb_logger=None,
     timer=None,
 ) -> dict:
-    """Esegue IUM/visibility/color_texture/irradiance/indirect/albedo e aggiorna
-    transforms_extended.json in-place con le nuove chiavi.
+    """Esegue IUM/visibility/color_texture/irradiance/indirect/spec_cone (bake) e
+    aggiorna transforms_extended.json in-place con le nuove chiavi.
+
+    Il fit PBR e l'albedo sono stati spostati nello Step 4 (_step4_reconstruction),
+    che legge solo la cache su disco prodotta qui.
     """
     rc = cfg.render
     tf = load_transforms(str(transforms_extended_path))
@@ -3057,74 +3063,6 @@ def _step3_posttrain_assets(
             if timer is not None:
                 timer.record("step3/spec_cone", time.perf_counter() - _t3_spec)
 
-        # ── PBR maps (metallic / roughness dal fit spec-cone) ────────────────
-        # Eseguito per OGNI sorgente in color_texture_image_sources, sotto sources/{src}/.
-        if rc.render_pbr_maps:
-            _t3_pbr = time.perf_counter()
-            spec_meta = json_dir / "spec_cone" / "spec_cone_meta.json"   # source-indipendente
-            if spec_meta.exists():
-                from pbr_solver import solve_pbr
-                for src in rc.color_texture_image_sources:
-                    cmin_path = json_dir / "sources" / src / "pixel_change" / "color_min.exr"
-                    if not cmin_path.exists():
-                        print(f"    ⚠  render_pbr_maps ({src}): manca {cmin_path} → skip "
-                              "(serve render_pixel_change)")
-                        continue
-                    print(f"[Step 3] Fit PBR ({src}) → metallic/roughness "
-                          f"(cv_gate={rc.pbr_diffuse_cv_gate}, "
-                          f"spec_threshold={rc.pbr_spec_threshold})…")
-                    pbr_out = solve_pbr(json_dir_str, source=src,
-                                        cv_gate=rc.pbr_diffuse_cv_gate,
-                                        spec_threshold=rc.pbr_spec_threshold,
-                                        min_views=rc.pbr_min_views,
-                                        albedo_eps=rc.albedo_eps)
-                    ium_result_data[f"metallic_path_{src}"] = _as_relative_to(
-                        pbr_out["metallic_path"], json_dir_str)
-                    ium_result_data[f"roughness_path_{src}"] = _as_relative_to(
-                        pbr_out["roughness_path"], json_dir_str)
-                    if pbr_out.get("albedo_pbr_path"):
-                        ium_result_data[f"albedo_pbr_path_{src}"] = _as_relative_to(
-                            pbr_out["albedo_pbr_path"], json_dir_str)
-                if timer is not None:
-                    timer.record("step3/pbr", time.perf_counter() - _t3_pbr)
-            else:
-                print("    ⚠  render_pbr_maps: manca spec_cone_meta.json → skip "
-                      "(serve precompute_spec_cone)")
-
-        # ── Albedo ───────────────────────────────────────────────────────────
-        # Generata per ogni sorgente in color_by_source; l'irradianza è condivisa.
-        if (rc.render_albedo and color_by_source and irr_res is not None):
-            _t3_alb = time.perf_counter()
-            print(f"[Step 3] Calcolo Albedo = π · color / max(irradiance, {rc.albedo_eps})…")
-
-            # Denominatore condiviso tra tutte le sorgenti
-            irr_flat = irr_res.irradiance_np.astype(np.float32)
-            if irr_indirect_flat is not None:
-                irr_flat = irr_flat + irr_indirect_flat
-            denom = np.maximum(irr_flat, rc.albedo_eps)
-
-            mask_flat = ium_res.masks_np.astype(bool) if ium_res.has_masks() else None
-
-            for src, color_flat in color_by_source.items():
-                albedo_flat = (np.float32(np.pi) * color_flat) / denom
-                if mask_flat is not None:
-                    albedo_flat[~mask_flat] = 0.0
-                albedo_flat = np.clip(albedo_flat, 0.0, 1.0)
-                alb_dir = json_dir / "sources" / src / "albedo"
-                os.makedirs(alb_dir, exist_ok=True)
-                alb_path = (alb_dir / f"albedo{rc.albedo_format.extension}").resolve().as_posix()
-                alb_arr = _reshape_flat(albedo_flat, ium_w, ium_h)
-                _save_layer(alb_arr, alb_path, rc.albedo_format, DataLayer.ALBEDO)
-                ium_result_data[f"albedo_path_{src}"] = _as_relative_to(alb_path, json_dir_str)
-
-                # — TensorBoard: albedo è già in [0,1] → no tonemap —
-                if tb_logger is not None:
-                    tb_logger.log_image(f"texture/albedo_{src}", alb_arr, step=0, tonemap=False)
-                    tb_logger.flush()
-
-            if timer is not None:
-                timer.record("step3/albedo", time.perf_counter() - _t3_alb)
-
     # Aggiorna il JSON in-place e riscrivi
     if ium_result_data:
         output_json["ium"] = ium_result_data
@@ -3134,17 +3072,137 @@ def _step3_posttrain_assets(
     return output_json
 
 
+def _step4_reconstruction(
+    cfg: PipelineConfig,
+    transforms_extended_path: Path,
+    tb_logger=None,
+    timer=None,
+) -> dict:
+    """Step 4 — ricostruzione (fit PBR + albedo) dalla sola cache su disco dello Step 3.
+
+    Non usa OptiX né il checkpoint NeRF: legge spec_cone/, sources/{src}/color_texture/,
+    irradiance/ e ium/ già prodotti dallo Step 3, quindi si può rieseguire da solo
+    (run_step1/2/3=False, run_step4=True) per iterare sulla ricostruzione senza ri-bake
+    dei coni. Aggiorna transforms_extended.json in-place con le chiavi
+    metallic/roughness/albedo_pbr/albedo.
+    """
+    rc = cfg.render
+    json_dir = Path(rc.output_dir).resolve()
+    json_dir_str = json_dir.as_posix()
+
+    with open(transforms_extended_path, encoding="utf-8") as fh:
+        output_json = json.load(fh)
+    ium_result_data: dict = output_json.get("ium", {})
+
+    # ── PBR maps (metallic / roughness dal fit spec-cone) ────────────────────
+    # Eseguito per OGNI sorgente in color_texture_image_sources, sotto sources/{src}/.
+    # solve_pbr legge tutto da disco (spec_cone/, camera_texture/, pixel_change/).
+    if rc.render_pbr_maps:
+        _t4_pbr = time.perf_counter()
+        spec_meta = json_dir / "spec_cone" / "spec_cone_meta.json"   # source-indipendente
+        if spec_meta.exists():
+            from pbr_solver import solve_pbr
+            for src in rc.color_texture_image_sources:
+                cmin_path = json_dir / "sources" / src / "pixel_change" / "color_min.exr"
+                if not cmin_path.exists():
+                    print(f"    ⚠  render_pbr_maps ({src}): manca {cmin_path} → skip "
+                          "(serve render_pixel_change nello Step 3)")
+                    continue
+                print(f"[Step 4] Fit PBR ({src}) → metallic/roughness "
+                      f"(cv_gate={rc.pbr_diffuse_cv_gate}, "
+                      f"spec_threshold={rc.pbr_spec_threshold})…")
+                pbr_out = solve_pbr(json_dir_str, source=src,
+                                    cv_gate=rc.pbr_diffuse_cv_gate,
+                                    spec_threshold=rc.pbr_spec_threshold,
+                                    min_views=rc.pbr_min_views,
+                                    albedo_eps=rc.albedo_eps)
+                ium_result_data[f"metallic_path_{src}"] = _as_relative_to(
+                    pbr_out["metallic_path"], json_dir_str)
+                ium_result_data[f"roughness_path_{src}"] = _as_relative_to(
+                    pbr_out["roughness_path"], json_dir_str)
+                if pbr_out.get("albedo_pbr_path"):
+                    ium_result_data[f"albedo_pbr_path_{src}"] = _as_relative_to(
+                        pbr_out["albedo_pbr_path"], json_dir_str)
+            if timer is not None:
+                timer.record("step4/pbr", time.perf_counter() - _t4_pbr)
+        else:
+            print("    ⚠  render_pbr_maps: manca spec_cone_meta.json → skip "
+                  "(serve precompute_spec_cone nello Step 3)")
+
+    # ── Albedo = π · color / max(irradiance + indiretta, eps) ────────────────
+    # Riletta interamente da disco: color_texture per sorgente, irradiance condivisa.
+    if rc.render_albedo:
+        _t4_alb = time.perf_counter()
+        irr_path = json_dir / "irradiance" / f"irradiance{rc.irradiance_format.extension}"
+        if not irr_path.exists():
+            print(f"    ⚠  render_albedo: manca {irr_path} → skip "
+                  "(serve render_irradiance nello Step 3)")
+        else:
+            print(f"[Step 4] Calcolo Albedo = π · color / max(irradiance, {rc.albedo_eps})…")
+
+            # Denominatore condiviso: irradiance diretta (+ indiretta se presente)
+            irr = _load_image_hw3_native(irr_path.as_posix())
+            ind_path = json_dir / "irradiance" / f"irradiance_indirect{rc.indirect_format.extension}"
+            if ind_path.exists():
+                irr = irr + _load_image_hw3_native(ind_path.as_posix())
+            denom = np.maximum(irr, rc.albedo_eps)
+
+            # Maschera IUM (canale 0 > 0.5 = texel valido); salvata con rc.ium_format
+            mask_path = json_dir / "ium" / f"ium_masks{rc.ium_format.extension}"
+            mask = None
+            if mask_path.exists():
+                mask = _load_image_hw3_native(mask_path.as_posix())[..., 0] > 0.5
+
+            for src in rc.color_texture_image_sources:
+                color_path = (json_dir / "sources" / src / "color_texture"
+                              / f"color_texture{rc.color_texture_format.extension}")
+                if not color_path.exists():
+                    print(f"    ⚠  albedo ({src}): manca {color_path} → skip "
+                          "(serve render_color_texture nello Step 3)")
+                    continue
+                color = _load_image_hw3_native(color_path.as_posix())
+                albedo = (np.float32(np.pi) * color) / denom
+                if mask is not None:
+                    albedo[~mask] = 0.0
+                albedo = np.clip(albedo, 0.0, 1.0).astype(np.float32)
+
+                alb_dir = json_dir / "sources" / src / "albedo"
+                os.makedirs(alb_dir, exist_ok=True)
+                alb_path = (alb_dir / f"albedo{rc.albedo_format.extension}").resolve().as_posix()
+                _save_layer(albedo, alb_path, rc.albedo_format, DataLayer.ALBEDO)
+                ium_result_data[f"albedo_path_{src}"] = _as_relative_to(alb_path, json_dir_str)
+
+                # — TensorBoard: albedo è già in [0,1] → no tonemap —
+                if tb_logger is not None:
+                    tb_logger.log_image(f"texture/albedo_{src}", albedo, step=0, tonemap=False)
+                    tb_logger.flush()
+
+            if timer is not None:
+                timer.record("step4/albedo", time.perf_counter() - _t4_alb)
+
+    # Aggiorna il JSON in-place e riscrivi
+    if ium_result_data:
+        output_json["ium"] = ium_result_data
+    with open(transforms_extended_path, "w", encoding="utf-8") as fh:
+        json.dump(output_json, fh, indent=4)
+    print(f"\n[Step 4] JSON aggiornato: {transforms_extended_path}")
+    return output_json
+
+
 def run_pipeline(
     cfg: PipelineConfig,
     *,
     tb_run_dir: str | None = None,
     tb_enabled: bool = True,
 ) -> dict:
-    """Orchestratore a tre step. Ogni step può essere abilitato/disabilitato.
+    """Orchestratore a quattro step. Ogni step può essere abilitato/disabilitato.
 
     Step 1 (run_step1): depth+mask per frame + copia immagini + transforms_extended.json minimo.
     Step 2 (run_step2): training NeRF via nerf/train.py, salva checkpoint.
-    Step 3 (run_step3): IUM/visibility/color_texture/irradiance/indirect/albedo.
+    Step 3 (run_step3): IUM/visibility/color_texture/irradiance/indirect/spec_cone (bake).
+    Step 4 (run_step4): ricostruzione (fit PBR + albedo) dalla sola cache su disco dello
+                        Step 3 — indipendente da OptiX/NeRF, rieseguibile per iterare
+                        sulla ricostruzione senza ri-bake dei coni.
 
     ``tb_run_dir`` è la cartella in cui scrivere gli event file TensorBoard.
     Se None, viene usata <output_dir>/tensorboard.
@@ -3245,6 +3303,16 @@ def run_pipeline(
         else:
             with open(transforms_extended, encoding="utf-8") as fh:
                 result = json.load(fh)
+
+        # Step 4 — ricostruzione (fit PBR + albedo) dalla cache su disco dello Step 3.
+        # Indipendente da run_step3: con run_step1/2/3=False si itera sulla
+        # ricostruzione senza ri-bake dei coni (non richiede OptiX né il checkpoint).
+        if cfg.run_step4:
+            with timer("step4"):
+                result = _step4_reconstruction(
+                    cfg, transforms_extended,
+                    tb_logger=logger, timer=timer,
+                )
 
         # ── Timing breakdown e HParams ────────────────────────────────────────
         top_times = {k: v for k, v in timer.timings.items() if "/" not in k}
@@ -3426,7 +3494,10 @@ if __name__ == "__main__":
     template = PipelineConfig(
         run_step1 = False,  # output Step 1 già su disco (exp_l1_d02)
         run_step2 = False,  # checkpoint NeRF e render Step 2b già su disco
-        run_step3 = True,   # solo pass texture-space: fit PBR col nuovo modello
+        run_step3 = False,   # pass texture-space fino al bake dello spec-cone
+        run_step4 = True,   # ricostruzione PBR+albedo (metti run_step3=False per iterare solo qui)
+
+
         resume_skip_step2_if_ckpt = True,   # salta il training NeRF se il checkpoint esiste già
 
         render = RenderConfig(
