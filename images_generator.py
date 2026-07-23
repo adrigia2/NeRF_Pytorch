@@ -523,6 +523,39 @@ def _load_exr_as_flat(path: str) -> np.ndarray | None:
         return None
 
 
+def _save_visibility_map(visibility_map: np.ndarray, vis_path: str,
+                         ium_h: int, ium_w: int, n_cams: int,
+                         fmt: ImageFormat) -> None:
+    """Salva la visibility (num_pix, n_cams) uint8 su disco.
+
+    EXR → multi-canale, un canale 0/1 per camera (formato letto da pbr_solver e
+    dagli inspector). Formati non-EXR → frazione di camere visibili per texel.
+    """
+    if fmt == ImageFormat.OPENEXR:
+        vis_arr = visibility_map.reshape((ium_h, ium_w, n_cams)).astype(np.float32)
+    else:
+        ratio = np.sum(visibility_map, axis=1).astype(np.float32) / float(max(n_cams, 1))
+        vis_arr = _reshape_flat(ratio, ium_w, ium_h)
+    _save_layer(vis_arr, vis_path, fmt, DataLayer.VISIBILITY)
+
+
+def _load_camera_masks(mask_dir: Path, stems: "list[str]", num_pix: int) -> "np.ndarray | None":
+    """Ricarica le maschere per-camera da <mask_dir>/{stem}.exr → (num_pix, n_cams) uint8.
+
+    Ritorna None se la cartella o anche una sola maschera manca (così il chiamante
+    sa che deve ricalcolare color_texture per rigenerarle).
+    """
+    if not mask_dir.is_dir():
+        return None
+    masks = np.zeros((num_pix, len(stems)), dtype=np.uint8)
+    for j, stem in enumerate(stems):
+        p = mask_dir / f"{stem}.exr"
+        if not p.exists():
+            return None
+        masks[:, j] = (_load_image_hw3_native(p.as_posix())[..., 0] > 0.5).reshape(num_pix)
+    return masks
+
+
 def _resolve_external_normal_size(
     rc,
     default_w: int,
@@ -2846,7 +2879,14 @@ def _step3_posttrain_assets(
             all_cameras.append(cam)
 
         # ── Visibility ───────────────────────────────────────────────────────
+        # Il pass calcola l'OCCLUSIONE (shadow ray camera→texel). L'artefatto
+        # autoritativo su disco è però la visibility raffinata dalle maschere di
+        # color_texture (occlusione∧frustum∧grazing): visibility.exr viene quindi
+        # scritto nel blocco color_texture (o come fallback solo-occlusione più
+        # sotto, se color_texture non gira). Qui NON si salva.
         visibility_map = None
+        visibility_refined = False   # True quando visibility.exr = maschere (frustum+grazing)
+        vis_path = None
         if rc.render_visibility and ium_res.has_positions() and ium_res.has_masks():
             _t3_vis = time.perf_counter()
             print("[Step 3] Calcolo Visibilità telecamere…")
@@ -2857,16 +2897,6 @@ def _step3_posttrain_assets(
             vis_out_dir = json_dir / "visibility"
             os.makedirs(vis_out_dir, exist_ok=True)
             vis_path = (vis_out_dir / f"visibility{rc.visibility_format.extension}").resolve().as_posix()
-
-            if rc.visibility_format == ImageFormat.OPENEXR:
-                vis_arr = visibility_map.reshape((ium_h, ium_w, len(all_cameras))).astype(np.float32)
-                _save_layer(vis_arr, vis_path, rc.visibility_format, DataLayer.VISIBILITY)
-            else:
-                visible_count = np.sum(visibility_map, axis=1)
-                ratio = visible_count.astype(np.float32) / float(len(all_cameras))
-                vis_arr = _reshape_flat(ratio, ium_w, ium_h)
-                _save_layer(vis_arr, vis_path, rc.visibility_format, DataLayer.VISIBILITY)
-
             ium_result_data["visibility_path"] = _as_relative_to(vis_path, json_dir_str)
             if timer is not None:
                 timer.record("step3/visibility", time.perf_counter() - _t3_vis)
@@ -2877,6 +2907,11 @@ def _step3_posttrain_assets(
         # la sorgente successiva). Le texture per-camera vengono scaricate dalla GPU
         # una camera alla volta: il blocco frames×texel non esiste mai in RAM host.
         color_by_source: dict[str, np.ndarray] = {}
+        # Le maschere per-camera di color_texture (occlusione∧frustum∧grazing, pre-peak)
+        # sono source-indipendenti: le salviamo una sola volta come <out>/camera_mask/
+        # {stem}.exr e le riusiamo come visibility condivisa raffinata.
+        cam_mask_dir = json_dir / "camera_mask"
+        stems = [f.stem for f in tf.frames]
         if (rc.render_color_texture and rc.render_ium and rc.render_visibility
                 and visibility_map is not None):
             _t3_ct = time.perf_counter()
@@ -2894,12 +2929,26 @@ def _step3_posttrain_assets(
                 cam_tex_dir = src_dir / "camera_texture"
 
                 if os.path.exists(ct_path) and cam_tex_dir.is_dir():
-                    print(f"[Step 3] Color texture trovata su disco ({src}): {ct_path}")
-                    loaded = _load_exr_as_flat(ct_path)
-                    if loaded is not None:
-                        color_by_source[src] = loaded
-                        ium_result_data[f"color_texture_path_{src}"] = _as_relative_to(ct_path, json_dir_str)
-                        continue
+                    # Cache-hit: per non far regredire la visibility servono le maschere
+                    # per-camera. Se ci sono su disco le ricarichiamo e raffiniamo; se
+                    # mancano NON usiamo la cache (ricalcoliamo per rigenerarle).
+                    masks_disk = _load_camera_masks(cam_mask_dir, stems, ium_w * ium_h)
+                    if masks_disk is not None:
+                        loaded = _load_exr_as_flat(ct_path)
+                        if loaded is not None:
+                            print(f"[Step 3] Color texture trovata su disco ({src}): {ct_path}")
+                            color_by_source[src] = loaded
+                            ium_result_data[f"color_texture_path_{src}"] = _as_relative_to(ct_path, json_dir_str)
+                            if not visibility_refined and vis_path is not None:
+                                visibility_map = masks_disk
+                                _save_visibility_map(visibility_map, vis_path, ium_h, ium_w,
+                                                     len(all_cameras), rc.visibility_format)
+                                visibility_refined = True
+                                print("[Step 3] Visibility raffinata dalle maschere per-camera su disco")
+                            continue
+                    else:
+                        print(f"[Step 3] Color texture in cache ({src}) ma maschere per-camera "
+                              f"mancanti → ricalcolo per rigenerarle")
 
                 print(f"[Step 3] Calcolo Color Texture (sorgente: {src})…")
                 optix_frames = _build_optix_frames_for_source(
@@ -2920,16 +2969,40 @@ def _step3_posttrain_assets(
                 color_by_source[src] = np.array(_ct_res.colors_np, dtype=np.float32)
 
                 # Texture per-camera per questa sorgente: sources/{src}/camera_texture/
+                # Scarico anche la maschera per-camera (uint8) per raffinare la visibility.
                 os.makedirs(cam_tex_dir, exist_ok=True)
+                # Le maschere sono source-indipendenti: le salviamo una sola volta,
+                # sul primo source che le produce (prima che visibility_refined diventi True).
+                save_masks = not visibility_refined
+                if save_masks:
+                    os.makedirs(cam_mask_dir, exist_ok=True)
+                cam_masks = np.zeros((ium_w * ium_h, len(tf.frames)), dtype=np.uint8)
                 for cam_idx, frame in enumerate(tf.frames):
                     cam_slice = ct_gen.download_camera_colors(cam_idx)  # (num_pix, 3) float32
                     cam_arr   = _reshape_flat(cam_slice, ium_w, ium_h)
                     cam_path  = (cam_tex_dir / f"{frame.stem}{rc.color_texture_format.extension}").resolve().as_posix()
                     _save_layer(cam_arr, cam_path, rc.color_texture_format, DataLayer.POSITION)
+                    cam_masks[:, cam_idx] = ct_gen.download_camera_mask(cam_idx)  # (num_pix,) uint8
+                    if save_masks:
+                        mask_path = (cam_mask_dir / f"{frame.stem}.exr").resolve().as_posix()
+                        _save_layer(_reshape_flat(cam_masks[:, cam_idx], ium_w, ium_h),
+                                    mask_path, ImageFormat.OPENEXR, DataLayer.MASK)
                     if rc.debug_camera_texture:
                         src_img_path = images_out_dir_ct / Path(frame.file_path).name
                         _save_debug_comparison(src_img_path, cam_arr, frame.stem,
                                                src_dir / "debug_camera_texture")
+
+                # Raffina la visibility condivisa con la maschera per-camera (una volta):
+                # occlusione∧frustum∧grazing, così spec_cone (usa visibility_map in memoria)
+                # e pbr_solver (rilegge visibility.exr) non pesano camere che non vedono
+                # davvero il texel. Nessuna modifica al solver.
+                if not visibility_refined and vis_path is not None:
+                    visibility_map = cam_masks
+                    _save_visibility_map(visibility_map, vis_path, ium_h, ium_w,
+                                         len(all_cameras), rc.visibility_format)
+                    visibility_refined = True
+                    print("[Step 3] Visibility raffinata con la maschera per-camera di "
+                          "color_texture (frustum+grazing) e ri-salvata")
 
                 # pixel_change per ogni sorgente: sources/{src}/pixel_change/
                 if rc.render_pixel_change:
@@ -2959,6 +3032,27 @@ def _step3_posttrain_assets(
 
             if timer is not None:
                 timer.record("step3/color_texture", time.perf_counter() - _t3_ct)
+
+        # ── Raffinamento visibility da maschere persistite (2-bis) e fallback ─
+        # Se color_texture non ha raffinato la visibility (es. render_color_texture
+        # disattivo) ma le maschere per-camera esistono su disco, raffina da lì così
+        # spec_cone e pbr_solver usano comunque la versione frustum+grazing.
+        if not visibility_refined and visibility_map is not None and vis_path is not None:
+            masks_disk = _load_camera_masks(cam_mask_dir, stems, ium_w * ium_h)
+            if masks_disk is not None:
+                visibility_map = masks_disk
+                _save_visibility_map(visibility_map, vis_path, ium_h, ium_w,
+                                     len(all_cameras), rc.visibility_format)
+                visibility_refined = True
+                print("[Step 3] Visibility raffinata dalle maschere per-camera su disco (2-bis)")
+            else:
+                # Fallback: nessuna maschera disponibile → salva la visibility
+                # solo-occlusione (frustum/grazing NON applicati).
+                _save_visibility_map(visibility_map, vis_path, ium_h, ium_w,
+                                     len(all_cameras), rc.visibility_format)
+                print("    ⚠  visibility.exr salvata SOLO-OCCLUSIONE (nessuna maschera "
+                      "per-camera su disco): frustum/grazing NON applicati. Esegui "
+                      "color_texture per raffinarla.")
 
         # ── Irradiance (Monte Carlo skybox) ──────────────────────────────────
         irr_res = None
@@ -3494,7 +3588,7 @@ if __name__ == "__main__":
     template = PipelineConfig(
         run_step1 = False,  # output Step 1 già su disco (exp_l1_d02)
         run_step2 = False,  # checkpoint NeRF e render Step 2b già su disco
-        run_step3 = False,   # pass texture-space fino al bake dello spec-cone
+        run_step3 = True,   # pass texture-space fino al bake dello spec-cone
         run_step4 = True,   # ricostruzione PBR+albedo (metti run_step3=False per iterare solo qui)
 
 
@@ -3665,7 +3759,7 @@ if __name__ == "__main__":
         # ("softplus_l1",        "softplus", "l1"),
     ]
     DECAYS     = (0.2,)
-    SWEEP_ROOT = "D:/tesi_output/experiments_specular_coscone_fit_pbr_2"
+    SWEEP_ROOT = "D:/tesi_output/experiments_specular_coscone_fit_pbr_mask"
 
     for name, act, loss in EXPERIMENTS:
         for decay in DECAYS:
