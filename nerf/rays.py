@@ -3,7 +3,8 @@
 # Commit: 63a5a630c9abd62b0f21c08703d0ac2ea7d4b9dd
 # License: MIT
 # Modifications: extracted get_rays_np; added raw2outputs (ported from run_nerf.py);
-#   removed ndc_rays (unused for object-centric scenes).
+#   removed ndc_rays (unused for object-centric scenes); get_rays_np now returns UNIT
+#   direction vectors (upstream leaves the z component at -1) — see its docstring.
 
 import numpy as np
 import torch
@@ -15,7 +16,18 @@ def get_rays_np(H, W, K, c2w):
 
     K: 3×3 intrinsic matrix [[fx,0,cx],[0,fy,cy],[0,0,1]]
     c2w: 3×4 or 4×4 camera-to-world matrix
-    Returns rays_o, rays_d each (H, W, 3) float32.
+    Returns rays_o, rays_d each (H, W, 3) float32, with rays_d NORMALIZED.
+
+    The normalization is a deliberate deviation from upstream nerf-pytorch, which
+    leaves the z component at -1 so that t advances one unit along the optical axis.
+    Here every t_hit comes from an OptiX depth map, and the OptiX kernel normalizes
+    the direction before tracing (depthMap/cuda/devicePrograms.cu), so the depth is a
+    metric world-space distance.  Feeding a metric distance to a non-unit direction
+    places the sample at depth·|rays_d| instead of depth — an error that is exactly
+    zero at the principal point and grows toward the image corners (+8.2% at 1920×1080
+    with fx=2666.7), which is why it can hide for a long time.  Directions and
+    distances must live in the same parametrization; unit vectors are that
+    parametrization.
     """
     i, j = np.meshgrid(np.arange(W, dtype=np.float32),
                         np.arange(H, dtype=np.float32), indexing='xy')
@@ -25,6 +37,7 @@ def get_rays_np(H, W, K, c2w):
         -np.ones_like(i),
     ], -1)
     rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
+    rays_d = rays_d / np.linalg.norm(rays_d, axis=-1, keepdims=True)
     rays_o = np.broadcast_to(c2w[:3, -1], np.shape(rays_d))
     return rays_o.astype(np.float32), rays_d.astype(np.float32)
 

@@ -989,7 +989,7 @@ class PipelineConfig:
     nerf_depth_window_end:     float = 0.5
     nerf_opacity_weight:       float = 1.0   # peso della loss opacità (fg e bg)
     nerf_raw_noise_std:        float = 0.0   # rumore pre-ReLU sulla densità
-    nerf_bg_radius_mult:       float = 6.0   # raggio sfera bg = bg_radius_mult × max_side
+    nerf_bg_radius_mult:       float = 6.0   # raggio sfera bg = bg_radius_mult × distanza max dall'origine
     nerf_bg_depth_window:      float = 2.0   # finestra bg [R - window, R + window_end]
     nerf_bg_depth_window_end:  float = 2.0
     nerf_profile_iters: int = 0         # per-fase timing sincronizzato per i primi N iter (0=off)
@@ -3586,11 +3586,10 @@ if __name__ == "__main__":
     # skybox_path) sono vuoti qui e vengono sovrascritti per ogni SceneConfig.
     # Tutti gli altri parametri di rendering/NeRF sono condivisi tra le scene.
     template = PipelineConfig(
-        run_step1 = False,  # output Step 1 già su disco (exp_l1_d02)
-        run_step2 = False,  # checkpoint NeRF e render Step 2b già su disco
-        run_step3 = True,   # pass texture-space fino al bake dello spec-cone
-        run_step4 = True,   # ricostruzione PBR+albedo (metti run_step3=False per iterare solo qui)
-
+        run_step1 = True,  # output Step 1 già su disco (exp_l1_d02)
+        run_step2 = True,  # checkpoint NeRF e render Step 2b già su disco
+        run_step3 = False,   # pass texture-space fino al bake dello spec-cone
+        run_step4 = False,   # ricostruzione PBR+albedo (metti run_step3=False per iterare solo qui)
 
         resume_skip_step2_if_ckpt = True,   # salta il training NeRF se il checkpoint esiste già
 
@@ -3696,7 +3695,13 @@ if __name__ == "__main__":
         nerf_depth_window_end          = 0.05,
         nerf_opacity_weight            = 1.0,
         nerf_raw_noise_std             = 1.0,
-        nerf_bg_radius_mult            = 3.0,
+        # Il raggio della sfera bg è ora bg_radius_mult × (distanza max dall'origine),
+        # non più × max_side della bbox: su questa scena la base passa da 3.2 a 2.266,
+        # quindi 3.0 darebbe R=6.8 contro i ~12 di prima. 5.0 → R=11.3, che tiene il
+        # guscio fuori dal rig di camere (le più lontane stanno a 9.0) e conserva la
+        # risoluzione angolare dell'envmap: quanto spazio occupa il guscio rispetto alle
+        # frequenze del positional encoding decide quanto è nitido skybox_nerf_baked.exr.
+        nerf_bg_radius_mult            = 5.0,
         nerf_bg_depth_window           = 0.05,
         nerf_bg_depth_window_end       = 0.05,
         # nerf_multires = 12,
@@ -3729,14 +3734,14 @@ if __name__ == "__main__":
             # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
             # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         ),
-        SceneConfig(
-            name             = "TableAndOtherInterior",
-            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenExrSmoothNoDiffuse/transforms.json",
-            model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
-            external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmoothNoDiffuse/BakedMaterial_normal.exr",
-            # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
-            # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
-        )
+        # SceneConfig(
+        #     name             = "TableAndOtherInterior",
+        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenExrSmoothNoDiffuse/transforms.json",
+        #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+        #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmoothNoDiffuse/BakedMaterial_normal.exr",
+        #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
+        #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+        # )
         # SceneConfig(
         #     name            = "SwordShield",
         #     transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
@@ -3753,19 +3758,21 @@ if __name__ == "__main__":
 
     # (tag_base, rgb_activation, loss_type) — fattoriale 2×2 attivazione × loss
     EXPERIMENTS = [
-        # ("exp_relmseraw",      "exp",      "rel_mse_raw"),
-        # ("softplus_relmseraw", "softplus", "rel_mse_raw"),
+        ("exp_relmseraw",      "exp",      "rel_mse_raw"),
+        ("softplus_relmseraw", "softplus", "rel_mse_raw"),
         ("exp_l1",             "exp",      "l1"),
-        # ("softplus_l1",        "softplus", "l1"),
+        ("softplus_l1",        "softplus", "l1"),
+        ("softplus_mse",       "softplus", "mse"),
+        ("exp_mse",            "exp",      "mse")
     ]
     DECAYS     = (0.2,)
-    SWEEP_ROOT = "D:/tesi_output/experiments_specular_coscone_fit_pbr_mask"
+    SWEEP_ROOT = "D:/tesi_output/sweep_nerf_activation_loss_decay_find_better_nerf"
 
     for name, act, loss in EXPERIMENTS:
         for decay in DECAYS:
             
             cfg = copy.deepcopy(template)
-            cfg.nerf_num_iters       = 50000
+            cfg.nerf_num_iters       = 75000
             cfg.nerf_lr_decay_steps  = 100000  # ancora fissa allineata a num_iters
             cfg.nerf_rgb_activation  = act
             cfg.nerf_loss_type       = loss
@@ -3775,8 +3782,7 @@ if __name__ == "__main__":
             run_pipeline_multi(
                 cfg, SCENES,
                 output_root    = f"{SWEEP_ROOT}/{tag}",
-                run_note       = f"{cfg.nerf_num_iters}iter | act={act} | loss={loss} | decay={decay} (step 3 only — fit PBR a·E·x + (1−x)·L media pura)",
-                experiment_tag = tag,
+                run_note       = f"{cfg.nerf_num_iters}iter | act={act} | loss={loss} | decay={decay}",
                 # tb_enabled=False
             )
     

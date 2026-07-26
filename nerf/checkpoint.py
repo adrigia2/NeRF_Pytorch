@@ -10,6 +10,27 @@ from .config import NerfConfig
 from .encoding import get_embedder
 from .model import NeRF
 
+# Marcatore della convenzione geometrica con cui il modello è stato addestrato.
+# "unit": rays_d unitario e t_hit distanza metrica (vedi get_rays_np). I checkpoint
+# scritti prima di questa convenzione non hanno la chiave: il loro campo è ancorato a
+# posizioni di campionamento spostate fino a ~0.4 unità e sono inutilizzabili, quindi
+# vengono rifiutati invece che migrati.
+RAY_CONVENTION = "unit"
+
+_LEGACY_CKPT_MSG = (
+    "Checkpoint scritto con la vecchia parametrizzazione dei raggi (rays_d non "
+    "normalizzato con t_hit metrico): i campioni foreground erano piazzati oltre la "
+    "superficie e il modello non è utilizzabile.\n"
+    "  checkpoint: {path}\n"
+    "  Cancellalo (o punta a un output_dir nuovo) e ri-addestra."
+)
+
+
+def _check_ray_convention(ckpt: dict, path: str) -> None:
+    """Rifiuta i checkpoint pre-normalizzazione. Vedi RAY_CONVENTION."""
+    if ckpt.get("ray_convention") != RAY_CONVENTION:
+        raise RuntimeError(_LEGACY_CKPT_MSG.format(path=path))
+
 
 def _build_models(cfg: NerfConfig, device):
     """Instantiate the single NeRF model and its embedders.
@@ -47,6 +68,9 @@ def save_checkpoint(path: str, model, optimizer, iter_done: int, cfg: NerfConfig
         "config":         {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)},
         "scene_center":   center_list,
         "sphere_radius":  float(sphere_radius),
+        # Fuori da "config" apposta: non è un iperparametro, ed è letto anche da chi
+        # (train.py) apre il checkpoint senza ricostruire NerfConfig.
+        "ray_convention": RAY_CONVENTION,
     }, tmp_path)
     os.replace(tmp_path, path)
 
@@ -63,6 +87,7 @@ def load_checkpoint(path: str, device=None, *, return_iter: bool = False):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ckpt = torch.load(path, map_location=device)
+    _check_ray_convention(ckpt, str(path))
     cfg_dict = dict(ckpt["config"])
     # Legacy checkpoints: map the old use_hdr_activation flag onto the new fields.
     if "rgb_activation" not in cfg_dict and "use_hdr_activation" in cfg_dict:

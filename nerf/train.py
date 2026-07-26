@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import time
 from collections import deque
 from pathlib import Path
@@ -8,8 +9,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .checkpoint import _build_models, save_checkpoint
+from .checkpoint import _build_models, _check_ray_convention, save_checkpoint
 from .config import NerfConfig
+from .csv_logger import CsvLogger
 from .dataset import NerfDataset
 from .render import render_image, render_rays_depth, render_unified
 
@@ -42,6 +44,36 @@ LOSSES = {
 }
 
 
+# Colonne di <output_dir>/training_metrics.csv, una riga per display block.
+#
+# Quali confronti sono leciti:
+#   - ``loss`` è nelle unità di cfg.loss_type: confrontarla tra run con loss
+#     diverse non ha significato, serve a leggere la convergenza dentro un run.
+#   - ``mse``/``psnr_db`` sono calcolate sempre, indipendentemente dalla loss
+#     usata per il gradiente: sono le uniche colonne confrontabili tra run con
+#     loss diverse.
+#   - Il dominio è il BATCH di training dell'iterazione, non un'immagine:
+#     sample_natural estrae raggi uniformemente da tutti i frame, foreground e
+#     background mescolati. Non è in nessun senso una metrica held-out.
+#   - psnr_db = -10·log10(mse) assume implicitamente MAX_I = 1, ma i target sono
+#     HDR (valori > 1): è una rimappatura monotona della MSE, confrontabile tra
+#     run sugli stessi dati ma NON con i valori di PSNR della letteratura, e
+#     potenzialmente negativa se mse > 1. Con composite_white=False la GT dei
+#     raggi di background sono i pixel reali dell'envmap, quindi le zone luminose
+#     pesano quadraticamente e dominano la metrica rispetto al range diffuso.
+#
+# Le ultime quattro colonne sono costanti per run e ridondanti riga per riga, ma
+# rendono il CSV auto-descrittivo: sono gli assi dello sweep, quindi concatenare
+# N file in un solo dataframe basta a etichettare le curve. La scena non è nota
+# qui ma è nel path (<output_root>/<scene>/nerf_train/).
+CSV_FIELDS = [
+    "iter", "loss", "mse", "psnr_db", "lr",
+    "iters_per_s", "rays_per_s", "acc_fg",
+    "wall_s", "timestamp",
+    "loss_type", "rgb_activation", "batch_size", "lr_decay_factor",
+]
+
+
 def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: str,
           num_iters: int, batch_size: int, lr: float, seed: int,
           display_every: int, tb_logger=None) -> float:
@@ -53,6 +85,15 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
     Returns the PSNR (dB) from the last display block, or float('nan') if the
     training ran for fewer than ``display_every`` iterations.
     ``tb_logger`` accepts a monitoring.RunLogger (or None to disable TB logging).
+
+    Every display block appends a row to ``<output_dir>/training_metrics.csv``
+    (columns and their semantics: see CSV_FIELDS).  The file is append-only, so
+    resumes and interactive continuations accumulate instead of overwriting.
+    Note that if the process dies *after* a display block but *before* the next
+    checkpoint, the restart rewinds ``iter_start`` and the CSV ends up with
+    duplicate/non-monotonic iterations; downstream that is a
+    ``drop_duplicates(subset="iter", keep="last")`` after sorting on timestamp.
+    Deduplicating at write time would mean re-reading the file on every row.
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -74,12 +115,38 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
             "Ensure transforms_extended.json includes depth_path for every frame."
         )
 
-    # Compute scene bounds from foreground hit points
-    center, max_side = dataset.compute_scene_bounds()
-    sphere_radius = float(cfg.bg_radius_mult * max_side)
+    # La sfera di background è ancorata all'ORIGINE del mondo: l'ambiente è una funzione
+    # puramente direzionale, quindi il centro è una convenzione, e sceglierlo fisso lo
+    # rende riproducibile invece che dipendente dal set di camere. La geometria serve
+    # solo a dimensionare il raggio.
+    scene_radius, p_min, p_max = dataset.compute_scene_bounds()
+    scene_radius = float(scene_radius)
+    center = torch.zeros(3, device=device, dtype=torch.float32)
+    sphere_radius = float(cfg.bg_radius_mult * scene_radius)
     cfg.far = sphere_radius + cfg.bg_depth_window_end + 1.0
-    print(f"  Scene centre: {center.tolist()}")
-    print(f"  Bbox max side: {max_side:.3f}  sphere radius: {sphere_radius:.3f}  far: {cfg.far:.3f}")
+
+    print(f"  Scene bbox: {[round(v, 3) for v in p_min.tolist()]} .. "
+          f"{[round(v, 3) for v in p_max.tolist()]}")
+    print(f"  Scene radius (from origin): {scene_radius:.3f}  "
+          f"sphere radius: {sphere_radius:.3f}  far: {cfg.far:.3f}")
+
+    # Il guscio deve stare interamente fuori dalla geometria, altrimenti i campioni di
+    # background finirebbero dentro l'oggetto, dove vive il campo foreground.
+    if sphere_radius <= scene_radius:
+        raise RuntimeError(
+            f"Background sphere radius {sphere_radius:.3f} is inside the geometry "
+            f"(scene radius {scene_radius:.3f}): the shell would intersect the mesh. "
+            f"bg_radius_mult is {cfg.bg_radius_mult} and must be > 1."
+        )
+
+    # Non è un errore (i raggi bg sono ri-ancorati al centro, quindi la matematica regge
+    # comunque), ma un guscio dentro il rig di camere è una condizione che vale la pena
+    # vedere: l'ambiente finisce più vicino all'origine di dove stanno gli osservatori.
+    cam_max = max(float(np.linalg.norm(m["pose"][:3, 3])) for m in dataset._frames_meta)
+    if sphere_radius <= cam_max:
+        print(f"  [warn] sphere radius {sphere_radius:.3f} does not enclose all cameras "
+              f"(farthest at {cam_max:.3f}); consider bg_radius_mult >= "
+              f"{cam_max / max(scene_radius, 1e-9):.2f}")
 
     model, embed_fn, embeddirs_fn = _build_models(cfg, device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999))
@@ -88,6 +155,11 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
     ckpt = Path(ckpt_path)
     if ckpt.exists():
         saved = torch.load(str(ckpt), map_location=device)
+        # Prima di qualsiasi altra cosa: un checkpoint pre-normalizzazione non è
+        # riprendibile. Serve qui e non solo in load_checkpoint() perché questo è
+        # l'unico punto che apre il checkpoint senza ricostruire NerfConfig, ed è la
+        # strada che percorre resume_skip_step2_if_ckpt.
+        _check_ray_convention(saved, str(ckpt))
         model.load_state_dict(saved["model_state"])
         try:
             optimizer.load_state_dict(saved["optimizer"])
@@ -104,6 +176,12 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # CSV delle metriche, una riga per display block. In append: train() viene
+    # rientrata sullo stesso output_dir sia dai resume sia dal loop interattivo
+    # di run_pipeline, e i segmenti devono accumularsi.
+    csv_logger = CsvLogger(out_dir / "training_metrics.csv", CSV_FIELDS)
+    _t_train_start = time.perf_counter()
 
     # Decay ancorato a un orizzonte FISSO in iterazioni assolute (lr_decay_steps):
     # schedule = funzione pura di i, continuo attraverso i resume. 0 = auto → num_iters.
@@ -232,6 +310,28 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
                       f"pred=[{_rgb_pred.min():.3f},{_rgb_pred.mean():.3f},{_rgb_pred.max():.3f}]  "
                       f"target=[{_rgb_gt.min():.3f},{_rgb_gt.mean():.3f},{_rgb_gt.max():.3f}]")
 
+            # Riga CSV: scritta qui perché acc_fg nasce nel blocco diag sopra, e
+            # prima della preview perché un errore in OpenEXR non deve far perdere
+            # una riga già calcolata.
+            csv_logger.log({
+                "iter":            i + 1,
+                "loss":            f"{recent_loss:.6g}",
+                "mse":             f"{recent_mse:.6g}",
+                "psnr_db":         f"{psnr:.6g}",
+                "lr":              f"{new_lr:.6e}",
+                "iters_per_s":     f"{iters_per_s:.6g}",
+                "rays_per_s":      f"{rays_per_s:.6g}",
+                "acc_fg":          f"{float(acc_fg):.6g}",
+                # wall_s si azzera a ogni rientro in train(): è il marcatore dei
+                # segmenti del loop interattivo.
+                "wall_s":          f"{time.perf_counter() - _t_train_start:.3f}",
+                "timestamp":       datetime.datetime.now().isoformat(timespec="seconds"),
+                "loss_type":       cfg.loss_type,
+                "rgb_activation":  cfg.rgb_activation,
+                "batch_size":      batch_size,
+                "lr_decay_factor": cfg.lr_decay_factor,
+            })
+
             # Preview: _save_preview ora ritorna l'array per il log TB
             preview_img = _save_preview(
                 model_bundle, dataset, cfg, out_dir / f"preview_iter_{i+1:06d}.exr"
@@ -264,7 +364,7 @@ def _save_preview(
     """
     import OpenEXR, Imath
     model = model_bundle[0]
-    _, _, _, test_pose, test_dep = dataset.get_test_frame()
+    _, _, _, test_pose, test_dep = dataset.get_preview_frame()
     model.eval()
     img = render_image(model_bundle, dataset.H, dataset.W, dataset.focal_x, test_pose, cfg,
                        focal_y=dataset.focal_y, target_depth=test_dep)

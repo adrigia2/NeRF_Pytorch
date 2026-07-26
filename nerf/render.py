@@ -34,9 +34,13 @@ def render_rays_depth(rays_o, rays_d, model, embed_fn, embeddirs_fn, cfg: NerfCo
     If window/window_end/n_samples are None, the cfg foreground defaults are used.
     bg_color: (N, 3) composited where acc < 1 instead of black. Ignored when None.
     Returns rgb (N, 3), and acc (N,) when return_acc=True.
+
+    rays_d is normalized here: t_hit is a metric distance (OptiX depth, or a sphere
+    radius), so direction and distance must share the same parametrization.
     """
     device = rays_o.device
     N = rays_o.shape[0]
+    rays_d = F.normalize(rays_d, dim=-1)
     _near = near if near is not None else cfg.near
     _far  = far  if far  is not None else cfg.far
     _win      = window    if window    is not None else cfg.depth_window
@@ -103,18 +107,21 @@ def render_unified(rays_o, rays_d, depths, in_mask, model, embed_fn, embeddirs_f
     """Single fixed-shape render for both fg (mesh hit) and bg (sphere shell) rays.
 
     in_mask=True  → fg: use ray origin + t_hit from depths, mesh depth window.
-    in_mask=False → bg: use scene center as origin, normalized direction, t_hit=sphere_radius.
+    in_mask=False → bg: use `center` as origin, t_hit=sphere_radius.
     All intermediate tensors have shape (N, depth_window_samples, ...) — constant across iters.
     Requires cfg.depth_window_samples for both fg and bg (use the same value).
+
+    Directions are normalized for both branches: `depths` is a metric OptiX distance
+    and `sphere_radius` a metric radius, so the two branches differ only in origin and
+    t_hit — the only difference that is actually meaningful.
     """
     device = rays_o.device
     N = rays_o.shape[0]
     n_s = cfg.depth_window_samples
     sphere_r = torch.full((N,), sphere_radius, device=device, dtype=torch.float32)
 
-    rays_d_n   = F.normalize(rays_d, dim=-1)
+    eff_dir    = F.normalize(rays_d, dim=-1)
     eff_origin = torch.where(in_mask[:, None], rays_o, center.unsqueeze(0).expand(N, 3))
-    eff_dir    = torch.where(in_mask[:, None], rays_d, rays_d_n)
     eff_t_hit  = torch.where(in_mask, depths, sphere_r)
 
     win_lo = torch.where(in_mask,
