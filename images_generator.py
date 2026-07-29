@@ -3726,9 +3726,17 @@ if __name__ == "__main__":
         #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
         #     skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # ),
-        SceneConfig(
-            name             = "TableAndOtherInteriorWithSpecular",
-            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
+        # SceneConfig(
+        #     name             = "TableAndOtherInteriorWithSpecular",
+        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
+        #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+        #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
+        #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
+        #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+        # ),
+         SceneConfig(
+            name             = "TableAndOtherInteriorWithSpecularHighDetails",
+            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRHighDetails/transforms.json",
             model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
             external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
             # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
@@ -3752,21 +3760,22 @@ if __name__ == "__main__":
     # ── Esecuzione ────────────────────────────────────────────────────────────
     # Sweep fattoriale 2×2×2: attivazione × loss × decay — 8 run in totale.
     # Ogni run ottiene il proprio output_root (checkpoint isolati: exp/softplus
+
     # non sono compatibili tra loro e non devono fare resume incrociato).
     # TB_LOG_ROOT viene letta da docker/tensorboard/.env — non serve cambiarla qui.
     # Per un sweep pulito da zero, cambiare SWEEP_ROOT o svuotare la cartella.
 
     # (tag_base, rgb_activation, loss_type) — fattoriale 2×2 attivazione × loss
     EXPERIMENTS = [
-        ("exp_relmseraw",      "exp",      "rel_mse_raw"),
-        ("softplus_relmseraw", "softplus", "rel_mse_raw"),
+        # ("exp_relmseraw",      "exp",      "rel_mse_raw"),
+        # ("softplus_relmseraw", "softplus", "rel_mse_raw"),
         ("exp_l1",             "exp",      "l1"),
-        ("softplus_l1",        "softplus", "l1"),
-        ("softplus_mse",       "softplus", "mse"),
-        ("exp_mse",            "exp",      "mse")
+        # ("softplus_l1",        "softplus", "l1"),
+        # ("softplus_mse",       "softplus", "mse"),
+        # ("exp_mse",            "exp",      "mse")
     ]
     DECAYS     = (0.2,)
-    SWEEP_ROOT = "D:/tesi_output/sweep_nerf_activation_loss_decay_find_better_nerf"
+    SWEEP_ROOT = "D:/tesi_output/test_high_frequency_nerf"
 
     for name, act, loss in EXPERIMENTS:
         for decay in DECAYS:
@@ -3777,7 +3786,7 @@ if __name__ == "__main__":
             cfg.nerf_rgb_activation  = act
             cfg.nerf_loss_type       = loss
             cfg.nerf_lr_decay        = decay
-            cfg.skybox_source        = "nerf"
+            cfg.render.skybox_source = "nerf"  # il campo vive su RenderConfig, non su PipelineConfig
             tag = f"{name}_d{str(decay).replace('.', '')}"  # es. exp_l1_d01
             run_pipeline_multi(
                 cfg, SCENES,
