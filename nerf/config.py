@@ -56,7 +56,7 @@ class NerfConfig:
     # Foreground depth-window (mesh surface)
     depth_window: float = 0.5        # samples span [t_hit - window, t_hit + window_end]
     depth_window_end: float = 0.5
-    depth_window_samples: int = 32
+    depth_window_samples: int = 5
     opacity_weight: float = 1.0      # deprecated: no longer used (unified loss, no opacity term)
 
     # Background sphere-shell window (origin = scene centre, t_hit = sphere radius)

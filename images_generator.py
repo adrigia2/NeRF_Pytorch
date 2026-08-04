@@ -3588,8 +3588,8 @@ if __name__ == "__main__":
     template = PipelineConfig(
         run_step1 = True,  # output Step 1 già su disco (exp_l1_d02)
         run_step2 = True,  # checkpoint NeRF e render Step 2b già su disco
-        run_step3 = False,   # pass texture-space fino al bake dello spec-cone
-        run_step4 = False,   # ricostruzione PBR+albedo (metti run_step3=False per iterare solo qui)
+        run_step3 = True,   # pass texture-space fino al bake dello spec-cone
+        run_step4 = True,   # ricostruzione PBR+albedo (metti run_step3=False per iterare solo qui)
 
         resume_skip_step2_if_ckpt = True,   # salta il training NeRF se il checkpoint esiste già
 
@@ -3726,22 +3726,30 @@ if __name__ == "__main__":
         #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
         #     skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # ),
-        # SceneConfig(
-        #     name             = "TableAndOtherInteriorWithSpecular",
-        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
-        #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
-        #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
-        #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
-        #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
-        # ),
-         SceneConfig(
-            name             = "TableAndOtherInteriorWithSpecularHighDetails",
-            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRHighDetails/transforms.json",
+        SceneConfig(
+            name             = "TableAndOtherInteriorWithSpecular",
+            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
             model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
             external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
             # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
             # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         ),
+        #  SceneConfig(
+        #     name             = "TableAndOtherInteriorWithSpecularHighDetails",
+        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRHighDetails/transforms.json",
+        #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+        #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
+        #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
+        #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+        # ),
+        # SceneConfig(
+        #             name             = "TableAndOtherInteriorWithSpecularNight",
+        #             transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmoothNight/transforms.json",
+        #             model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+        #             external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmoothNight/BakedMaterial_normal.exr",
+        #             # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
+        #             # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+        #         )
         # SceneConfig(
         #     name             = "TableAndOtherInterior",
         #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenExrSmoothNoDiffuse/transforms.json",
@@ -3775,7 +3783,7 @@ if __name__ == "__main__":
         # ("exp_mse",            "exp",      "mse")
     ]
     DECAYS     = (0.2,)
-    SWEEP_ROOT = "D:/tesi_output/test_high_frequency_nerf"
+    SWEEP_ROOT = "D:/tesi_output/specular_exp_l1_complete"
 
     for name, act, loss in EXPERIMENTS:
         for decay in DECAYS:

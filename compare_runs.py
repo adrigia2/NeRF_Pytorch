@@ -16,9 +16,10 @@ Il punto metodologico, che e' il motivo per cui questo script esiste:
   Ogni run e' per costruzione il minimo della PROPRIA loss su questi dati.
   Classificarli con la MSE premia i run addestrati con mse, con la MAE quelli
   addestrati con l1, con la relMSE quelli addestrati con rel_mse_raw.  Serve un
-  arbitro terzo.  La metrica di testa e' quindi la SMAPE, su cui nessun run e'
-  stato addestrato, affiancata da mu-law PSNR e log-RMSE; le metriche "diagonali"
-  restano nella matrice ma sono marcate come tali.
+  arbitro terzo, quindi quelle tre metriche sono ESCLUSE dalla matrice e dalle
+  classifiche (restano nei CSV grezzi): marcarle non basta, perche' una cella
+  auto-valutata pesa lo stesso nel colpo d'occhio.  La metrica di testa e' la
+  SMAPE, affiancata da mu-law PSNR e log-RMSE.
 
   Inoltre il NeRF, in questa pipeline, non viene consumato come immagine ma come
   sorgente di radianza dentro integrali emisferici (irradianza indiretta, coni
@@ -26,11 +27,13 @@ Il punto metodologico, che e' il motivo per cui questo script esiste:
   per questo il bias con segno per fascia di luminanza e' riportato accanto
   all'errore per pixel, e non come nota a pie' di pagina.
 
-  Per la stessa ragione l'ultima sezione non misura un errore ma uno SPETTRO: la
-  distribuzione dei valori HDR (R, G, B e norma del pixel) di ogni run contro
-  quella della GT, per frame e su tutti i frame insieme, piu' il confronto fra la
-  skybox originale e quelle bakate dai NeRF.  Un run puo' avere l'errore per
-  pixel piu' basso e lo spettro piu' storto.
+  Per la stessa ragione la matrice non contiene solo errori per pixel: le ultime
+  due colonne misurano lo SPETTRO, cioe' quanto la distribuzione dei valori HDR
+  del run somiglia a quella della GT (distanza W1 in decadi e spostamento tonale
+  medio), calcolate sullo stesso insieme di pixel della matrice.  Un run puo'
+  avere l'errore per pixel piu' basso e lo spettro piu' storto.  La sezione
+  finale scompone quello stesso spettro per canale, per frame e sulla skybox
+  (originale contro quelle bakate dai NeRF).
 
 Le formule replicate da altri moduli sono segnalate nei commenti con il file di
 origine, cosi' che una divergenza futura sia individuabile: lo script e' autonomo
@@ -120,6 +123,7 @@ SPEC_UPPER = SPEC_LO_EXP + np.arange(NS) * SPEC_STEP
 SPEC_CHANNELS = ("R", "G", "B", "norm")
 SPEC_CH_COLORS = ("#E63946", "#2A9D8F", "#457B9D", "#9B59B6")   # come _RGB_HIST_COLORS
 N_SPEC_CH = len(SPEC_CHANNELS)
+NORM_CH = N_SPEC_CH - 1   # indice del canale "norm"
 
 # Quantita' accumulate per cella (set x fascia).  Tutte sono medie di quantita'
 # per campione, quindi additive sulle partizioni: e' cio' che rende esatta la
@@ -127,28 +131,38 @@ N_SPEC_CH = len(SPEC_CHANNELS)
 QUANTS = ("sq", "absd", "smape", "rel", "logsq", "musq",
           "tmclip_sq", "tmrein_sq", "p", "g")
 
-# Metriche mostrate nella matrice, con verso e loss che le rende "diagonali"
+# Metriche mostrate nella matrice, con verso e famiglia.
+#
+# Nessuna colonna coincide con una delle loss dello sweep: MSE/PSNR lineare, MAE e
+# relMSE sono state tolte proprio perche' ognuna e' la loss di uno dei run, che quindi
+# ne e' il minimo per costruzione.  Restano nei CSV grezzi (metrics_global.csv), dove
+# nessuno le legge come una classifica.
 @dataclass(frozen=True)
 class MetricSpec:
     key: str
     label: str
     higher_is_better: bool
-    own_loss: str | None = None     # loss per cui questa metrica e' la diagonale
     fmt: str = "{:.4f}"
+    # True = misura la DISTRIBUZIONE dei valori, non l'errore per pixel.  Serve a
+    # separare le due famiglie nelle figure e nel report: sono domande diverse, e il
+    # caso interessante e' quando si contraddicono.
+    spectrum: bool = False
 
 
 METRIC_SPECS = (
-    MetricSpec("smape",      "SMAPE",          False, None,          "{:.4f}"),
-    MetricSpec("mu_psnr",    "mu-PSNR [dB]",   True,  None,          "{:.2f}"),
-    MetricSpec("log_rmse",   "log-RMSE",       False, None,          "{:.4f}"),
-    MetricSpec("psnr_lin",   "PSNR lin [dB]",  True,  "mse",         "{:.2f}"),
-    MetricSpec("mae_lin",    "MAE",            False, "l1",          "{:.5f}"),
-    MetricSpec("rel_mse_gt", "relMSE",         False, "rel_mse_raw", "{:.4f}"),
-    MetricSpec("psnr_tm_clip",     "PSNR tm-clip [dB]",     True, None, "{:.2f}"),
-    MetricSpec("psnr_tm_reinhard", "PSNR tm-Reinhard [dB]", True, None, "{:.2f}"),
+    MetricSpec("smape",            "SMAPE",                 False, "{:.4f}"),
+    MetricSpec("mu_psnr",          "mu-PSNR [dB]",          True,  "{:.2f}"),
+    MetricSpec("log_rmse",         "log-RMSE",              False, "{:.4f}"),
+    MetricSpec("psnr_tm_clip",     "PSNR tm-clip [dB]",     True,  "{:.2f}"),
+    MetricSpec("psnr_tm_reinhard", "PSNR tm-Reinhard [dB]", True,  "{:.2f}"),
     # etichetta senza barre verticali: finisce dentro una tabella markdown
-    MetricSpec("abs_energy_bias",  "abs. energy bias",      False, None, "{:.5f}"),
+    MetricSpec("abs_energy_bias",  "abs. energy bias",      False, "{:.5f}"),
+    MetricSpec("spec_w1",          "W1 spectrum [dex]",     False, "{:.4f}", spectrum=True),
+    MetricSpec("spec_absdmean",    "abs. dmean [dex]",      False, "{:.4f}", spectrum=True),
 )
+
+# indice della prima colonna di distribuzione: separatore nelle figure
+FIRST_SPEC_COL = next(j for j, sp in enumerate(METRIC_SPECS) if sp.spectrum)
 
 # Colori: la famiglia di colore identifica la loss, la tonalita' e il tratto
 # identificano l'attivazione (exp = scuro continuo, softplus = chiaro tratteggiato)
@@ -350,6 +364,33 @@ def spectrum_hist(arr_hw3: np.ndarray, weights: np.ndarray | None = None) -> np.
     return out
 
 
+def spectrum_hist_sets(arr_hw3: np.ndarray, fg: np.ndarray) -> np.ndarray:
+    """(H, W, 3) + maschera fg -> (3, 4, NS): full, fg, bg nell'ordine di PIXEL_SETS.
+
+    L'indice di bin si calcola una volta sola e si ribina tre volte: la searchsorted e'
+    la parte cara, i bincount no.  I tre istogrammi sono calcolati in modo indipendente
+    (full senza pesi, fg con la maschera, bg col complemento) e non per differenza:
+    cosi' il controllo `full == fg + bg` di verify_spectrum ha davvero potere sulla
+    gestione della maschera invece di essere vero per costruzione.
+
+    Il motivo per cui serve la separazione: la pipeline consuma il NeRF in due modi
+    diversi, il foreground alimenta il fit PBR e il background il bake dell'envmap, e
+    sono due distribuzioni di radianza diverse.
+    """
+    a = arr_hw3.astype(np.float32, copy=False)
+    vals = (a[..., 0], a[..., 1], a[..., 2], np.sqrt((a * a).sum(-1)))
+    w_fg = fg.reshape(-1).astype(np.float64)
+    w_bg = 1.0 - w_fg
+    out = np.zeros((len(PIXEL_SETS), N_SPEC_CH, NS), dtype=np.float64)
+    for c, v in enumerate(vals):
+        # side="right" e clip: stessa convenzione di spectrum_hist, nessun pixel perso
+        idx = np.clip(np.searchsorted(SPEC_EDGES, v.reshape(-1), side="right"), 0, NS - 1)
+        out[0, c] = np.bincount(idx, minlength=NS)
+        out[1, c] = np.bincount(idx, weights=w_fg, minlength=NS)
+        out[2, c] = np.bincount(idx, weights=w_bg, minlength=NS)
+    return out
+
+
 def spec_density(hist: np.ndarray) -> np.ndarray:
     """Istogramma (..., NS) -> densita' che somma a 1 sull'ultimo asse."""
     tot = hist.sum(axis=-1, keepdims=True)
@@ -531,7 +572,9 @@ class GtStats:
     fg_frac: float
     hl_in_fg: float          # quota degli highlight (L>1) che cade nel foreground
     percentiles: dict[float, float]
-    spec_gt: np.ndarray = field(default_factory=lambda: np.zeros((0, N_SPEC_CH, NS)))
+    # (F, 3, 4, NS): frame x pixel set (PIXEL_SETS) x canale x bin
+    spec_gt: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, len(PIXEL_SETS), N_SPEC_CH, NS)))
     n_pixels: int = 0        # pixel per frame, per la verifica sugli istogrammi
 
 
@@ -541,14 +584,15 @@ def gt_prepass(gt_paths: list[Path], mask_paths: list[Path]) -> GtStats:
     p999 = np.zeros(len(gt_paths))
     gmax = np.zeros(len(gt_paths))
     n_cell_tot = np.zeros(N_CELLS)
-    # spettro della GT: calcolato qui perche' questo passo carica gia' ogni GT
-    spec_gt = np.zeros((len(gt_paths), N_SPEC_CH, NS), dtype=np.float64)
+    # spettro della GT: calcolato qui perche' questo passo carica gia' ogni GT e la
+    # sua maschera, quindi i tre pixel set non costano un EXR in piu'
+    spec_gt = np.zeros((len(gt_paths), len(PIXEL_SETS), N_SPEC_CH, NS), dtype=np.float64)
     n_pixels = 0
     t0 = time.perf_counter()
     for i, (gp, mp) in enumerate(zip(gt_paths, mask_paths)):
         g = load_exr_rgb(str(gp))
         fg = load_mask_bool(str(mp))
-        spec_gt[i] = spectrum_hist(g)
+        spec_gt[i] = spectrum_hist_sets(g, fg)
         n_pixels = g.shape[0] * g.shape[1]
         lum = (g * LUMA_COEFF).sum(-1)
         p999[i] = float(np.percentile(lum, 99.9))
@@ -595,13 +639,16 @@ class RunResult:
     run: Run
     acc: Accum
     per_frame: list[dict] = field(default_factory=list)
-    spec: np.ndarray = field(default_factory=lambda: np.zeros((0, N_SPEC_CH, NS)))
+    # (F, 3, 4, NS), stessa disposizione di GtStats.spec_gt
+    spec: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, len(PIXEL_SETS), N_SPEC_CH, NS)))
 
 
 def compute_all(runs: list[Run], gt_paths: list[Path], mask_paths: list[Path],
                 stats: GtStats) -> dict[str, RunResult]:
-    results = {r.key: RunResult(run=r, acc=Accum(),
-                                spec=np.zeros((len(gt_paths), N_SPEC_CH, NS)))
+    results = {r.key: RunResult(
+                   run=r, acc=Accum(),
+                   spec=np.zeros((len(gt_paths), len(PIXEL_SETS), N_SPEC_CH, NS)))
                for r in runs}
     n_frames = len(gt_paths)
     total = n_frames * len(runs)
@@ -621,8 +668,8 @@ def compute_all(runs: list[Run], gt_paths: list[Path], mask_paths: list[Path],
                 raise ValueError(f"{r.key} frame {i}: shape {pred.shape} != GT {gt.shape}")
             facc = accumulate_frame(pred, ctx, stats.mu_scale)
             results[r.key].acc.add(facc)
-            # spettro del frame intero: nessuna maschera, nessun EXR in piu'
-            results[r.key].spec[i] = spectrum_hist(pred)
+            # spettro sui tre pixel set: la maschera e' gia' in mano, nessun EXR in piu'
+            results[r.key].spec[i] = spectrum_hist_sets(pred, fg)
 
             row = {"run": r.key, "frame": i}
             for ps in PIXEL_SETS:
@@ -669,12 +716,14 @@ def compute_all(runs: list[Run], gt_paths: list[Path], mask_paths: list[Path],
 CACHE_NAME = "_cache_metrics.npz"
 # v2 = aggiunti gli spettri (per run e per la GT).  Una cache v1 non ha le chiavi
 # corrispondenti: va ignorata invece di far esplodere un KeyError.
-CACHE_VERSION = 2
+# v3 = gli spettri hanno un asse in piu' (pixel set): stessa chiave, shape diversa,
+# quindi anche qui va ignorata e non riletta.
+CACHE_VERSION = 3
 
 
 def _spec_grid() -> dict:
     return {"lo": SPEC_LO_EXP, "hi": SPEC_HI_EXP, "per_decade": SPEC_PER_DECADE,
-            "channels": list(SPEC_CHANNELS)}
+            "channels": list(SPEC_CHANNELS), "pixel_sets": list(PIXEL_SETS)}
 
 
 def save_cache(out: Path, results: dict[str, RunResult], stats: GtStats) -> None:
@@ -1196,12 +1245,15 @@ def fig_per_frame_referee(results: dict[str, RunResult], runs: list[Run],
 
 
 def _matrix_values(results: dict[str, RunResult], runs: list[Run], pixel_set: str,
-                   mu_scale: float) -> tuple[np.ndarray, np.ndarray]:
+                   mu_scale: float, an: "SpectrumAnalysis"
+                   ) -> tuple[np.ndarray, np.ndarray]:
     vals = np.zeros((len(runs), len(METRIC_SPECS)))
     ranks = np.zeros_like(vals, dtype=int)
     for i, r in enumerate(runs):
         n, s = _slice(results[r.key].acc, pixel_set, 0, N_DEC - 1)
         m = metrics_from(n, s, mu_scale)
+        # le colonne di distribuzione vengono dallo spettro dello STESSO pixel set
+        m.update(spectrum_metrics(an, r.key, pixel_set))
         for j, sp in enumerate(METRIC_SPECS):
             vals[i, j] = m[sp.key]
     for j, sp in enumerate(METRIC_SPECS):
@@ -1210,15 +1262,14 @@ def _matrix_values(results: dict[str, RunResult], runs: list[Run], pixel_set: st
 
 
 def fig_metric_matrix(results: dict[str, RunResult], runs: list[Run], mu_scale: float,
-                      figdir: Path, pixel_set: str = "full") -> None:
-    vals, ranks = _matrix_values(results, runs, pixel_set, mu_scale)
+                      figdir: Path, pixel_set: str, an: "SpectrumAnalysis") -> None:
+    vals, ranks = _matrix_values(results, runs, pixel_set, mu_scale, an)
     cmap = plt.get_cmap("RdYlGn_r")
     fig, ax = plt.subplots(figsize=(1.35 * len(METRIC_SPECS) + 3, 0.75 * len(runs) + 3))
     im = ax.imshow(ranks, cmap="RdYlGn_r", vmin=1, vmax=len(runs), aspect="auto")
     span = max(len(runs) - 1, 1)
     for i, r in enumerate(runs):
         for j, sp in enumerate(METRIC_SPECS):
-            diag = (sp.own_loss is not None and sp.own_loss == r.loss)
             # testo bianco sulle celle scure (rank estremi): il grigio scuro su verde
             # o rosso saturo non si legge
             cr, cg, cb, _ = cmap((ranks[i, j] - 1) / span)
@@ -1226,34 +1277,36 @@ def fig_metric_matrix(results: dict[str, RunResult], runs: list[Run], mu_scale: 
             ax.text(j, i - 0.16, sp.fmt.format(vals[i, j]), ha="center", va="center",
                     fontsize=8, color=fgc,
                     fontweight="bold" if ranks[i, j] == 1 else "normal")
-            ax.text(j, i + 0.24, f"#{ranks[i, j]}" + ("  (own loss)" if diag else ""),
-                    ha="center", va="center", fontsize=6.5, color=fgc)
-            if diag:
-                ax.add_patch(plt.Rectangle((j - 0.5, i - 0.5), 1, 1, fill=False,
-                                           hatch="////", edgecolor=fgc, lw=1.2))
+            ax.text(j, i + 0.24, f"#{ranks[i, j]}", ha="center", va="center",
+                    fontsize=6.5, color=fgc)
+    # separatore fra errore per pixel e distribuzione: misurano cose diverse
+    ax.axvline(FIRST_SPEC_COL - 0.5, color="k", lw=1.6)
     ax.set_xticks(range(len(METRIC_SPECS)))
     ax.set_xticklabels([s.label for s in METRIC_SPECS], rotation=35, ha="right", fontsize=8)
     ax.set_yticks(range(len(runs)))
     ax.set_yticklabels([r.label for r in runs], fontsize=9)
     ax.set_title(f"Run x metric, pixel set = {pixel_set}. Colour = rank (green best).\n"
-                 "Hatched cells are the metric each run was trained on: not evidence.",
-                 fontsize=10)
+                 "No column is one of the sweep's training losses: no cell is self-graded.\n"
+                 "Right of the line: distribution of the values on the same pixel set, "
+                 "not per-pixel error.", fontsize=10)
     fig.colorbar(im, ax=ax, label="rank", shrink=0.7)
     _save(fig, figdir / f"metric_matrix_{pixel_set}.png")
 
 
 def fig_rank_bump(results: dict[str, RunResult], runs: list[Run], mu_scale: float,
-                  figdir: Path) -> None:
-    _, ranks = _matrix_values(results, runs, "full", mu_scale)
+                  figdir: Path, an: "SpectrumAnalysis") -> None:
+    _, ranks = _matrix_values(results, runs, "full", mu_scale, an)
     fig, ax = plt.subplots(figsize=(11, 5))
     x = np.arange(len(METRIC_SPECS))
     for i, r in enumerate(runs):
         ax.plot(x, ranks[i], color=r.color, ls=r.linestyle, lw=2, marker="o", ms=6,
                 label=r.label)
-    for j, sp in enumerate(METRIC_SPECS):
-        for i, r in enumerate(runs):
-            if sp.own_loss == r.loss:
-                ax.plot(j, ranks[i, j], marker="s", ms=13, mfc="none", mec="k", mew=1.4)
+    # Le colonne di distribuzione sono su fondo ombreggiato invece che etichettate:
+    # con sei curve che attraversano tutti i rank non esiste un punto del riquadro
+    # dove un'etichetta non copra una linea, e sopra il riquadro c'e' il titolo.
+    ax.axvspan(FIRST_SPEC_COL - 0.5, len(METRIC_SPECS) - 0.5, color="#8C8CB4",
+               alpha=0.13, lw=0, zorder=0)
+    ax.axvline(FIRST_SPEC_COL - 0.5, color="k", lw=1.4, alpha=0.7, zorder=1)
     ax.set_xticks(x)
     ax.set_xticklabels([s.label for s in METRIC_SPECS], rotation=35, ha="right", fontsize=8)
     ax.set_yticks(range(1, len(runs) + 1))
@@ -1261,8 +1314,11 @@ def fig_rank_bump(results: dict[str, RunResult], runs: list[Run], mu_scale: floa
     ax.set_ylabel("rank (1 = best)")
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8, ncol=2)
-    ax.set_title("Rank stability across metrics. Square markers = the run's own training loss.\n"
-                 "A ranking that survives only on its own loss is not a ranking.", fontsize=10)
+    ax.set_title("Rank stability across metrics, none of which is a training loss.\n"
+                 "A run that changes rank between columns is telling you the ranking "
+                 "depends on the metric, not on the model.\n"
+                 "Left of the divider: per-pixel error. Shaded: distribution of the "
+                 "values.", fontsize=10)
     _save(fig, figdir / "rank_bump.png")
 
 
@@ -1549,25 +1605,29 @@ def fig_visual(runs: list[Run], gt_paths: list[Path], mask_paths: list[Path],
 @dataclass
 class SpectrumAnalysis:
     keys: list[str]                  # run, nell'ordine di `runs`
+    # Le quantita' per frame restano sul FRAME INTERO: sono quelle che alimentano le
+    # figure e le tabelle di questa sezione.  La divisione per pixel set vive solo
+    # negli array `*_pooled_set`, che alimentano le tre matrici run x metrica.
     w1: np.ndarray                   # (n_run, n_frame, 4)  distanza per frame
     dmean: np.ndarray                # (n_run, n_frame, 4)  bias con segno
-    w1_pooled: np.ndarray            # (n_run, 4)   su tutti i frame insieme
+    w1_pooled: np.ndarray            # (n_run, 4)   su tutti i frame insieme, full
     dmean_pooled: np.ndarray         # (n_run, 4)
-    spec_gt_tot: np.ndarray          # (4, NS)
+    w1_pooled_set: np.ndarray        # (n_run, 3, 4)  per pixel set (PIXEL_SETS)
+    dmean_pooled_set: np.ndarray     # (n_run, 3, 4)
+    spec_gt_tot: np.ndarray          # (4, NS)      full
     spec_run_tot: np.ndarray         # (n_run, 4, NS)
     notable: dict[str, int]          # etichetta -> indice di frame
-    order: list[int]                 # run ordinati per w1 medio sui canali
-
-
-NORM_CH = N_SPEC_CH - 1   # indice del canale "norm"
+    order: list[int]                 # run ordinati per w1 sul canale norm
 
 
 def analyze_spectrum(results: dict[str, RunResult], runs: list[Run],
                      stats: GtStats) -> SpectrumAnalysis:
     keys = [r.key for r in runs]
-    spec_gt = stats.spec_gt                                   # (F, 4, NS)
+    spec_gt_set = stats.spec_gt                                   # (F, 3, 4, NS)
+    spec_runs_set = np.stack([results[k].spec for k in keys])     # (R, F, 3, 4, NS)
+    spec_gt = spec_gt_set[:, 0]                                   # (F, 4, NS)  full
+    spec_runs = spec_runs_set[:, :, 0]                            # (R, F, 4, NS)
     n_frames = spec_gt.shape[0]
-    spec_runs = np.stack([results[k].spec for k in keys])     # (R, F, 4, NS)
 
     w1 = np.zeros((len(keys), n_frames, N_SPEC_CH))
     dmean = np.zeros_like(w1)
@@ -1577,8 +1637,14 @@ def analyze_spectrum(results: dict[str, RunResult], runs: list[Run],
 
     spec_gt_tot = spec_gt.sum(0)                              # (4, NS)
     spec_run_tot = spec_runs.sum(1)                           # (R, 4, NS)
-    w1_pooled = spec_w1_dex(spec_run_tot, spec_gt_tot[None])
-    dmean_pooled = spec_dmean_dex(spec_run_tot, spec_gt_tot[None])
+
+    # pooling sui frame per ciascun pixel set: (R, 3, 4, NS) contro (1, 3, 4, NS)
+    gt_tot_set = spec_gt_set.sum(0)                           # (3, 4, NS)
+    run_tot_set = spec_runs_set.sum(1)                        # (R, 3, 4, NS)
+    w1_pooled_set = spec_w1_dex(run_tot_set, gt_tot_set[None])
+    dmean_pooled_set = spec_dmean_dex(run_tot_set, gt_tot_set[None])
+    w1_pooled = w1_pooled_set[:, 0]
+    dmean_pooled = dmean_pooled_set[:, 0]
 
     # ── frame notevoli ───────────────────────────────────────────────────────
     # Riferimento: il canale `norm`, che e' la quantita' che il resto della
@@ -1597,28 +1663,53 @@ def analyze_spectrum(results: dict[str, RunResult], runs: list[Run],
         "most_hdr": int(np.argmax(stats.per_frame_p999)),
     }
 
-    order = list(np.argsort(w1_pooled.mean(axis=1)))
+    # Classifica sul canale `norm` e non sulla media dei quattro: e' la stessa
+    # quantita' che la matrice run x metrica mette in colonna, quindi le due
+    # classifiche non possono divergere.  La media sui quattro canali conterebbe
+    # comunque due volte la stessa informazione, dato che norm e' funzione di RGB.
+    order = list(np.argsort(w1_pooled[:, NORM_CH]))
     return SpectrumAnalysis(keys, w1, dmean, w1_pooled, dmean_pooled,
+                            w1_pooled_set, dmean_pooled_set,
                             spec_gt_tot, spec_run_tot, notable, order)
 
 
+def spectrum_metrics(an: SpectrumAnalysis, key: str, pixel_set: str) -> dict[str, float]:
+    """Le due colonne di spettro della matrice, canale norm (= ||RGB||_2).
+
+    `dmean` entra in valore assoluto perche' il rank ha bisogno di un verso; il segno
+    resta leggibile nella sezione spettro e in spectrum_distance.csv.
+    """
+    if key not in an.keys:
+        raise KeyError(f"{key} non e' nell'analisi di spettro ({an.keys})")
+    i, s = an.keys.index(key), PIXEL_SETS.index(pixel_set)
+    return {"spec_w1": float(an.w1_pooled_set[i, s, NORM_CH]),
+            "spec_absdmean": float(abs(an.dmean_pooled_set[i, s, NORM_CH]))}
+
+
 def verify_spectrum(results: dict[str, RunResult], stats: GtStats) -> list[str]:
-    """Nessun pixel perso nel binning, e distanza nulla della GT da se stessa."""
+    """Nessun pixel perso nel binning, partizione fg/bg esatta, GT a distanza nulla
+    da se stessa."""
     lines = []
     n_pix = stats.n_pixels
-    tot_gt = stats.spec_gt.sum(axis=-1)                   # (F, 4)
-    bad = 0 if n_pix <= 0 else int(np.count_nonzero(np.abs(tot_gt - n_pix) > 0.5))
-    for key, res in results.items():
-        t = res.spec.sum(axis=-1)
-        bad += int(np.count_nonzero(np.abs(t - n_pix) > 0.5))
+    all_spec = [stats.spec_gt] + [res.spec for res in results.values()]
+
+    tot = np.concatenate([s[:, 0].sum(axis=-1).ravel() for s in all_spec])   # full
+    bad = 0 if n_pix <= 0 else int(np.count_nonzero(np.abs(tot - n_pix) > 0.5))
     lines.append(f"  [{'OK ' if bad == 0 else 'FAIL'}] spettro: ogni istogramma somma "
                  f"a {n_pix} pixel ({bad} violazioni)")
 
-    self_w1 = float(np.abs(spec_w1_dex(stats.spec_gt, stats.spec_gt)).max())
+    # I tre insiemi sono binnati indipendentemente (spectrum_hist_sets), quindi questa
+    # uguaglianza e' una verifica vera sulla maschera: prova che nessun pixel finisce
+    # in due insiemi o in nessuno.
+    worst = max(float(np.abs(s[:, 0] - s[:, 1] - s[:, 2]).max()) for s in all_spec)
+    lines.append(f"  [{'OK ' if worst == 0.0 else 'FAIL'}] spettro: full == fg + bg bin "
+                 f"per bin (scarto max {worst:.3e})")
+
+    self_w1 = float(np.abs(spec_w1_dex(stats.spec_gt[:, 0], stats.spec_gt[:, 0])).max())
     lines.append(f"  [{'OK ' if self_w1 == 0.0 else 'FAIL'}] spettro: W1(GT, GT) = "
                  f"{self_w1:.3e}")
 
-    dens = spec_density(stats.spec_gt)
+    dens = spec_density(stats.spec_gt[:, 0])
     err = float(np.abs(dens.sum(axis=-1) - 1.0).max())
     lines.append(f"  [{'OK ' if err < 1e-12 else 'FAIL'}] spettro: densita' a somma 1 "
                  f"(scarto max {err:.2e})")
@@ -1834,8 +1925,9 @@ def fig_spectrum_frames(an: SpectrumAnalysis, runs: list[Run], results: dict[str
     outdir.mkdir(parents=True, exist_ok=True)
     x = _spec_x()
     xlim = _spec_xlim(an.spec_gt_tot, an.spec_run_tot)
-    # limiti in y dai singoli frame (piu' alti del pooled: meno pixel per bin)
-    ylim = _spec_ylim(stats.spec_gt, *[results[k].spec for k in an.keys])
+    # limiti in y dai singoli frame (piu' alti del pooled: meno pixel per bin).
+    # Fetta `full`: mescolare i tre pixel set conterebbe due volte gli stessi pixel.
+    ylim = _spec_ylim(stats.spec_gt[:, 0], *[results[k].spec[:, 0] for k in an.keys])
     by_frame: dict[int, list[str]] = {}
     for name, f in an.notable.items():
         by_frame.setdefault(f, []).append(name)
@@ -1846,8 +1938,8 @@ def fig_spectrum_frames(an: SpectrumAnalysis, runs: list[Run], results: dict[str
         fig, axs = _spec_panel_grid(sharex=True, sharey=True)
         for c, ch in enumerate(SPEC_CHANNELS):
             curves = [(f"{r.label}  W1={an.w1[i, fidx, c]:.3f}", r.color, r.linestyle,
-                       results[r.key].spec[fidx, c]) for i, r in enumerate(runs)]
-            _draw_spectrum(axs[c], x, stats.spec_gt[fidx, c], curves, ylim, xlim)
+                       results[r.key].spec[fidx, 0, c]) for i, r in enumerate(runs)]
+            _draw_spectrum(axs[c], x, stats.spec_gt[fidx, 0, c], curves, ylim, xlim)
             axs[c].set_title(ch, fontsize=10)
             axs[c].set_xlabel("pixel value (HDR)", fontsize=8)
             axs[c].set_ylabel("fraction of pixels per bin", fontsize=8)
@@ -2027,15 +2119,19 @@ def _report_spectrum(A, runs: list[Run], an: SpectrumAnalysis,
                      sky: tuple[np.ndarray, dict[str, np.ndarray], Path] | None) -> None:
     A("## Spettro dei colori")
     A("")
-    A("Le metriche qui sopra sono errori **per pixel**: dicono quanto un run sbaglia, "
-      "non se riproduce la **distribuzione** dei valori della GT. Sono domande diverse: "
-      "un run puo' avere l'errore piu' basso e lo spettro piu' storto, per esempio "
-      "comprimendo le alte luci e alzando il fondo scala. Dentro gli integrali "
-      "emisferici della pipeline conta la seconda.")
+    A("Le metriche per pixel dicono quanto un run sbaglia, non se riproduce la "
+      "**distribuzione** dei valori della GT. Sono domande diverse: un run puo' avere "
+      "l'errore piu' basso e lo spettro piu' storto, per esempio comprimendo le alte "
+      "luci e alzando il fondo scala. Dentro gli integrali emisferici della pipeline "
+      "conta la seconda.")
+    A("")
+    A("Le due colonne `W1 spectrum` e `abs. dmean` della matrice vengono da qui, li' "
+      "divise per insieme di pixel. Questa sezione resta sul **frame intero** e lo "
+      "scompone: per canale, per frame, e sulla skybox.")
     A("")
     A(f"Lo spettro e' l'istogramma dei valori HDR su griglia log ({SPEC_PER_DECADE} bin "
-      f"per decade da 1e{SPEC_LO_EXP:.0f} a 1e{SPEC_HI_EXP:.0f}), calcolato sul **frame "
-      "intero** (nessuna distinzione fg/bg) per i canali R, G, B e per la norma "
+      f"per decade da 1e{SPEC_LO_EXP:.0f} a 1e{SPEC_HI_EXP:.0f}), qui calcolato sul "
+      "**frame intero**, per i canali R, G, B e per la norma "
       "`||RGB||` del pixel. La distanza dalla GT e' la **W1 nel dominio log10**, cioe' "
       "lo spostamento medio dei quantili misurato in **decadi**: 0 = distribuzioni "
       "identiche, 0.1 = i quantili sono spostati in media di un decimo di decade "
@@ -2051,8 +2147,13 @@ def _report_spectrum(A, runs: list[Run], an: SpectrumAnalysis,
     A(_md_table(["#", "run", "act.", "loss"] + [f"W1 {c}" for c in SPEC_CHANNELS]
                 + ["W1 media", "dmean norm"], rows))
     A("")
-    A("Classifica sulla media dei quattro canali, su tutti i frame insieme "
-      "(`spectrum_distance.csv` per le statistiche per frame). Figure: "
+    A("Classifica sul canale `norm`, su tutti i frame insieme: e' la radianza del "
+      "pixel, cioe' la quantita' che la pipeline consuma, ed e' la stessa colonna che "
+      "compare nella matrice, quindi le due classifiche non possono divergere. La "
+      "colonna `W1 media` resta come diagnosi, ma mediare i quattro canali conterebbe "
+      "due volte la stessa informazione, dato che `norm` e' funzione di R, G, B.")
+    A("")
+    A("Statistiche per frame in `spectrum_distance.csv`. Figure: "
       "`spectrum_global.png` (istogrammi), `spectrum_global_ratio.png` (residuo, "
       "dove le differenze si vedono), `spectrum_cdf.png` (l'area fra le curve **e'** "
       "la W1), `spectrum_qq.png` (quantile per quantile).")
@@ -2090,7 +2191,8 @@ def _report_spectrum(A, runs: list[Run], an: SpectrumAnalysis,
         A("")
         rows = []
         pairs = [(r, per_run[r.key]) for r in runs if r.key in per_run]
-        pairs.sort(key=lambda t: float(spec_w1_dex(t[1], spec_sky_gt).mean()))
+        # stesso criterio della classifica sui frame: canale norm, non media sui 4
+        pairs.sort(key=lambda t: float(spec_w1_dex(t[1], spec_sky_gt)[NORM_CH]))
         for rank, (r, h) in enumerate(pairs, start=1):
             w1 = spec_w1_dex(h, spec_sky_gt)
             dm = spec_dmean_dex(h, spec_sky_gt)
@@ -2122,10 +2224,10 @@ def _report_spectrum(A, runs: list[Run], an: SpectrumAnalysis,
 
 def write_report(out: Path, runs: list[Run], results: dict[str, RunResult],
                  stats: GtStats, checks: list[str], root: Path, n_frames: int,
-                 an: SpectrumAnalysis | None = None,
+                 an: SpectrumAnalysis,
                  sky: tuple[np.ndarray, dict[str, np.ndarray], Path] | None = None) -> None:
     mu_scale = stats.mu_scale
-    vals, ranks = _matrix_values(results, runs, "full", mu_scale)
+    vals, ranks = _matrix_values(results, runs, "full", mu_scale, an)
     order = np.argsort([r for r in ranks[:, 0]])   # rank sulla SMAPE (prima colonna)
 
     L: list[str] = []
@@ -2140,17 +2242,34 @@ def write_report(out: Path, runs: list[Run], results: dict[str, RunResult],
     A("")
     A("Ogni run e' per costruzione il minimo della **propria** loss su questi dati. "
       "Classificarli con la MSE premia i run `mse`, con la MAE i run `l1`, con la relMSE "
-      "i run `rel_mse_raw`: le celle diagonali della matrice non sono evidenza. La "
-      "metrica di testa e' quindi la **SMAPE**, `mean(|p-g| / (|p|+|g|+1e-3))`, su cui "
-      "nessun run e' stato addestrato: e' simmetrica, invariante di scala (in HDR ogni "
-      "decade pesa uguale) e limitata in [0,1], quindi un singolo pixel incandescente "
-      "non decide la classifica. mu-PSNR e log-RMSE la affiancano come controllo.")
+      "i run `rel_mse_raw`. Per questo le tre metriche che coincidono con le loss dello "
+      "sweep, cioe' **MSE/PSNR lineare, MAE e relMSE**, sono state **tolte dalla "
+      "matrice** invece che marcate: una cella auto-valutata resta ingannevole anche "
+      "quando e' etichettata, e marcarne alcune ma non tutte lascerebbe il campo di casa "
+      "a una loss sola. Restano calcolate in `metrics_global.csv`, dove nessuno le legge "
+      "come una classifica.")
+    A("")
+    A("La metrica di testa e' la **SMAPE**, `mean(|p-g| / (|p|+|g|+1e-3))`: e' "
+      "simmetrica, invariante di scala (in HDR ogni decade pesa uguale) e limitata in "
+      "[0,1], quindi un singolo pixel incandescente non decide la classifica. mu-PSNR e "
+      "log-RMSE la affiancano come controllo. Una precisazione che serve per non "
+      "vendere piu' di quanto c'e': nessuna colonna della matrice **e'** una delle loss, "
+      "ma `PSNR tm-clip` e `PSNR tm-Reinhard` restano quadratiche e `log-RMSE` resta "
+      "relativa, quindi la parentela di famiglia con `mse` e `rel_mse_raw` esiste. E' "
+      "molto piu' debole della coincidenza esatta, e viene dichiarata invece che "
+      "nascosta.")
     A("")
     A("Il secondo criterio non e' un errore per pixel. Il NeRF, qui, e' consumato dentro "
       "integrali emisferici (irradianza indiretta, coni speculari): il **bias con segno** "
       "sopravvive all'integrazione, il rumore a media nulla si cancella. Un modello "
       "leggermente piu' rumoroso ma centrato e' preferibile a uno piu' liscio ma che "
       "sottostima sistematicamente gli highlight.")
+    A("")
+    A("Il terzo criterio e' lo **spettro**, cioe' la distribuzione dei valori, e non e' "
+      "piu' un'appendice: le ultime due colonne della matrice sono la distanza W1 dalla "
+      "distribuzione della GT e lo spostamento tonale medio, entrambe in decadi e "
+      "calcolate sullo **stesso insieme di pixel** della colonna accanto. La sezione "
+      "\"Spettro dei colori\" le scompone per canale e per frame.")
     A("")
 
     A("## Classifica secondo la metrica di testa (SMAPE, full frame)")
@@ -2167,26 +2286,38 @@ def write_report(out: Path, runs: list[Run], results: dict[str, RunResult],
         rows.append([f"**{ranks[i, 0]}**", r.key, r.activation, r.loss,
                      f"{m['smape']:.4f}", f"{mr['smape']:.4f}", f"{mh['smape']:.4f}",
                      f"{mr['energy_bias']:+.4f}", f"{mh['energy_bias']:+.4f}",
-                     f"{m['mu_psnr']:.2f}", f"{m['psnr_lin']:.2f}"])
+                     f"{m['mu_psnr']:.2f}",
+                     f"{spectrum_metrics(an, r.key, 'full')['spec_w1']:.4f}"])
     A(_md_table(["#", "run", "act.", "loss", "SMAPE", "SMAPE rest", "SMAPE highlight",
-                 "bias rest", "bias highlight", "mu-PSNR", "PSNR lin"], rows))
+                 "bias rest", "bias highlight", "mu-PSNR", "W1 spettro"], rows))
     A("")
     A("`rest` = luminanza GT <= 1, `highlight` = luminanza GT > 1. Il bias e' "
-      "`(sum pred - sum gt) / sum gt` sulla zona: negativo = sottostima.")
+      "`(sum pred - sum gt) / sum gt` sulla zona: negativo = sottostima. `W1 spettro` "
+      "e' la distanza fra la distribuzione dei valori del run e quella della GT, in "
+      "decadi, sul frame intero: non si divide fra `rest` e `highlight` perche' e' una "
+      "proprieta' dell'intera distribuzione, non di una sua fascia.")
     A("")
     A("La stessa classifica sui tre insiemi di pixel, perche' la pipeline consuma il "
       "NeRF in due modi diversi: il foreground alimenta il fit PBR, il background "
       "alimenta il bake dell'envmap.")
     A("")
-    by_set = {ps: _matrix_values(results, runs, ps, mu_scale) for ps in PIXEL_SETS}
+    by_set = {ps: _matrix_values(results, runs, ps, mu_scale, an) for ps in PIXEL_SETS}
+    j_w1 = next(j for j, sp in enumerate(METRIC_SPECS) if sp.key == "spec_w1")
     rows = []
     for i, r in enumerate(runs):
         cells = [r.label]
-        for ps in PIXEL_SETS:
-            v_ps, rk_ps = by_set[ps]
-            cells.append(f"{v_ps[i, 0]:.4f} (#{rk_ps[i, 0]})")
+        for j in (0, j_w1):
+            for ps in PIXEL_SETS:
+                v_ps, rk_ps = by_set[ps]
+                cells.append(f"{v_ps[i, j]:.4f} (#{rk_ps[i, j]})")
         rows.append(cells)
-    A(_md_table(["run", "SMAPE full", "SMAPE foreground", "SMAPE background"], rows))
+    A(_md_table(["run", "SMAPE full", "SMAPE foreground", "SMAPE background",
+                 "W1 full", "W1 foreground", "W1 background"], rows))
+    A("")
+    A("Le colonne `W1` sono lo spettro calcolato sullo stesso insieme di pixel, non il "
+      "valore del frame intero ripetuto tre volte: la distribuzione della radianza "
+      "dell'oggetto e quella dell'envmap sono due cose diverse, e un run puo' "
+      "riprodurre bene l'una e male l'altra.")
     A("")
 
     # ── Il compromesso, calcolato dai dati e non asserito ────────────────────
@@ -2194,37 +2325,41 @@ def write_report(out: Path, runs: list[Run], results: dict[str, RunResult],
     A("")
     top = [runs[i] for i in order]
     win = int(order[0])
-    win_loss = runs[win].loss
-    # i rank sono una permutazione di 1..n, quindi argmin da' l'indice del primo
-    neutral = [(j, sp) for j, sp in enumerate(METRIC_SPECS) if sp.own_loss is None]
-    diagonal = [(j, sp) for j, sp in enumerate(METRIC_SPECS) if sp.own_loss is not None]
-    n_agree = [sp.label for j, sp in neutral if int(np.argmin(ranks[:, j])) == win]
-    n_dis = [sp.label for j, sp in neutral if sp.label not in n_agree]
-    d_agree = [sp.label for j, sp in diagonal if int(np.argmin(ranks[:, j])) == win]
-    d_dis = [sp.label for j, sp in diagonal if sp.label not in d_agree]
+    # i rank sono una permutazione di 1..n, quindi argmin da' l'indice del primo.
+    # La partizione non e' piu' neutre/diagonali (non ci sono piu' diagonali) ma per
+    # famiglia: errore per pixel contro distribuzione dei valori.
+    per_pixel = [(j, sp) for j, sp in enumerate(METRIC_SPECS) if not sp.spectrum]
+    spec_fam = [(j, sp) for j, sp in enumerate(METRIC_SPECS) if sp.spectrum]
+    p_agree = [sp.label for j, sp in per_pixel if int(np.argmin(ranks[:, j])) == win]
+    p_dis = [sp.label for j, sp in per_pixel if sp.label not in p_agree]
+    s_agree = [sp.label for j, sp in spec_fam if int(np.argmin(ranks[:, j])) == win]
+    s_dis = [sp.label for j, sp in spec_fam if sp.label not in s_agree]
 
-    A(f"Le metriche **neutre**, quelle su cui nessun run e' stato addestrato, sono "
-      f"{len(neutral)}. Di queste, {len(n_agree)} indicano lo stesso vincitore della "
-      f"metrica di testa" + (f": {', '.join(n_agree)}" if n_agree else "") +
-      (f"; le restanti no: {', '.join(n_dis)}." if n_dis else "."))
+    A(f"Le metriche di **errore per pixel** sono {len(per_pixel)}, nessuna delle quali "
+      f"coincide con una loss dello sweep. Di queste, {len(p_agree)} indicano lo stesso "
+      f"vincitore della metrica di testa"
+      + (f": {', '.join(p_agree)}" if p_agree else "")
+      + (f"; le restanti no: {', '.join(p_dis)}." if p_dis else "."))
     A("")
-    A(f"Le metriche **diagonali** sono {len(diagonal)}. "
-      + (f"{', '.join(d_agree)} indica lo stesso vincitore, ma "
-         + (f"e' la loss con cui il vincitore e' stato addestrato (`{win_loss}`), "
-            "quindi non e' una conferma indipendente. "
-            if any(sp.own_loss == win_loss for _, sp in diagonal
-                   if sp.label in d_agree) else "")
-         if d_agree else "")
-      + (f"{', '.join(d_dis)} indica un vincitore diverso, ed e' il comportamento "
-         "atteso: ogni run e' il minimo della propria loss."
-         if d_dis else ""))
+    A(f"Le metriche di **distribuzione** sono {len(spec_fam)}. "
+      + (f"{', '.join(s_agree)} " + ("indicano" if len(s_agree) > 1 else "indica")
+         + " lo stesso vincitore. " if s_agree else "")
+      + (f"{', '.join(s_dis)} " + ("indicano" if len(s_dis) > 1 else "indica")
+         + " un vincitore diverso: il run che sbaglia meno per pixel non e' quello che "
+           "riproduce meglio la distribuzione dei valori, ed e' la seconda che conta "
+           "dentro gli integrali emisferici." if s_dis else ""))
     A("")
-    if not n_dis:
-        A("Nessuna metrica neutra contraddice la classifica di testa: il ranking non "
-          "dipende dalla metrica scelta, purche' la metrica non sia una delle loss.")
+    if not p_dis and not s_dis:
+        A("Nessuna metrica contraddice la classifica di testa: il ranking non dipende "
+          "dalla metrica scelta, e nessuna delle metriche e' una delle loss.")
+    elif not s_dis:
+        A("Le due famiglie concordano sul vincitore, ma almeno una metrica per pixel "
+          "no: il risultato va presentato come compromesso e non come vincitore "
+          "assoluto.")
     else:
-        A("Almeno una metrica neutra contraddice la classifica di testa, quindi il "
-          "risultato va presentato come compromesso e non come vincitore assoluto.")
+        A("Le due famiglie non concordano. E' il caso interessante: errore per pixel e "
+          "fedelta' della distribuzione sono domande diverse, e la scelta va motivata "
+          "su quale delle due la pipeline consuma davvero.")
     A("")
 
     # confronto appaiato fra i primi due, sui 60 frame
@@ -2278,15 +2413,18 @@ def write_report(out: Path, runs: list[Run], results: dict[str, RunResult],
         cells = []
         for j, sp in enumerate(METRIC_SPECS):
             txt = sp.fmt.format(vals[i, j]) + f" (#{ranks[i, j]})"
-            if sp.own_loss == r.loss:
-                txt = f"_{txt} own_"
-            elif ranks[i, j] == 1:
+            if ranks[i, j] == 1:
                 txt = f"**{txt}**"
             cells.append(txt)
         rows.append([r.label] + cells)
     A(_md_table(hdr, rows))
     A("")
-    A("`own` marca la metrica su cui quel run e' stato addestrato.")
+    A("Nessuna colonna e' una delle loss dello sweep, quindi nessuna cella e' "
+      "auto-valutata. Le ultime due misurano la distribuzione e non l'errore per "
+      "pixel: sono la W1 dalla distribuzione della GT e lo spostamento tonale medio in "
+      "valore assoluto, sul canale `norm` e sullo stesso insieme di pixel della "
+      "matrice. Le stesse due colonne, calcolate su `fg` e `bg`, sono in "
+      "`metric_matrix_fg.png` e `metric_matrix_bg.png`.")
     A("")
 
     A("## Errore sugli highlight e sul resto")
@@ -2342,8 +2480,11 @@ def write_report(out: Path, runs: list[Run], results: dict[str, RunResult],
 
     A("## Avvertenze")
     A("")
-    A("1. **Circolarita'.** Ogni run e' il minimo della propria loss su questi dati; le "
-      "celle marcate `own` nella matrice non sono evidenza a favore di quel run.")
+    A("1. **Circolarita'.** Ogni run e' il minimo della propria loss su questi dati. Le "
+      "tre metriche che coincidono con le loss dello sweep (MSE/PSNR lineare, MAE, "
+      "relMSE) sono percio' escluse dalla matrice e dalle classifiche; sopravvivono "
+      "solo in `metrics_global.csv` e `metrics_per_frame_all_runs.csv`, che sono dump "
+      "grezzi. Se le si usa per confrontare i run, il confronto e' circolare.")
     A("2. **Sono tutte viste di training.** `hold_out_preview` e' `False` di default "
       "(`nerf/dataset.py`), quindi tutti i frame valutati qui sono stati visti in "
       "addestramento. Si sta misurando la qualita' del fit, non la generalizzazione.")
@@ -2469,6 +2610,13 @@ def main() -> int:
     smax = max(max(x["smape_full"] for x in res.per_frame) for res in results.values())
     print(f"  [{'OK ' if 0 <= smax <= 1 else 'FAIL'}] SMAPE dentro [0,1]: max={smax:.4f}")
 
+    # Prima delle tabelle e delle figure: due colonne della matrice vengono da qui.
+    an = analyze_spectrum(results, usable, stats)
+    print("      frame notevoli (canale norm): " +
+          ", ".join(f"{k}={v}" for k, v in an.notable.items()))
+    print("      classifica per spettro (W1 sul canale norm, in decadi): " +
+          ", ".join(f"{usable[i].label} {an.w1_pooled[i, NORM_CH]:.4f}" for i in an.order))
+
     write_metrics_global(out, results, stats.mu_scale)
     write_metrics_by_band(out, results, stats.mu_scale)
     write_bias_by_decade(out, results, stats.mu_scale)
@@ -2478,9 +2626,9 @@ def main() -> int:
 
     fig_quality_boxplots(results, usable, figdir)
     fig_per_frame_referee(results, usable, stats, figdir)
-    for ps in ("full", "fg", "bg"):
-        fig_metric_matrix(results, usable, stats.mu_scale, figdir, ps)
-    fig_rank_bump(results, usable, stats.mu_scale, figdir)
+    for ps in PIXEL_SETS:
+        fig_metric_matrix(results, usable, stats.mu_scale, figdir, ps, an)
+    fig_rank_bump(results, usable, stats.mu_scale, figdir, an)
     fig_bias_by_decade(results, usable, stats.mu_scale, figdir)
     fig_smape_by_decade(results, usable, stats.mu_scale, figdir)
     fig_highlight_bias(results, usable, stats.mu_scale, figdir)
@@ -2493,11 +2641,6 @@ def main() -> int:
     fig_visual(usable, gt_paths, mask_paths, vf, figdir)
 
     # ── spettro dei colori ───────────────────────────────────────────────────
-    an = analyze_spectrum(results, usable, stats)
-    print("      frame notevoli (canale norm): " +
-          ", ".join(f"{k}={v}" for k, v in an.notable.items()))
-    print("      classifica per spettro (W1 media sui canali, in decadi): " +
-          ", ".join(f"{usable[i].label} {an.w1_pooled[i].mean():.4f}" for i in an.order))
     write_spectrum_tables(out, an, usable)
     print("      + spectrum_distance.csv, spectrum_per_frame.csv")
     fig_spectrum_global(an, usable, figdir)
