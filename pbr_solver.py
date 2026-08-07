@@ -64,6 +64,9 @@ suffissati):
     su disco (irradiance_indirect.exr sommata se presente); se manca, la mappa
     è saltata con warning. Sui texel non risolvibili si assume x=1 (diffuso,
     α = media tra camere → a ≡ albedo Lambertiana classica).
+metallic e roughness vengono scritte anche come metallic_rgb.exr /
+roughness_rgb.exr accanto agli originali (stessi valori su tre canali R/G/B
+float32, convenzione dei bake di Blender) salvo blender_rgb=False.
 Diagnostica in <out>/sources/{source}/pbr/: diffuse_weight.exr (x),
 diffuse_term.exr (α, radianza diffusa stimata), lobe_param.exr (apertura del
 cono vincente in gradi, 0 = specchio), residual.exr, n_views.exr,
@@ -75,6 +78,7 @@ ium/ium_masks.exr, visibility/visibility.exr, irradiance/.
 Uso:
     python pbr_solver.py <output_dir> [--source gt] [--cv-gate 0.05]
                          [--spec-threshold 0.2] [--min-views 2] [--albedo-eps 1e-3]
+                         [--no-blender-rgb]
 """
 
 from __future__ import annotations
@@ -90,6 +94,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from images_generator import (  # noqa: E402
     DataLayer, ImageFormat, _save_layer, spec_cone_level_name,
 )
+from exr_to_blender_rgb import write_blender_rgb  # noqa: E402
 
 # Sotto questo x il texel è considerato completamente speculare: l'albedo
 # diffusa non è definita (α/x → 0/0) e viene scritta a 0 (convenzione metallo).
@@ -169,6 +174,7 @@ def solve_pbr(output_dir: str,
               spec_threshold: float = 0.2,
               min_views: int = 2,
               albedo_eps: float = 1e-3,
+              blender_rgb: bool = True,
               eps: float = 1e-12) -> dict:
     out = Path(output_dir)
     src_dir = out / "sources" / source     # artefatti source-dipendenti (camera_texture/, pixel_change/, uscite PBR)
@@ -336,6 +342,17 @@ def solve_pbr(output_dir: str,
     _save_layer(metallic.reshape(H, W), metallic_path, fmt, DataLayer.METALLIC)
     _save_layer(roughness.reshape(H, W), roughness_path, fmt, DataLayer.ROUGHNESS)
 
+    # Variante R/G/B nella convenzione dei bake di Blender, accanto agli
+    # originali a canale singolo (che restano l'input dei lettori interni).
+    # force=True: le mappe sono appena state riscritte, una _rgb rimasta da un
+    # run precedente sarebbe stantia.
+    metallic_rgb_path = roughness_rgb_path = None
+    if blender_rgb:
+        metallic_rgb_path = write_blender_rgb(metallic_path, force=True, quiet=True)
+        roughness_rgb_path = write_blender_rgb(roughness_path, force=True, quiet=True)
+        metallic_rgb_path = metallic_rgb_path and metallic_rgb_path.as_posix()
+        roughness_rgb_path = roughness_rgb_path and roughness_rgb_path.as_posix()
+
     # ── Diagnostica ───────────────────────────────────────────────────────────
     pbr_dir = src_dir / "pbr"
     pbr_dir.mkdir(parents=True, exist_ok=True)
@@ -392,10 +409,15 @@ def solve_pbr(output_dir: str,
 
     print(f"✓ metallic:  {metallic_path}")
     print(f"✓ roughness: {roughness_path}")
+    if metallic_rgb_path and roughness_rgb_path:
+        print(f"✓ variante RGB per Blender: {Path(metallic_rgb_path).name}, "
+              f"{Path(roughness_rgb_path).name}")
     print(f"✓ diagnostica in {pbr_dir}")
     return {
         "metallic_path": metallic_path,
         "roughness_path": roughness_path,
+        "metallic_rgb_path": metallic_rgb_path,
+        "roughness_rgb_path": roughness_rgb_path,
         "albedo_pbr_path": albedo_pbr_path,
         "albedo_pbr": albedo_pbr,
         "metallic": metallic.reshape(H, W),
@@ -424,7 +446,11 @@ if __name__ == "__main__":
                     help="minimo di camere valide per texel")
     ap.add_argument("--albedo-eps", type=float, default=1e-3,
                     help="clamp minimo dell'irradiance nell'albedo_pbr")
+    ap.add_argument("--no-blender-rgb", action="store_true",
+                    help="non scrivere le varianti metallic_rgb/roughness_rgb "
+                         "(EXR R/G/B nella convenzione dei bake di Blender)")
     args = ap.parse_args()
     solve_pbr(args.output_dir, source=args.source,
               cv_gate=args.cv_gate, spec_threshold=args.spec_threshold,
-              min_views=args.min_views, albedo_eps=args.albedo_eps)
+              min_views=args.min_views, albedo_eps=args.albedo_eps,
+              blender_rgb=not args.no_blender_rgb)

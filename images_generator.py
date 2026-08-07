@@ -944,6 +944,10 @@ class RenderConfig:
     pbr_min_views: int = 2
     pbr_diffuse_cv_gate: float = 0.05  # std tra camere < gate·luminanza → diffuso (0 = gate disattivato)
     pbr_spec_threshold: float = 0.2    # metallic minimo perché r sia attendibile (0 = nessuna censura)
+    # Copia metallic/roughness anche come EXR R/G/B (metallic_rgb.exr,
+    # roughness_rgb.exr): il canale singolo 'Z' che scrive ExrWriter non è la
+    # convenzione dei bake di Blender, che replicano il grigio su tre canali.
+    pbr_write_blender_rgb: bool = True
 
     # Albedo (color_texture / irradiance) — modello Lambertiano ρ = π · L / E
     render_albedo: bool = False
@@ -3209,7 +3213,8 @@ def _step4_reconstruction(
                                     cv_gate=rc.pbr_diffuse_cv_gate,
                                     spec_threshold=rc.pbr_spec_threshold,
                                     min_views=rc.pbr_min_views,
-                                    albedo_eps=rc.albedo_eps)
+                                    albedo_eps=rc.albedo_eps,
+                                    blender_rgb=rc.pbr_write_blender_rgb)
                 ium_result_data[f"metallic_path_{src}"] = _as_relative_to(
                     pbr_out["metallic_path"], json_dir_str)
                 ium_result_data[f"roughness_path_{src}"] = _as_relative_to(
@@ -3588,8 +3593,8 @@ if __name__ == "__main__":
     template = PipelineConfig(
         run_step1 = True,  # output Step 1 già su disco (exp_l1_d02)
         run_step2 = True,  # checkpoint NeRF e render Step 2b già su disco
-        run_step3 = True,   # pass texture-space fino al bake dello spec-cone
-        run_step4 = True,   # ricostruzione PBR+albedo (metti run_step3=False per iterare solo qui)
+        run_step3 = False,   # pass texture-space fino al bake dello spec-cone
+        run_step4 = False,   # ricostruzione PBR+albedo (metti run_step3=False per iterare solo qui)
 
         resume_skip_step2_if_ckpt = True,   # salta il training NeRF se il checkpoint esiste già
 
@@ -3726,22 +3731,22 @@ if __name__ == "__main__":
         #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
         #     skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # ),
-        SceneConfig(
-            name             = "TableAndOtherInteriorWithSpecular",
-            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
-            model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
-            external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
-            # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
-            # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
-        ),
-        #  SceneConfig(
-        #     name             = "TableAndOtherInteriorWithSpecularHighDetails",
-        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRHighDetails/transforms.json",
+        # SceneConfig(
+        #     name             = "TableAndOtherInteriorWithSpecular",
+        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
         #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
         #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
         #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
         #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # ),
+         SceneConfig(
+            name             = "TableAndOtherInteriorWithSpecularHighDetails",
+            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRHighDetails/transforms.json",
+            model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+            external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
+            # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
+            # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+        ),
         # SceneConfig(
         #             name             = "TableAndOtherInteriorWithSpecularNight",
         #             transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmoothNight/transforms.json",
@@ -3776,14 +3781,14 @@ if __name__ == "__main__":
     # (tag_base, rgb_activation, loss_type) — fattoriale 2×2 attivazione × loss
     EXPERIMENTS = [
         # ("exp_relmseraw",      "exp",      "rel_mse_raw"),
-        # ("softplus_relmseraw", "softplus", "rel_mse_raw"),
+        ("softplus_relmseraw", "softplus", "rel_mse_raw"),
         ("exp_l1",             "exp",      "l1"),
         # ("softplus_l1",        "softplus", "l1"),
         # ("softplus_mse",       "softplus", "mse"),
         # ("exp_mse",            "exp",      "mse")
     ]
     DECAYS     = (0.2,)
-    SWEEP_ROOT = "D:/tesi_output/specular_exp_l1_complete"
+    SWEEP_ROOT = "D:/tesi_output/test_high_details_new_batches"
 
     for name, act, loss in EXPERIMENTS:
         for decay in DECAYS:
