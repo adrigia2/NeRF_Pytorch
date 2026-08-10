@@ -42,7 +42,16 @@ chiusa. Statistiche sufficienti, accumulate in streaming camera per camera:
 Dal candidato vincente: x = 1−β,  α_c = (SC_c − β·SL_c)/Sw (≥ 0),
     a_c = clip(π·α_c / (max(E_c, albedo_eps)·x), 0, 1);  x < X_EPS → a = 0
 (convenzione metallo: un texel completamente speculare non ha albedo diffusa).
-La RAM non scala col numero di camere (loop streaming, come sempre).
+
+La RAM non scala né col numero di camere né con la risoluzione della texture: il
+loop esterno è sulle BANDE di texel (blocchi di scanline intere, `tile_texels`),
+quello interno sulle camere. Gli accumulatori vivono solo per la banda corrente e
+il fit — che è puramente per-texel, nessuna operazione mette in relazione texel
+diversi — viene chiuso banda per banda; a piena risoluzione restano solo le mappe
+di uscita, in float32. Ogni lettura EXR è una `channels()` su un intervallo di
+scanline: una sola decompressione per banda invece di una per canale (a 4096²
+con 14 aperture il file dei coni ha 43 canali, quindi 43 decompressioni
+dell'intero file per camera).
 
 Gate e validità:
   - gate diffuso scale-invariant sul coefficiente di variazione tra camere
@@ -78,7 +87,7 @@ ium/ium_masks.exr, visibility/visibility.exr, irradiance/.
 Uso:
     python pbr_solver.py <output_dir> [--source gt] [--cv-gate 0.05]
                          [--spec-threshold 0.2] [--min-views 2] [--albedo-eps 1e-3]
-                         [--no-blender-rgb]
+                         [--tile-texels 1048576] [--no-blender-rgb]
 """
 
 from __future__ import annotations
@@ -92,7 +101,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from images_generator import (  # noqa: E402
-    DataLayer, ImageFormat, _save_layer, spec_cone_level_name,
+    DataLayer, ImageFormat, _save_layer, _tile_bar, spec_cone_level_name,
 )
 from exr_to_blender_rgb import write_blender_rgb  # noqa: E402
 
@@ -105,32 +114,111 @@ X_EPS = 1e-3
 # IO helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _channel_order(names: "list[str]") -> "tuple[list[str], bool]":
+    """Ordine canonico dei canali di un EXR → (nomi, canale_singolo).
+
+    Regola condivisa da _read_exr e _ExrBandReader: la colonna j di un array a
+    piena immagine e quella di una banda devono riferirsi allo stesso canale.
+    Non è banale perché ExrWriter (images_generator.py:100-106) nomina i canali
+    in base al loro numero: 1 → Z, 3 → R,G,B, 4 → R,G,B,A e solo da 5 in su
+    Cam0, Cam1, … — quindi una visibility con 3 o 4 camere NON ha canali Cam*.
+    """
+    names = list(names)
+    if names == ["Z"] or names == ["Y"]:
+        return names, True
+    if set("RGB").issubset(names):
+        return ["R", "G", "B"] + (["A"] if "A" in names else []), False
+    return sorted(names, key=lambda n: (len(n), n)), False   # Cam0, Cam1, … in ordine numerico
+
+
+class _ExrBandReader:
+    """EXR letto per blocchi di scanline consecutive: la controparte in lettura
+    di images_generator.IncrementalExrWriter.
+
+    Serve al solver, che ha il loop sulle bande di texel all'esterno e quello
+    sulle camere all'interno: a piena risoluzione i coni di una camera sono già
+    2.6 GiB e gli accumulatori quasi 10, mentre una banda costa poche decine di MB.
+
+    Una `channels()` sola per blocco e non una `channel()` per canale: il
+    framebuffer viene montato una volta e i blocchi ZIP si decomprimono una
+    volta sola. Con i 43 canali del file dei coni la differenza misurata è ~34x.
+    """
+
+    def __init__(self, path: Path):
+        import OpenEXR, Imath
+
+        self.path = Path(path)
+        self._exr = OpenEXR.InputFile(self.path.as_posix())
+        header = self._exr.header()
+        dw = header["dataWindow"]
+        self.width  = dw.max.x - dw.min.x + 1
+        self.height = dw.max.y - dw.min.y + 1
+        self._pt    = Imath.PixelType(Imath.PixelType.FLOAT)  # half convertito in lettura
+        self._avail = set(header["channels"].keys())
+        self.names, self.single = _channel_order(list(header["channels"].keys()))
+
+    # ── lettura ──────────────────────────────────────────────────────────────
+    def read_raw(self, y0: int, rows: "int | None",
+                 names: "list[str]") -> "list[bytes]":
+        """Buffer grezzi dei canali richiesti, nell'ordine richiesto."""
+        rows = self.height - y0 if rows is None else rows
+        if y0 < 0 or rows <= 0 or y0 + rows > self.height:
+            raise ValueError(f"{self.path}: banda [{y0}, {y0 + rows}) fuori "
+                             f"dalle {self.height} scanline del file")
+        missing = [n for n in names if n not in self._avail]
+        if missing:
+            raise ValueError(f"{self.path}: canali mancanti {missing} "
+                             f"(disponibili: {sorted(self._avail)[:8]}…)")
+        return self._exr.channels(names, self._pt, y0, y0 + rows - 1)
+
+    def read(self, y0: int = 0, rows: "int | None" = None,
+             names=None) -> np.ndarray:
+        """Banda → (rows·width, C) float32, oppure (rows·width,) se `names` è una
+        stringa o se il file ha un canale singolo (Z/Y) e `names` è None."""
+        squeeze = False
+        if names is None:
+            names, squeeze = self.names, self.single
+        elif isinstance(names, str):
+            names, squeeze = [names], True
+        else:
+            names = list(names)
+
+        bufs = self.read_raw(y0, rows, names)
+        n = (self.height - y0 if rows is None else rows) * self.width
+        if squeeze:
+            return np.frombuffer(bufs[0], dtype=np.float32).copy()   # scrivibile
+        out = np.empty((n, len(names)), dtype=np.float32)
+        for i, buf in enumerate(bufs):
+            out[:, i] = np.frombuffer(buf, dtype=np.float32)
+        return out
+
+    def close(self) -> None:
+        if self._exr is not None:
+            self._exr.close()
+            self._exr = None
+
+    def __enter__(self): return self
+
+    def __exit__(self, exc_type, exc, tb): self.close()
+
+
+def _read_band(path: Path, y0: int, rows: "int | None" = None, names=None) -> np.ndarray:
+    """Una banda di scanline da `path` (apre, legge, chiude)."""
+    with _ExrBandReader(path) as rd:
+        return rd.read(y0, rows, names)
+
+
 def _read_exr(path: Path) -> np.ndarray:
     """EXR → (H, W) float32 [canale Z] oppure (H, W, C) [R,G,B(,A) o Cam*]."""
-    import OpenEXR, Imath
-
-    exr = OpenEXR.InputFile(path.as_posix())
-    header = exr.header()
-    dw = header["dataWindow"]
-    w = dw.max.x - dw.min.x + 1
-    h = dw.max.y - dw.min.y + 1
-    pt = Imath.PixelType(Imath.PixelType.FLOAT)
-    names = list(header["channels"].keys())
-
-    def chan(name):
-        return np.frombuffer(exr.channel(name, pt), dtype=np.float32).reshape(h, w)
-
-    if names == ["Z"] or names == ["Y"]:
-        return chan(names[0])
-    if set("RGB").issubset(names):
-        chans = ["R", "G", "B"] + (["A"] if "A" in names else [])
-    else:  # canali arbitrari (es. Cam0, Cam1, …) in ordine numerico
-        chans = sorted(names, key=lambda n: (len(n), n))
-    return np.stack([chan(c) for c in chans], axis=-1)
+    with _ExrBandReader(path) as rd:
+        arr = rd.read()
+        return arr.reshape(rd.height, rd.width) if arr.ndim == 1 else \
+            arr.reshape(rd.height, rd.width, -1)
 
 
-def read_cones(path: Path, apertures_deg) -> "tuple[np.ndarray, np.ndarray]":
-    """EXR dei coni di una camera → (L (N, K, 3), n_valid (N,)).
+def read_cones(path: Path, apertures_deg, y0: int = 0,
+               rows: "int | None" = None) -> "tuple[np.ndarray, np.ndarray]":
+    """EXR dei coni di una camera → (L (n, K, 3), n_valid (n,)).
 
     Un canale RGB per livello, con la media pura sul cono già chiusa dal bake,
     più `valid`, il numero di raggi validi del texel. I nomi dei livelli portano
@@ -140,28 +228,28 @@ def read_cones(path: Path, apertures_deg) -> "tuple[np.ndarray, np.ndarray]":
     apertura: il bake condiviso ha il loop sui tile all'esterno, quindi i writer
     di tutte le camere restano aperti insieme e K+1 file per camera
     supererebbero il limite stdio di MSVC.
+
+    Con y0/rows si legge solo una banda di scanline (n = rows·W); il default
+    resta l'immagine intera (n = N).
     """
-    import OpenEXR, Imath
+    K = len(apertures_deg)
+    want = [f"{spec_cone_level_name(apertures_deg, k)}.{c}"
+            for k in range(K) for c in "RGB"] + ["valid"]
 
-    exr = OpenEXR.InputFile(path.as_posix())
-    header = exr.header()
-    dw = header["dataWindow"]
-    w = dw.max.x - dw.min.x + 1
-    h = dw.max.y - dw.min.y + 1
-    pt = Imath.PixelType(Imath.PixelType.FLOAT)   # half convertito in lettura
-    names = set(header["channels"].keys())
-
-    def chan(name):
-        if name not in names:
-            raise ValueError(f"{path}: canale {name!r} mancante "
-                             f"(bake incompleto o num_levels sbagliato nel meta)")
-        return np.frombuffer(exr.channel(name, pt), dtype=np.float32).reshape(h * w)
-
-    cones = np.stack(
-        [np.stack([chan(f"{spec_cone_level_name(apertures_deg, k)}.{c}") for c in "RGB"],
-                  axis=-1)
-         for k in range(len(apertures_deg))], axis=1)      # (N, K, 3)
-    return cones, chan("valid")
+    with _ExrBandReader(path) as rd:
+        try:
+            bufs = rd.read_raw(y0, rows, want)
+        except ValueError as err:
+            raise ValueError(f"{err} — bake incompleto o num_levels sbagliato "
+                             f"nel meta") from None
+        n = (rd.height - y0 if rows is None else rows) * rd.width
+        # Riempita canale per canale: uno np.stack annidato terrebbe in vita le
+        # K fette (n,3) *e* il risultato, raddoppiando il picco a immagine piena.
+        cones = np.empty((n, K, 3), dtype=np.float32)
+        for k in range(K):
+            for ci in range(3):
+                cones[:, k, ci] = np.frombuffer(bufs[3 * k + ci], dtype=np.float32)
+        return cones, np.frombuffer(bufs[-1], dtype=np.float32).copy()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -175,6 +263,7 @@ def solve_pbr(output_dir: str,
               min_views: int = 2,
               albedo_eps: float = 1e-3,
               blender_rgb: bool = True,
+              tile_texels: int = 1 << 20,
               eps: float = 1e-12) -> dict:
     out = Path(output_dir)
     src_dir = out / "sources" / source     # artefatti source-dipendenti (camera_texture/, pixel_change/, uscite PBR)
@@ -208,130 +297,205 @@ def solve_pbr(output_dir: str,
                    for k in range(1, K)]
     n_cand = len(candidates)
 
-    # ── Input per il gate diffuso (color_min NON entra più nel fit) ──────────
-    D_img = _read_exr(src_dir / "pixel_change" / "color_min.exr")          # (H, W, 3)
-    var   = _read_exr(src_dir / "pixel_change" / "color_variance.exr")     # (H, W, 3)
-    H, W  = D_img.shape[:2]
-    N     = H * W
-    D     = D_img.reshape(N, 3).astype(np.float64)
-
-    mask_path = out / "ium" / "ium_masks.exr"
-    if mask_path.exists():
-        mask = _read_exr(mask_path).reshape(N) > 0.5
-    else:
-        mask = np.ones(N, dtype=bool)
-
-    vis_path = out / "visibility" / "visibility.exr"
-    vis = _read_exr(vis_path).reshape(N, -1) > 0.5 if vis_path.exists() else None
-
-    print(f"[pbr_solver] {N} texel, {len(cams)} camere, "
-          f"{n_cand} candidati ({K - 1} coni-media + specchio)")
-
-    # ── Scan streaming: una camera alla volta, statistiche sufficienti ───────
-    SC  = np.zeros((N, 3))                 # Σ w·C          (indip. dal candidato)
-    SCC = np.zeros(N)                      # Σ w·C² pooled  (indip. dal candidato)
-    SL  = np.zeros((N, n_cand, 3))         # Σ w·L          per candidato
-    SLL = np.zeros((N, n_cand))            # Σ w·L² pooled  per candidato
-    SCL = np.zeros((N, n_cand))            # Σ w·C·L pooled per candidato
-    n_views = np.zeros(N, dtype=np.int32)
-
-    for j in cams:
-        C_j = _read_exr(src_dir / "camera_texture" / f"{stems[j]}.exr")
-        C_j = C_j.reshape(N, 3).astype(np.float64)
-        w_j = mask.copy()
-        if vis is not None:
-            w_j &= vis[:, j]
-
-        cones, n_valid = read_cones(
-            spec_dir / meta["cam_file_pattern"].format(cam=j), apertures)
-        cones = cones.astype(np.float64)                    # (N, n_cand, 3)
-        # Un texel è valido per questa camera se almeno un raggio è finito sopra
-        # l'orizzonte: è la stessa maschera che il bake usa per azzerare i coni.
-        w_j &= n_valid > 0
-
-        n_views += w_j
-
-        wf = w_j.astype(np.float64)
-        SC  += wf[:, None] * C_j
-        SCC += wf * (C_j * C_j).sum(axis=-1)
-        for c_idx in range(n_cand):
-            L = cones[:, c_idx]
-            SL[:, c_idx]  += wf[:, None] * L
-            SLL[:, c_idx] += wf * (L * L).sum(axis=-1)
-            SCL[:, c_idx] += wf * (C_j * L).sum(axis=-1)
-        print(f"  cam {j}: statistiche accumulate")
-
-    solvable = mask & (n_views >= min_views)
-
-    # Gate diffuso scale-invariant: variazione tra camere piccola rispetto
-    # alla luminanza del texel → x=1, metallic=0, lobo non vincolato
-    lum_D   = D.mean(axis=-1)
-    lum_std = np.sqrt(np.maximum(var.reshape(N, 3).mean(axis=-1), 0.0))
-    diffuse_gate = solvable & (lum_std < cv_gate * np.maximum(lum_D, 1e-6))
-
-    print(f"  texel risolvibili: {int(solvable.sum())}, "
-          f"di cui gated come diffusi (CV<{cv_gate}): {int(diffuse_gate.sum())}")
-
-    # ── Fit per candidato: regressione centrata in forma chiusa ─────────────
-    Sw  = np.maximum(n_views.astype(np.float64), 1.0)
-    VLL = np.maximum(SLL - (SL ** 2).sum(axis=-1) / Sw[:, None], 0.0)
-    VCL = SCL - np.einsum("nc,nkc->nk", SC, SL) / Sw[:, None]
-    VCC = np.maximum(SCC - (SC ** 2).sum(axis=-1) / Sw, 0.0)
-
-    beta_all = np.clip(VCL / np.maximum(VLL, eps), 0.0, 1.0)        # β = 1−x
-    res_all  = VCC[:, None] - 2.0 * beta_all * VCL + beta_all ** 2 * VLL
-    res_all /= np.maximum(3.0 * n_views, 1.0)[:, None]  # residuo medio per equazione
-
-    target    = solvable & ~diffuse_gate
-    best_k    = np.argmin(res_all, axis=1).astype(np.int32)
-    _idx      = np.arange(N)
-    best_res  = res_all[_idx, best_k]
-    best_beta = beta_all[_idx, best_k]
-
-    for c_idx, (label, rough, _param) in enumerate(candidates):
-        n_best = int(((best_k == c_idx) & target & np.isfinite(best_res)).sum())
-        print(f"  candidato {label:>11} (roughness={rough:.3f}) → migliore per "
-              f"{n_best} texel")
-
-    # ── Composizione output ───────────────────────────────────────────────────
-    fitted = target & np.isfinite(best_res)
-
-    diffuse_w = np.zeros(N, dtype=np.float32)     # x
-    diffuse_w[diffuse_gate] = 1.0
-    diffuse_w[fitted] = (1.0 - best_beta[fitted]).astype(np.float32)
-
-    metallic = np.zeros(N, dtype=np.float32)      # β = 1−x (specularità)
-    metallic[fitted] = best_beta[fitted].astype(np.float32)
-
     rough_vals = np.asarray([c[1] for c in candidates], dtype=np.float32)
     param_vals = np.asarray([c[2] for c in candidates], dtype=np.float32)
 
+    # ── Input: solo geometria dagli header, i pixel si leggono per banda ─────
+    cmin_path = src_dir / "pixel_change" / "color_min.exr"
+    cvar_path = src_dir / "pixel_change" / "color_variance.exr"
+    with _ExrBandReader(cmin_path) as rd:
+        H, W = rd.height, rd.width
+    N = H * W
+
+    mask_path = out / "ium" / "ium_masks.exr"
+    has_mask  = mask_path.exists()
+
+    vis_path = out / "visibility" / "visibility.exr"
+    has_vis  = vis_path.exists()
+    if has_vis:
+        # La colonna j dell'array che _read_exr costruirebbe è la camera j:
+        # l'ordine canonico dei canali dà il nome corrispondente, e leggere per
+        # nome evita di decomprimere i canali delle camere che non servono.
+        with _ExrBandReader(vis_path) as rd:
+            vis_cols = [rd.names[j] for j in cams]
+
+    # Serve solo all'albedo: il controllo sta fuori dal loop così le bande non
+    # allocano nulla quando l'irradiance manca.
+    irr_path = out / "irradiance" / "irradiance.exr"
+    ind_path = out / "irradiance" / "irradiance_indirect.exr"
+    has_irr  = irr_path.exists()
+    has_ind  = has_irr and ind_path.exists()
+
+    cam_paths  = [src_dir / "camera_texture" / f"{stems[j]}.exr" for j in cams]
+    cone_paths = [spec_dir / meta["cam_file_pattern"].format(cam=j) for j in cams]
+
+    # ── Partizione in bande di scanline intere ───────────────────────────────
+    # Il fit è puramente per-texel, quindi partizionare la texture non cambia il
+    # risultato di un bit; cambia solo il picco di RAM, che diventa
+    # ~tile_texels·n_cand·8B·20 invece di N·n_cand·8B·20.
+    rows = max(1, int(tile_texels) // W)
+    if rows >= 16:
+        rows = (rows // 16) * 16      # allineate al blocco ZIP: niente decompressioni doppie
+    rows = min(rows, H)
+    n_tiles = (H + rows - 1) // rows
+
+    print(f"[pbr_solver] {N} texel, {len(cams)} camere, "
+          f"{n_cand} candidati ({K - 1} coni-media + specchio)")
+    print(f"             {n_tiles} bande da {rows} scanline ({rows * W} texel)")
+
+    # ── Uscite a piena risoluzione (float32/int32/bool: ~870 MiB a 4096²) ────
+    n_views    = np.zeros(N, dtype=np.int32)
+    diffuse_w  = np.zeros(N, dtype=np.float32)     # x
+    metallic   = np.zeros(N, dtype=np.float32)     # β = 1−x (specularità)
     lobe_param = np.zeros(N, dtype=np.float32)
-    lobe_param[fitted] = param_vals[best_k[fitted]]
+    roughness  = np.zeros(N, dtype=np.float32)
+    residual   = np.zeros(N, dtype=np.float32)
+    r_valid    = np.zeros(N, dtype=bool)
+    alpha      = np.zeros((N, 3), dtype=np.float32)
+    albedo_flat = np.zeros((N, 3), dtype=np.float32) if has_irr else None
 
-    # lobo attendibile solo con specularità sufficiente; altrove roughness=1
-    r_valid = fitted & (metallic >= spec_threshold)
-    roughness = np.where(mask, 1.0, 0.0).astype(np.float32)
-    roughness[r_valid] = rough_vals[best_k[r_valid]]
+    tot_solvable = tot_gated = tot_rvalid = 0
+    best_counts  = np.zeros(n_cand, dtype=np.int64)
 
-    residual = np.zeros(N, dtype=np.float32)
-    residual[fitted] = best_res[fitted].astype(np.float32)
+    bar = _tile_bar(n_tiles, f"Fit PBR ({source})")
+    for y0 in range(0, H, rows):
+        r   = min(rows, H - y0)
+        off = y0 * W
+        T   = r * W
+        sl  = slice(off, off + T)
 
-    print(f"  texel con r attendibile (metallic≥{spec_threshold}): "
-          f"{int(r_valid.sum())}")
+        mask_t = (_read_band(mask_path, y0, r) > 0.5) if has_mask \
+            else np.ones(T, dtype=bool)
+        D_t   = _read_band(cmin_path, y0, r).astype(np.float64)   # (T, 3)
+        var_t = _read_band(cvar_path, y0, r)                      # (T, 3) f32
+        # Una sola lettura per banda invece di una per camera.
+        vis_t = (_read_band(vis_path, y0, r, vis_cols) > 0.5) if has_vis else None
 
-    # ── Intercetta α = x·a·E/π (radianza diffusa stimata) ────────────────────
-    # x e α completi su tutta la mask: texel gated/non fittabili → diffusi
-    # (x=1, α = media di C tra le camere ⇒ a ≡ albedo Lambertiana classica)
-    C_bar  = SC / Sw[:, None]
-    X_full = np.ones(N)
-    X_full[fitted] = 1.0 - best_beta[fitted]
-    SL_best = SL[_idx, best_k]                                       # (N, 3)
-    alpha = C_bar.copy()
-    alpha[fitted] = ((SC[fitted] - best_beta[fitted, None] * SL_best[fitted])
-                     / Sw[fitted, None])
-    alpha = np.maximum(alpha, 0.0)
-    alpha[~mask] = 0.0
+        # ── Scan streaming: una camera alla volta, statistiche sufficienti ───
+        SC  = np.zeros((T, 3))             # Σ w·C          (indip. dal candidato)
+        SCC = np.zeros(T)                  # Σ w·C² pooled  (indip. dal candidato)
+        SL  = np.zeros((T, n_cand, 3))     # Σ w·L          per candidato
+        SLL = np.zeros((T, n_cand))        # Σ w·L² pooled  per candidato
+        SCL = np.zeros((T, n_cand))        # Σ w·C·L pooled per candidato
+        nv_t = np.zeros(T, dtype=np.int32)
+
+        for jj in range(len(cams)):
+            C_j = _read_band(cam_paths[jj], y0, r).astype(np.float64)   # (T, 3)
+            w_j = mask_t.copy()
+            if vis_t is not None:
+                w_j &= vis_t[:, jj]
+
+            cones, n_valid = read_cones(cone_paths[jj], apertures, y0, r)
+            cones = cones.astype(np.float64)                # (T, n_cand, 3)
+            # Un texel è valido per questa camera se almeno un raggio è finito sopra
+            # l'orizzonte: è la stessa maschera che il bake usa per azzerare i coni.
+            w_j &= n_valid > 0
+
+            nv_t += w_j
+
+            wf = w_j.astype(np.float64)
+            SC  += wf[:, None] * C_j
+            SCC += wf * (C_j * C_j).sum(axis=-1)
+            for c_idx in range(n_cand):
+                L = cones[:, c_idx]
+                SL[:, c_idx]  += wf[:, None] * L
+                SLL[:, c_idx] += wf * (L * L).sum(axis=-1)
+                SCL[:, c_idx] += wf * (C_j * L).sum(axis=-1)
+
+        solvable = mask_t & (nv_t >= min_views)
+
+        # Gate diffuso scale-invariant: variazione tra camere piccola rispetto
+        # alla luminanza del texel → x=1, metallic=0, lobo non vincolato
+        lum_D   = D_t.mean(axis=-1)
+        lum_std = np.sqrt(np.maximum(var_t.mean(axis=-1), 0.0))
+        diffuse_gate = solvable & (lum_std < cv_gate * np.maximum(lum_D, 1e-6))
+
+        # ── Fit per candidato: regressione centrata in forma chiusa ─────────
+        Sw  = np.maximum(nv_t.astype(np.float64), 1.0)
+        VLL = np.maximum(SLL - (SL ** 2).sum(axis=-1) / Sw[:, None], 0.0)
+        VCL = SCL - np.einsum("nc,nkc->nk", SC, SL) / Sw[:, None]
+        VCC = np.maximum(SCC - (SC ** 2).sum(axis=-1) / Sw, 0.0)
+
+        beta_all = np.clip(VCL / np.maximum(VLL, eps), 0.0, 1.0)    # β = 1−x
+        res_all  = VCC[:, None] - 2.0 * beta_all * VCL + beta_all ** 2 * VLL
+        res_all /= np.maximum(3.0 * nv_t, 1.0)[:, None]  # residuo medio per equazione
+
+        target    = solvable & ~diffuse_gate
+        best_k    = np.argmin(res_all, axis=1).astype(np.int32)
+        _idx      = np.arange(T)
+        best_res  = res_all[_idx, best_k]
+        best_beta = beta_all[_idx, best_k]
+
+        # ── Composizione output della banda ─────────────────────────────────
+        fitted = target & np.isfinite(best_res)
+
+        dw_t = np.zeros(T, dtype=np.float32)
+        dw_t[diffuse_gate] = 1.0
+        dw_t[fitted] = (1.0 - best_beta[fitted]).astype(np.float32)
+
+        met_t = np.zeros(T, dtype=np.float32)
+        met_t[fitted] = best_beta[fitted].astype(np.float32)
+
+        lobe_t = np.zeros(T, dtype=np.float32)
+        lobe_t[fitted] = param_vals[best_k[fitted]]
+
+        # lobo attendibile solo con specularità sufficiente; altrove roughness=1
+        rval_t = fitted & (met_t >= spec_threshold)
+        rgh_t  = np.where(mask_t, 1.0, 0.0).astype(np.float32)
+        rgh_t[rval_t] = rough_vals[best_k[rval_t]]
+
+        res_t = np.zeros(T, dtype=np.float32)
+        res_t[fitted] = best_res[fitted].astype(np.float32)
+
+        # ── Intercetta α = x·a·E/π (radianza diffusa stimata) ───────────────
+        # x e α completi su tutta la mask: texel gated/non fittabili → diffusi
+        # (x=1, α = media di C tra le camere ⇒ a ≡ albedo Lambertiana classica)
+        C_bar = SC / Sw[:, None]
+        X_t   = np.ones(T)
+        X_t[fitted] = 1.0 - best_beta[fitted]
+        SL_best = SL[_idx, best_k]                                   # (T, 3)
+        alpha_t = C_bar.copy()
+        alpha_t[fitted] = ((SC[fitted] - best_beta[fitted, None] * SL_best[fitted])
+                           / Sw[fitted, None])
+        alpha_t = np.maximum(alpha_t, 0.0)
+        alpha_t[~mask_t] = 0.0
+
+        n_views[sl]    = nv_t
+        diffuse_w[sl]  = dw_t
+        metallic[sl]   = met_t
+        lobe_param[sl] = lobe_t
+        roughness[sl]  = rgh_t
+        residual[sl]   = res_t
+        r_valid[sl]    = rval_t
+        alpha[sl]      = alpha_t.astype(np.float32)
+
+        # ── Albedo PBR: a = π·α / (max(E_sky+E_ind, albedo_eps)·x) ──────────
+        # Calcolata qui dall'α/x in float64 della banda: rifarla a valle dall'α
+        # float32 salvata cambierebbe gli ultimi bit.
+        if has_irr:
+            E = _read_band(irr_path, y0, r).astype(np.float64)
+            if has_ind:
+                E += _read_band(ind_path, y0, r).astype(np.float64)
+            denom = np.maximum(E, albedo_eps)
+            x_col = np.maximum(X_t, X_EPS)[:, None]
+            alb_t = np.clip(np.pi * alpha_t / (denom * x_col), 0.0, 1.0)
+            alb_t[X_t < X_EPS] = 0.0    # completamente speculare: albedo nulla
+            alb_t[~mask_t] = 0.0
+            albedo_flat[sl] = alb_t.astype(np.float32)
+
+        tot_solvable += int(solvable.sum())
+        tot_gated    += int(diffuse_gate.sum())
+        tot_rvalid   += int(rval_t.sum())
+        best_counts  += np.bincount(best_k[fitted], minlength=n_cand)
+        bar.update(1)
+    bar.close()
+
+    print(f"  texel risolvibili: {tot_solvable}, "
+          f"di cui gated come diffusi (CV<{cv_gate}): {tot_gated}")
+    for c_idx, (label, rough, _param) in enumerate(candidates):
+        print(f"  candidato {label:>11} (roughness={rough:.3f}) → migliore per "
+              f"{int(best_counts[c_idx])} texel")
+    print(f"  texel con r attendibile (metallic≥{spec_threshold}): {tot_rvalid}")
 
     # ── Mappe finali (cartelle dedicate, come l'albedo) ───────────────────────
     fmt = ImageFormat.OPENEXR
@@ -358,7 +522,7 @@ def solve_pbr(output_dir: str,
     pbr_dir.mkdir(parents=True, exist_ok=True)
     _save_layer(diffuse_w.reshape(H, W), (pbr_dir / "diffuse_weight.exr").as_posix(),
                 fmt, DataLayer.METALLIC)
-    _save_layer(alpha.reshape(H, W, 3).astype(np.float32),
+    _save_layer(alpha.reshape(H, W, 3),
                 (pbr_dir / "diffuse_term.exr").as_posix(), fmt, DataLayer.ALBEDO)
     _save_layer(lobe_param.reshape(H, W), (pbr_dir / "lobe_param.exr").as_posix(),
                 fmt, DataLayer.SPEC_CONE_R)
@@ -380,21 +544,11 @@ def solve_pbr(output_dir: str,
     # ── Albedo PBR: a = π·α / (max(E_sky+E_ind, albedo_eps)·x) ───────────────
     # L'albedo esce direttamente dal fit, già depurata dallo speculare per-vista;
     # coesiste con l'albedo Lambertiana classica in <out>/sources/{source}/albedo/.
+    # Il calcolo è già stato fatto banda per banda: qui si scrive soltanto.
     albedo_pbr_path = None
     albedo_pbr = None
-    irr_path = out / "irradiance" / "irradiance.exr"
-    if irr_path.exists():
-        E = _read_exr(irr_path).reshape(N, 3).astype(np.float64)
-        ind_path = out / "irradiance" / "irradiance_indirect.exr"
-        if ind_path.exists():
-            E += _read_exr(ind_path).reshape(N, 3).astype(np.float64)
-        denom = np.maximum(E, albedo_eps)
-
-        x_col = np.maximum(X_full, X_EPS)[:, None]
-        alb_flat = np.clip(np.pi * alpha / (denom * x_col), 0.0, 1.0)
-        alb_flat[X_full < X_EPS] = 0.0    # completamente speculare: albedo nulla
-        alb_flat[~mask] = 0.0
-        albedo_pbr = alb_flat.reshape(H, W, 3).astype(np.float32)
+    if has_irr:
+        albedo_pbr = albedo_flat.reshape(H, W, 3)
 
         alb_dir = src_dir / "albedo_pbr"; alb_dir.mkdir(parents=True, exist_ok=True)
         albedo_pbr_path = (alb_dir / "albedo_pbr.exr").resolve().as_posix()
@@ -402,7 +556,7 @@ def solve_pbr(output_dir: str,
         Image.fromarray((albedo_pbr * 255).astype(np.uint8)
                         ).save(pbr_dir / "albedo_pbr_preview.png")
         print(f"✓ albedo_pbr: {albedo_pbr_path} (indirect: "
-              f"{'sì' if ind_path.exists() else 'no'})")
+              f"{'sì' if has_ind else 'no'})")
     else:
         print(f"    ⚠  albedo_pbr saltata: {irr_path} non trovata "
               "(serve il pass irradiance)")
@@ -446,6 +600,9 @@ if __name__ == "__main__":
                     help="minimo di camere valide per texel")
     ap.add_argument("--albedo-eps", type=float, default=1e-3,
                     help="clamp minimo dell'irradiance nell'albedo_pbr")
+    ap.add_argument("--tile-texels", type=int, default=1 << 20,
+                    help="texel per banda (arrotondati a scanline intere): il "
+                         "picco di RAM scala con questo, non con la risoluzione")
     ap.add_argument("--no-blender-rgb", action="store_true",
                     help="non scrivere le varianti metallic_rgb/roughness_rgb "
                          "(EXR R/G/B nella convenzione dei bake di Blender)")
@@ -453,4 +610,5 @@ if __name__ == "__main__":
     solve_pbr(args.output_dir, source=args.source,
               cv_gate=args.cv_gate, spec_threshold=args.spec_threshold,
               min_views=args.min_views, albedo_eps=args.albedo_eps,
-              blender_rgb=not args.no_blender_rgb)
+              blender_rgb=not args.no_blender_rgb,
+              tile_texels=args.tile_texels)

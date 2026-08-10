@@ -948,6 +948,11 @@ class RenderConfig:
     # roughness_rgb.exr): il canale singolo 'Z' che scrive ExrWriter non è la
     # convenzione dei bake di Blender, che replicano il grigio su tre canali.
     pbr_write_blender_rgb: bool = True
+    # Texel per banda del solver: il fit è per-texel, quindi la texture viene
+    # partizionata in blocchi di scanline intere e il picco di RAM scala con
+    # questo valore (~tile·n_candidati·8B·20, cioè ~2.5 GiB a 1 M texel e 14
+    # candidati) invece che con la risoluzione. Non cambia il risultato.
+    pbr_tile_texels: int = 1 << 20
 
     # Albedo (color_texture / irradiance) — modello Lambertiano ρ = π · L / E
     render_albedo: bool = False
@@ -3214,7 +3219,8 @@ def _step4_reconstruction(
                                     spec_threshold=rc.pbr_spec_threshold,
                                     min_views=rc.pbr_min_views,
                                     albedo_eps=rc.albedo_eps,
-                                    blender_rgb=rc.pbr_write_blender_rgb)
+                                    blender_rgb=rc.pbr_write_blender_rgb,
+                                    tile_texels=rc.pbr_tile_texels)
                 ium_result_data[f"metallic_path_{src}"] = _as_relative_to(
                     pbr_out["metallic_path"], json_dir_str)
                 ium_result_data[f"roughness_path_{src}"] = _as_relative_to(
@@ -3222,6 +3228,10 @@ def _step4_reconstruction(
                 if pbr_out.get("albedo_pbr_path"):
                     ium_result_data[f"albedo_pbr_path_{src}"] = _as_relative_to(
                         pbr_out["albedo_pbr_path"], json_dir_str)
+                # Il dict di ritorno porta anche le mappe a piena risoluzione
+                # (~900 MiB): qui servono solo i path, e senza il del resterebbero
+                # vive per tutta la sorgente successiva.
+                del pbr_out
             if timer is not None:
                 timer.record("step4/pbr", time.perf_counter() - _t4_pbr)
         else:
@@ -3642,7 +3652,7 @@ if __name__ == "__main__":
             ium_texture_size = [4096, 4096],
             apply_scale      = False,
 
-            color_texture_image_sources = ["gt", "nerf"], # entrambe processate per intero sotto sources/
+            color_texture_image_sources = ["gt"], # entrambe processate per intero sotto sources/
 
             precompute_spec_cone = True,
             render_pbr_maps      = True,
