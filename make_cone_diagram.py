@@ -3,11 +3,14 @@
 
     python make_cone_diagram.py --out ../Doc/images/cone
 
-Scrive due PNG e stampa le righe della tabella LaTeX dell'esempio:
+Scrive tre PNG e stampa le righe della tabella LaTeX dell'esempio:
 
   cone_geometry.png  texel, normale, camera, raggio riflesso e i coni candidati
   cone_rings.png     il set condiviso di Fibonacci, colorato per anello, in 3D e
                      nella vista lungo R dove il binning si conta a occhio
+  cone_weights.png   che cosa vale un raggio: la stessa regione in proiezione
+                     equivalente, a sinistra il set condiviso vero con le sue celle di
+                     Voronoi, a destra un budget piatto di N raggi per anello
 
 I pesi e la chiusura dei coni NON sono riscritti qui: arrivano da images_generator,
 gli stessi usati dal bake.  Se un giorno divergono, diverge anche la figura della tesi
@@ -35,11 +38,16 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import LogNorm
 from matplotlib.lines import Line2D
+from matplotlib.patches import Circle, Polygon, Wedge
+from scipy.spatial import SphericalVoronoi
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from images_generator import (_cones_from_rings_np, ring_weights_mean,
+                              spec_cone_ring_samples,
                               spec_cone_shared_ring_samples)
 
 # Caso didattico: pochi raggi, contabili a occhio, e una griglia di aperture ridotta
@@ -48,6 +56,11 @@ APERTURES = [0.0, 30.0, 60.0, 90.0, 140.0]   # aperture TOTALI, in gradi
 S = 96                                        # direzioni condivise sull'emisfero
 THETA_V = 30.0                                # inclinazione della camera dalla normale
 PHI_V = 200.0                                 # suo azimut, scelto solo per l'inquadratura
+
+# Budget piatto della figura sui pesi: un numero arbitrario di raggi per anello, uguale
+# per tutti.  E' l'esagerazione didattica dell'allocazione mirata, dove il floor sui primi
+# anelli lascia comunque una ventina di volte fra il raggio piu' denso e il piu' rado.
+AIMED_PER_RING = 10
 
 # Rampa sequenziale a tinta unica: gli anelli sono ordinati, quindi il colore deve
 # crescere con l'indice.  Niente arcobaleno.  Grigio per i raggi fuori da ogni cono.
@@ -97,6 +110,34 @@ def circle_on_sphere(axis: np.ndarray, half_deg: float, n: int = 240) -> np.ndar
             + np.sin(a) * (np.cos(ang)[:, None] * t + np.sin(ang)[:, None] * b))
 
 
+def _hemisphere_voronoi(dirs: np.ndarray) -> tuple[list, np.ndarray]:
+    """Celle di Voronoi sferiche del set condiviso, chiuse esattamente sull'orizzonte.
+
+    La toppa di cielo che un raggio rappresenta e' la regione delle direzioni piu' vicine
+    a lui che a ogni altro raggio: e' quella, non un settore disegnato a tavolino, che
+    dice quanto vale un campione.
+
+    Il set vive solo sopra n e un Voronoi su mezza sfera lascerebbe le celle di bordo
+    aperte fin sotto la superficie.  Aggiungere i punti specchiati sotto l'orizzonte le
+    chiude su z = 0 senza approssimare niente: per una direzione u con u_z > 0 e una
+    coppia q, q' = (q_x, q_y, -q_z) vale sempre u.q > u.q', quindi nessuna cella superiore
+    attraversa l'equatore.  La somma delle prime S aree torna 2*pi esatto.
+
+    Le aree NON sono tutte uguali: meta' sta entro lo 0.6% da 2*pi/S, ma sul bordo del
+    reticolo (i punti a un decimo di grado dall'equatore) la cella e' tagliata dalla
+    superficie e vale circa meta'.  E' geometria del reticolo, non del bake: l'equazione
+    dei coni usa il peso nominale 2*pi/S e con W_i costante quel fattore si semplifica,
+    quindi la stima resta la media dei campioni.  Per questo la figura colora le celle col
+    peso nominale e ne disegna la forma vera.
+    """
+    mirrored = dirs * np.array([1.0, 1.0, -1.0])
+    sv = SphericalVoronoi(np.concatenate([dirs, mirrored], axis=0),
+                          radius=1.0, center=np.zeros(3))
+    sv.sort_vertices_of_regions()
+    cells = [sv.vertices[r] for r in sv.regions[:len(dirs)]]
+    return cells, sv.calculate_areas()[:len(dirs)]
+
+
 def build_case() -> dict:
     """Geometria, binning e tutte le quantita' dell'equazione."""
     n = np.array([0.0, 0.0, 1.0])
@@ -127,6 +168,20 @@ def build_case() -> dict:
     w = ring_weights_mean(cos_b, k - 1, n_nom)
     cones = _cones_from_rings_np(ring_sum, ring_valid, w)[0, :, 0]
 
+    # Le due allocazioni del budget messe a confronto in fig_weights.  Quella mirata passa
+    # dalla funzione di produzione, cosi' se un giorno cambia allocazione cambia la figura.
+    n_aimed = np.asarray(spec_cone_ring_samples(APERTURES, AIMED_PER_RING, alloc="uniform"),
+                         dtype=np.float64)
+    # I pesi disegnati si dividono a mano e NON passano da ring_weights_mean: con
+    # ring_samples uniforme quella salta la divisione di proposito, perche' un fattore
+    # costante si semplifica fra numeratore e denominatore dell'equazione dei coni.  Esatto
+    # per il valore del cono, sbagliato di un fattore N per una figura il cui soggetto e'
+    # proprio quanto vale una singola toppa.
+    w_draw_aimed = omega / n_aimed
+    w_shared = 2.0 * np.pi / S          # = Omega_i/N_i con N_i = S*Omega_i/2pi, per ogni i
+
+    cells, cell_area = _hemisphere_voronoi(dirs)
+
     # Forma chiusa, valida solo dove il cono non tocca l'orizzonte
     exact = 0.5 + 0.5 * r[2] * (1.0 + cos_b) / 2.0
     unclipped = np.degrees(np.arccos(r[2])) + half <= 90.0
@@ -134,7 +189,9 @@ def build_case() -> dict:
     return dict(n=n, v=v, r=r, dirs=dirs, ang=ang, ring=ring, lum=lum,
                 omega=omega, n_nom=n_nom, w=w, ring_sum=ring_sum[0, :, 0],
                 ring_valid=ring_valid[0], cones=cones, exact=exact,
-                unclipped=unclipped, half=half)
+                unclipped=unclipped, half=half, cos_b=cos_b,
+                n_aimed=n_aimed, w_draw_aimed=w_draw_aimed, w_shared=w_shared,
+                cells=cells, cell_area=cell_area)
 
 
 def _frame(ax, case: dict, arrows: bool = True) -> None:
@@ -298,6 +355,190 @@ def fig_rings(case: dict, out: Path) -> None:
     print(f"  + {out}")
 
 
+def _equal_area_radius(half_deg) -> np.ndarray:
+    """Proiezione azimutale equivalente di Lambert attorno a R: rho = 2 sin(theta/2).
+
+    E' l'unica scelta che rende la figura leggibile come dice di essere: con questo
+    raggio l'area disegnata di una regione VALE il suo angolo solido in steradianti
+    (rho drho = sin theta dtheta), quindi una cella grande il doppio e' un raggio che
+    sta per il doppio di cielo.  La vista polare di cone_rings.png, dove il raggio e'
+    l'angolo da R, non ha questa proprieta' e qui sarebbe una figura che mente.
+    """
+    return 2.0 * np.sin(np.radians(np.asarray(half_deg, dtype=np.float64)) * 0.5)
+
+
+def _project_disk(u: np.ndarray, axis: np.ndarray) -> np.ndarray:
+    """(..., 3) direzioni -> (..., 2) nel disco equivalente attorno ad `axis`.
+
+    rho = 2 sin(gamma/2) = sqrt(2(1 - cos gamma)), azimut attorno all'asse.
+    """
+    t, b = onb(axis)
+    c = np.clip(u @ axis, -1.0, 1.0)
+    rho = np.sqrt(np.maximum(0.0, 2.0 * (1.0 - c)))
+    az = np.arctan2(u @ b, u @ t)
+    return np.stack([rho * np.cos(az), rho * np.sin(az)], axis=-1)
+
+
+def _slerp_ring(v: np.ndarray, steps: int = 6) -> np.ndarray:
+    """Lati di una cella sferica campionati lungo la geodetica invece che in linea retta.
+
+    Una cella e' larga una quindicina di gradi: unendo i vertici con segmenti nel disco i
+    bordi risulterebbero visibilmente piu' dritti del vero e le celle adiacenti non
+    combacerebbero.
+    """
+    out = []
+    for k in range(len(v)):
+        a, b = v[k], v[(k + 1) % len(v)]
+        w = np.arccos(np.clip(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)),
+                              -1.0, 1.0))
+        if w < 1e-9:
+            out.append(a[None, :])
+            continue
+        s = np.linspace(0.0, 1.0, steps, endpoint=False)[:, None]
+        out.append((np.sin((1.0 - s) * w) * a + np.sin(s * w) * b) / np.sin(w))
+    return np.concatenate(out, axis=0)
+
+
+def _dot_color(color) -> str:
+    """Punto bianco o nero a seconda della cella: la rampa attraversa tutto l'intervallo,
+    e un punto bianco sparisce sul giallo tanto quanto uno nero sparisce sul nero."""
+    lum = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+    return C_INK if lum > 0.55 else "white"
+
+
+def _weights_chrome(ax, case: dict, rows: str) -> None:
+    """Cerchi degli anelli, aperture, raggio specchio, orizzonte, elenco sotto il pannello.
+    Identico nei due pannelli: l'unica cosa che cambia fra loro deve essere N_i."""
+    rho = _equal_area_radius(case["half"])
+    a = np.linspace(0, 2 * np.pi, 400)
+    for i in range(len(APERTURES) - 1):
+        # Stesso colore per anello di cone_rings.png e cone_geometry.png: le tre figure
+        # devono leggersi come lo stesso oggetto.
+        ax.plot(rho[i + 1] * np.cos(a), rho[i + 1] * np.sin(a),
+                color=RING_COLORS[i], lw=1.6, zorder=5)
+        ax.text(0.0, rho[i + 1] + 0.035, f"{APERTURES[i + 1]:.0f}$^\\circ$",
+                ha="center", va="bottom", fontsize=11, color=C_INK, zorder=6,
+                bbox=dict(facecolor="white", edgecolor="none", pad=0.8, alpha=0.85))
+
+    # L'orizzonte: il cerchio massimo perpendicolare a n, visto da qui.  Il cono piu' largo
+    # lo attraversa, ed e' li' che il set condiviso finisce.
+    e1, e2 = onb(case["n"])
+    ang = np.linspace(0, 2 * np.pi, 721)
+    xy = _project_disk(np.cos(ang)[:, None] * e1 + np.sin(ang)[:, None] * e2, case["r"])
+    ax.plot(xy[:, 0], xy[:, 1], color="0.45", lw=1.2, ls="--", zorder=5,
+            clip_path=Circle((0, 0), rho[-1], transform=ax.transData))
+
+    ax.scatter([0], [0], marker="+", s=120, color=C_MIRROR, linewidth=2.0, zorder=6)
+    ax.text(0.10, -0.13, r"$\mathbf{R}$", color=C_MIRROR, fontsize=14, zorder=6)
+
+    lim = rho[-1] * 1.16
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.set_aspect("equal")
+    ax.set_axis_off()
+    ax.text(0.5, -0.04, rows, transform=ax.transAxes, ha="center", va="top",
+            fontsize=11, color=C_INK, family="monospace", linespacing=1.5)
+
+
+def _panel_shared(ax, case: dict, norm, cmap) -> None:
+    """Il set condiviso vero, ogni direzione con la sua cella di Voronoi."""
+    rho = _equal_area_radius(case["half"])
+    clip = Circle((0, 0), rho[-1], transform=ax.transData)
+    # Una tinta sola per tutte le celle, senza distinguere in quale anello cadono: e'
+    # esattamente cio' che il pannello afferma, un raggio vale 2*pi/S qualunque anello lo
+    # accolga.  Il binning sta nei cerchi disegnati sopra, ed e' il soggetto di
+    # cone_rings.png, non di questo.
+    color = cmap(norm(case["w_shared"]))
+    for cell in case["cells"]:
+        p = Polygon(_project_disk(_slerp_ring(cell), case["r"]), closed=True,
+                    facecolor=color, edgecolor="white", lw=0.7, zorder=2)
+        p.set_clip_path(clip)
+        ax.add_patch(p)
+
+    pts = _project_disk(case["dirs"], case["r"])
+    s = ax.scatter(pts[:, 0], pts[:, 1], s=9, color=_dot_color(color), zorder=4,
+                   linewidths=0)
+    s.set_clip_path(clip)
+
+
+def _panel_aimed(ax, case: dict, norm, cmap) -> None:
+    """Budget piatto: l'anello i tagliato in N settori uguali, disegnati in scala."""
+    rho = _equal_area_radius(case["half"])
+    for i in range(len(APERTURES) - 1):
+        n_i = int(case["n_aimed"][i])
+        color = cmap(norm(case["w_draw_aimed"][i]))
+        r_in, r_out = rho[i], rho[i + 1]
+        # Settori senza sfasamento fra un anello e l'altro: i bordi radiali si allineano e
+        # si leggono come dieci raggi che attraversano tutti gli anelli, che e' esattamente
+        # quello che il pannello racconta.
+        edges = np.linspace(0.0, 360.0, n_i + 1)
+        for k in range(n_i):
+            ax.add_patch(Wedge((0.0, 0.0), r_out, edges[k], edges[k + 1],
+                               width=r_out - r_in, facecolor=color,
+                               edgecolor="white", lw=0.7, zorder=2))
+        # Un punto per cella, sul raggio che ne dimezza l'area: e' il raggio tracciato, e
+        # ricorda che la cella e' la sua toppa di cielo e non una decorazione.
+        mid_a = np.radians(0.5 * (edges[:-1] + edges[1:]))
+        mid_r = np.sqrt(0.5 * (r_in ** 2 + r_out ** 2))
+        ax.scatter(mid_r * np.cos(mid_a), mid_r * np.sin(mid_a), s=9,
+                   color=_dot_color(color), zorder=4, linewidths=0)
+
+
+def fig_weights(case: dict, out: Path) -> None:
+    fig = plt.figure(figsize=(10.0, 6.4))
+    # Tre righe e non due: quella di mezzo resta vuota e fa spazio all'elenco degli anelli,
+    # che vive nelle coordinate dei pannelli e altrimenti finisce sotto la barra.
+    gs = fig.add_gridspec(3, 2, height_ratios=(1.0, 0.24, 0.04), hspace=0.10, wspace=0.04)
+
+    w_all = np.append(case["w_draw_aimed"], case["w_shared"])
+    # Scala logaritmica: fra la cella piu' piccola e la piu' grande c'e' un fattore dieci,
+    # e in lineare i due terzi bassi finirebbero tutti nella stessa tinta scura.  La
+    # dimensione resta comunque il canale principale, il colore la rinforza.
+    norm = LogNorm(vmin=w_all.min(), vmax=w_all.max())
+    cmap = plt.get_cmap("magma_r")
+
+    # A sinistra l'elenco ha una colonna in piu': il pannello mostra i raggi veri, quindi
+    # accanto al budget N_i (un valore ATTESO, e i decimali lo dicono) si puo' leggere il
+    # conteggio n_i che e' arrivato davvero.  A destra di raggi veri non ce ne sono.
+    rows_shared = "\n".join(
+        f"ring {i + 1}:  N = {case['n_nom'][i]:4.1f}   n = {int(case['ring_valid'][i + 1]):2d}"
+        f"   W = {case['w_shared']:.3f} sr" for i in range(len(APERTURES) - 1))
+    rows_aimed = "\n".join(
+        f"ring {i + 1}:  N = {int(case['n_aimed'][i]):2d}   W = {case['w_draw_aimed'][i]:.3f} sr"
+        for i in range(len(APERTURES) - 1))
+
+    panels = ((_panel_shared, rows_shared,
+               f"The {S} shared directions, uniform in solid angle",
+               f"each owns a patch of $2\\pi/S$ = {case['w_shared']:.3f} sr"),
+              (_panel_aimed, rows_aimed,
+               f"Flat budget, $N_i$ = {AIMED_PER_RING} on every ring",
+               "what a ray carries spans "
+               f"{case['w_draw_aimed'].max() / case['w_draw_aimed'].min():.1f}$\\times$"))
+    for col, (draw, rows, title, sub) in enumerate(panels):
+        ax = fig.add_subplot(gs[0, col])
+        draw(ax, case, norm, cmap)
+        _weights_chrome(ax, case, rows)
+        ax.set_title(f"{title}\n{sub}", fontsize=13, color=C_INK, pad=10)
+
+    cax = fig.add_subplot(gs[2, :])
+    cb = fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), cax=cax,
+                      orientation="horizontal")
+    cb.set_label("solid angle one ray stands for, $W_i = \\Omega_i / N_i$  [sr]",
+                 fontsize=12, color=C_INK)
+    # Tick sui valori che le celle hanno davvero, non sulle decadi (in un fattore dieci non
+    # ne cade nessuna): i quattro del pannello a budget piatto, che coprono tutto
+    # l'intervallo.  Il peso del pannello condiviso, 2*pi/S, cade fra il secondo e il terzo
+    # e non va ripetuto: e' gia' scritto nel titolo e nell'elenco.
+    ticks = np.sort(case["w_draw_aimed"])
+    cb.set_ticks(ticks)
+    cb.set_ticklabels([f"{t:.3f}" for t in ticks], fontsize=10)
+    cb.ax.minorticks_off()
+
+    fig.savefig(out, dpi=190, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  + {out}")
+
+
 def print_table(case: dict) -> None:
     print("\n% righe della tabella dell'esempio (generate, non scritte a mano)")
     print("% ring & Theta_i & Omega_i & N_i & n_i & b_i & W_i & L(Theta_k) & exact")
@@ -321,6 +562,30 @@ def print_table(case: dict) -> None:
         print(f"% scarto dalla forma chiusa sui coni non tagliati: max {err.max():.4f}")
 
 
+def print_weights(case: dict) -> None:
+    """I numeri che la didascalia di cone_weights.png cita, stampati e non scritti a mano."""
+    print("\n% pesi delle due allocazioni (figura cone_weights)")
+    print("% ring & Omega_i & N_i atteso & n_i vero & W_i cond. & N_i mirato & W_i mirato")
+    for i in range(len(APERTURES) - 1):
+        print(f"{i + 1} & {case['omega'][i]:.3f} & {case['n_nom'][i]:.2f} & "
+              f"{int(case['ring_valid'][i + 1])} & {case['w_shared']:.4f} & "
+              f"{int(case['n_aimed'][i])} & {case['w_draw_aimed'][i]:.4f} \\\\")
+    wa = case["w_draw_aimed"]
+    print(f"% condiviso: W = 2*pi/S = {case['w_shared']:.4f} su ogni anello")
+    print(f"% mirato:    W fra {wa.min():.4f} e {wa.max():.4f}, "
+          f"rapporto {wa.max() / wa.min():.2f}")
+    inside = case["ring"] < len(APERTURES) - 1
+    print(f"% raggi dentro il cono piu' largo: {int(inside.sum())} condivisi "
+          f"(su S = {S} sull'emisfero), {int(case['n_aimed'].sum())} mirati")
+
+    # Le celle di Voronoi non sono tutte uguali e la didascalia lo dice: qui il numero.
+    a = case["cell_area"] / case["w_shared"]
+    print(f"% celle di Voronoi (in unita' di 2*pi/S): somma {case['cell_area'].sum():.5f} "
+          f"= 2*pi ({2 * np.pi:.5f}), mediana {np.median(a):.3f}, "
+          f"quartili {np.percentile(a, 25):.3f}/{np.percentile(a, 75):.3f}, "
+          f"min {a.min():.3f} (all'orizzonte) max {a.max():.3f}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -332,7 +597,9 @@ def main() -> int:
     case = build_case()
     fig_geometry(case, out / "cone_geometry.png")
     fig_rings(case, out / "cone_rings.png")
+    fig_weights(case, out / "cone_weights.png")
     print_table(case)
+    print_weights(case)
     return 0
 
 

@@ -850,7 +850,7 @@ class RenderConfig:
     render_pixel_change: bool = False    # salva min/max/range texture in pixel_change/
     debug_pixel_change: bool = False     # salva plot comparativo in debug_pixel_change/
 
-    # Irradiance map (Monte Carlo skybox lighting per-texel)
+    # Irradiance map (skybox per-texel, quadratura deterministica su spirale di Fibonacci)
     render_irradiance: bool = False
     irradiance_format: ImageFormat = ImageFormat.OPENEXR
     # Sorgente dell'envmap usato dal pass irradiance:
@@ -3058,7 +3058,7 @@ def _step3_posttrain_assets(
                       "per-camera su disco): frustum/grazing NON applicati. Esegui "
                       "color_texture per raffinarla.")
 
-        # ── Irradiance (Monte Carlo skybox) ──────────────────────────────────
+        # ── Irradiance (skybox, quadratura deterministica) ───────────────────
         irr_res = None
         skybox_flat_step3 = None   # condivisa tra irradiance e spec_cone
         if (rc.render_irradiance
@@ -3591,10 +3591,10 @@ if __name__ == "__main__":
     # skybox_path) sono vuoti qui e vengono sovrascritti per ogni SceneConfig.
     # Tutti gli altri parametri di rendering/NeRF sono condivisi tra le scene.
     template = PipelineConfig(
-        run_step1 = True,  # output Step 1 già su disco (exp_l1_d02)
-        run_step2 = True,  # checkpoint NeRF e render Step 2b già su disco
-        run_step3 = False,   # pass texture-space fino al bake dello spec-cone
-        run_step4 = False,   # ricostruzione PBR+albedo (metti run_step3=False per iterare solo qui)
+        run_step1 = False,  # output Step 1 già su disco (exp_l1_d02)
+        run_step2 = False,  # checkpoint NeRF e render Step 2b già su disco
+        run_step3 = True,   # pass texture-space fino al bake dello spec-cone
+        run_step4 = True,   # ricostruzione PBR+albedo (metti run_step3=False per iterare solo qui)
 
         resume_skip_step2_if_ckpt = True,   # salta il training NeRF se il checkpoint esiste già
 
@@ -3739,14 +3739,14 @@ if __name__ == "__main__":
         #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
         #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # ),
-         SceneConfig(
-            name             = "TableAndOtherInteriorWithSpecularHighDetails",
-            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRHighDetails/transforms.json",
-            model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
-            external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
-            # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
-            # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
-        ),
+        #  SceneConfig(
+        #     name             = "TableAndOtherInteriorWithSpecularHighDetails",
+        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRHighDetails/transforms.json",
+        #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+        #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
+        #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
+        #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+        # ),
         # SceneConfig(
         #             name             = "TableAndOtherInteriorWithSpecularNight",
         #             transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmoothNight/transforms.json",
@@ -3768,6 +3768,19 @@ if __name__ == "__main__":
         #     transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
         #     model_path      = f"{REPO}/Scenes/SwordShield/Models/SwordShield.obj",
         # ),
+        # SceneConfig(
+        #     name             = "SwordShieldStudio",
+        #     transforms_path  = f"{REPO}/Scenes/SwordShield Thesis/NerfStudio/transforms.json",
+        #     model_path       = f"{REPO}/Scenes/SwordShield Thesis/BakedStudio/Baked.obj",
+        #     external_normal_path = f"{REPO}/Scenes/SwordShield Thesis/BakedStudio/BakedMaterial_normal.exr",
+        # ),
+        SceneConfig(
+            name             = "SwordShieldNight",
+            transforms_path  = f"{REPO}/Scenes/SwordShield Thesis/NerfNight/transforms.json",
+            model_path       = f"{REPO}/Scenes/SwordShield Thesis/BakedNight/Baked.obj",
+            external_normal_path = f"{REPO}/Scenes/SwordShield Thesis/BakedNight/BakedMaterial_normal.exr",
+        )
+
     ]
 
     # ── Esecuzione ────────────────────────────────────────────────────────────
@@ -3782,13 +3795,13 @@ if __name__ == "__main__":
     EXPERIMENTS = [
         # ("exp_relmseraw",      "exp",      "rel_mse_raw"),
         ("softplus_relmseraw", "softplus", "rel_mse_raw"),
-        ("exp_l1",             "exp",      "l1"),
+        # ("exp_l1",             "exp",      "l1"),
         # ("softplus_l1",        "softplus", "l1"),
         # ("softplus_mse",       "softplus", "mse"),
         # ("exp_mse",            "exp",      "mse")
     ]
     DECAYS     = (0.2,)
-    SWEEP_ROOT = "D:/tesi_output/test_high_details_new_batches"
+    SWEEP_ROOT = "D:/tesi_output/test_sword_shield"
 
     for name, act, loss in EXPERIMENTS:
         for decay in DECAYS:
@@ -3805,6 +3818,6 @@ if __name__ == "__main__":
                 cfg, SCENES,
                 output_root    = f"{SWEEP_ROOT}/{tag}",
                 run_note       = f"{cfg.nerf_num_iters}iter | act={act} | loss={loss} | decay={decay}",
-                # tb_enabled=False
+                tb_enabled=False
             )
     
