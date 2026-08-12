@@ -159,10 +159,30 @@ class IncrementalExrWriter:
         header["compression"] = Imath.Compression(comp)
         self._file = OpenEXR.OutputFile(path, header)
 
+    HALF_MAX = 65504.0   # massimo rappresentabile in float16
+
+    def _check_half_range(self, name: str, arr: np.ndarray) -> None:
+        """Un valore oltre HALF_MAX diventerebbe inf nel cast a half, e numpy lo
+        segnala con un RuntimeWarning che il filtro di default stampa UNA SOLA
+        VOLTA per posizione nel codice: un bake intero può corrompersi lasciando
+        una riga sola nel log. A valle è peggio che rumoroso, è muto — un inf in
+        un canale dei coni rende nan la varianza centrata del solver, np.argmin
+        restituisce l'indice del nan e il texel esce dal fit. Meglio fermarsi qui.
+        """
+        a = np.asarray(arr)
+        mx = float(np.abs(a).max()) if a.size else 0.0   # nan/inf si propagano al max
+        if not np.isfinite(mx) or mx > self.HALF_MAX:
+            raise ValueError(
+                f"IncrementalExrWriter: {self.path}: il canale {name!r} è half ma "
+                f"contiene {mx:.6g} (limite {self.HALF_MAX:g}): il cast produrrebbe "
+                f"inf. Passare il canale a np.float32 oppure ridurre i valori a monte.")
+
     def write_block(self, block: "dict[str, np.ndarray]") -> None:
         rows = None
         payload = {}
         for name, dt in self.channels.items():
+            if dt == np.float16:
+                self._check_half_range(name, block[name])
             arr = np.ascontiguousarray(block[name], dtype=dt)
             if arr.ndim != 2 or arr.shape[1] != self.width:
                 raise ValueError(f"IncrementalExrWriter: canale {name!r} ha shape "
@@ -1400,12 +1420,25 @@ def spec_cone_channels(apertures_deg) -> "dict[str, type]":
     `valid` è il numero totale di raggi validi del texel (quelli sopra
     l'orizzonte, su tutti i livelli): >0 è la stessa maschera per-camera che il
     bake per anelli scriveva in valid.png.
+
+    Tutti i canali sono float32. I coni sono stati half fino al 2026-08-10, ma
+    half satura a 65504 e il livello specchio porta il valore dell'envmap non
+    mediato: vedi il commento nel corpo. Il formato su disco è comunque
+    trasparente al lettore, perché read_cones legge con PixelType.FLOAT.
     """
     ch: "dict[str, type]" = {}
     for k in range(len(apertures_deg)):
         name = spec_cone_level_name(apertures_deg, k)
         for c in "RGB":
-            ch[f"{name}.{c}"] = np.float16   # radianza: half basta e dimezza il file
+            # float32 e non half: il livello 0 è un CAMPIONE SINGOLO dell'envmap
+            # (raggio specchio, mai mediato), e su una scena notturna le sorgenti
+            # luminose sfondano il range di half. Sullo skybox NeRF di
+            # SwordShieldNight il canale R del nucleo della lampada più forte vale
+            # 80609 contro un limite di 65504: il cast scriveva inf, e un inf in un
+            # canale dei coni fa uscire il texel dal fit PBR per intero, perché
+            # np.argmin propaga il nan che ne deriva. Gli altri livelli sono medie
+            # su ≥9 raggi e avevano margine, ma non vale la pena avere due formati.
+            ch[f"{name}.{c}"] = np.float32
     ch["valid"] = np.float32
     return ch
 
@@ -3601,10 +3634,10 @@ if __name__ == "__main__":
     # skybox_path) sono vuoti qui e vengono sovrascritti per ogni SceneConfig.
     # Tutti gli altri parametri di rendering/NeRF sono condivisi tra le scene.
     template = PipelineConfig(
-        run_step1 = False,  # output Step 1 già su disco (exp_l1_d02)
-        run_step2 = False,  # checkpoint NeRF e render Step 2b già su disco
-        run_step3 = True,   # pass texture-space fino al bake dello spec-cone
-        run_step4 = True,   # ricostruzione PBR+albedo (metti run_step3=False per iterare solo qui)
+        run_step1 = True,  # output Step 1 già su disco (exp_l1_d02)
+        run_step2 = True,  # checkpoint NeRF e render Step 2b già su disco
+        run_step3 = False,   # pass texture-space fino al bake dello spec-cone
+        run_step4 = False,   # ricostruzione PBR+albedo (metti run_step3=False per iterare solo qui)
 
         resume_skip_step2_if_ckpt = True,   # salta il training NeRF se il checkpoint esiste già
 
@@ -3764,9 +3797,9 @@ if __name__ == "__main__":
         #             external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmoothNight/BakedMaterial_normal.exr",
         #             # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
         #             # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
-        #         )
+        #         ),
         # SceneConfig(
-        #     name             = "TableAndOtherInterior",
+        #     name             = "TableAndOtherInteriorNoSpecular",
         #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenExrSmoothNoDiffuse/transforms.json",
         #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
         #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmoothNoDiffuse/BakedMaterial_normal.exr",
@@ -3804,17 +3837,19 @@ if __name__ == "__main__":
     # (tag_base, rgb_activation, loss_type) — fattoriale 2×2 attivazione × loss
     EXPERIMENTS = [
         # ("exp_relmseraw",      "exp",      "rel_mse_raw"),
-        ("softplus_relmseraw", "softplus", "rel_mse_raw"),
-        # ("exp_l1",             "exp",      "l1"),
+        # ("softplus_relmseraw", "softplus", "rel_mse_raw"),
+        ("exp_l1",             "exp",      "l1"),
         # ("softplus_l1",        "softplus", "l1"),
         # ("softplus_mse",       "softplus", "mse"),
         # ("exp_mse",            "exp",      "mse")
     ]
     DECAYS     = (0.2,)
-    SWEEP_ROOT = "D:/tesi_output/test_sword_shield"
+    SWEEP_ROOT = "D:/tesi_output/test_sword_shield_test_retrain"
 
     for name, act, loss in EXPERIMENTS:
         for decay in DECAYS:
+
+
             
             cfg = copy.deepcopy(template)
             cfg.nerf_num_iters       = 75000
