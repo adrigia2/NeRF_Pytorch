@@ -18,7 +18,13 @@ class NerfConfig:
     # Sampling
     near: float = 0.01
     far: float = 20.0          # overwritten at runtime from sphere radius
-    perturb: bool = True
+    # Deviazione standard del rumore gaussiano sommato alla densità grezza in
+    # raw2outputs. È un REGOLARIZZATORE DI TRAINING: lo attiva soltanto il forward
+    # su cui si fa backward (train.py), passandolo esplicitamente come noise_std.
+    # Nessun percorso di inferenza lo legge — render_image, query_radiance e
+    # bake_envmap usano il default 0.0 delle funzioni di render, così un bake è
+    # riproducibile. Fino al 2026-08-12 veniva invece applicato ovunque, e i bake
+    # prodotti allora non sono confrontabili con quelli successivi.
     raw_noise_std: float = 0.0
     # RGB output activation: "exp" (HDR, mirrors NeILFMLP/pbrnerf) or "softplus".
     # Note: checkpoints saved with one activation are NOT compatible with the

@@ -366,6 +366,18 @@ def solve_pbr(output_dir: str,
 
         mask_t = (_read_band(mask_path, y0, r) > 0.5) if has_mask \
             else np.ones(T, dtype=bool)
+
+        # Banda interamente fuori dalla maschera IUM: senza texel validi ogni
+        # uscita della banda varrebbe zero, e gli array sono già zero-inizializzati,
+        # quindi saltarla è bit-identico. Evita le due letture di pixel_change e
+        # soprattutto il loop sulle camere, che è la parte cara (una banda di
+        # camera_texture + una di cam_XXX.exr per camera). Vale sempre — l'atlante
+        # UV ha zone vuote — ma è ciò che rende quasi gratis una ricostruzione
+        # ristretta a una ROI.
+        if not mask_t.any():
+            bar.update(1)
+            continue
+
         D_t   = _read_band(cmin_path, y0, r).astype(np.float64)   # (T, 3)
         var_t = _read_band(cvar_path, y0, r)                      # (T, 3) f32
         # Una sola lettura per banda invece di una per camera.

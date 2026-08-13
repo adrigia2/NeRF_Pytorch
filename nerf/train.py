@@ -305,10 +305,13 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
 
         # ── render unificato fg+bg ───────────────────────────────────────────
         if _profiling: _sync(); _t0 = time.perf_counter()
+        # Unico punto della repo che attiva il rumore sulla densità: è un
+        # regolarizzatore, quindi vale solo per il forward su cui si fa backward.
+        # Ogni percorso di inferenza usa il default noise_std=0.0 ed è riproducibile.
         rgb_pred = render_unified(
             rays_o, rays_d, depths, in_mask,
             model, embed_fn, embeddirs_fn, cfg, center, sphere_radius,
-            perturb=False)
+            noise_std=cfg.raw_noise_std)
         if _profiling: _sync(); _prof["render"] += time.perf_counter() - _t0
 
         # ── loss ─────────────────────────────────────────────────────────────
@@ -407,7 +410,7 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
                 _rgb_pred, _acc = render_unified(
                     _ro, _rd, _dep, _msk,
                     model, embed_fn, embeddirs_fn, cfg, center, sphere_radius,
-                    perturb=False, return_acc=True)
+                    return_acc=True)
                 acc_fg = _acc[_msk].mean() if _msk.any() else _acc.mean()
                 print(f"    [diag] acc_fg={acc_fg:.4f}  "
                       f"pred=[{_rgb_pred.min():.3f},{_rgb_pred.mean():.3f},{_rgb_pred.max():.3f}]  "

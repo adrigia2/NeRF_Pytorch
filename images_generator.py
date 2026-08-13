@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -684,6 +685,139 @@ def _apply_external_normal(rc, ium_res, ium_w: int, ium_h: int) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ROI di test in spazio texture (Step 3 + Step 4)
+#
+# La ROI non è un parametro che attraversa la pipeline: è un fattore in più sulla
+# maschera IUM, applicato una volta sola subito dopo il render IUM. Tutti i kernel
+# a valle escono già sui texel con maschera a zero (deviceProgramsVis.cu:55,
+# ColorTex.cu:22, Irradiance.cu:136, Indirect.cu:39, SpecCone.cu:107,
+# HemiVis.cu:94) e ogni generatore ricarica la maschera dall'host a ogni
+# set_inputs, quindi restringere masks_np basta a restringere tutto il bake.
+# Il fit PBR e l'albedo la ereditano rileggendo ium/ium_masks.exr da disco.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _roi_is_active(rc) -> bool:
+    return bool(rc.roi_rect) or bool(rc.roi_mask_path)
+
+
+def _roi_default_tag(rc) -> str:
+    """Tag di default della sandbox: deterministico, leggibile, filesystem-safe."""
+    parts: list[str] = []
+    if rc.roi_mask_path:
+        stem = Path(rc.roi_mask_path).stem
+        parts.append("".join(c if (c.isalnum() or c in "-_") else "_" for c in stem))
+    if rc.roi_rect:
+        x0, y0, w, h = (int(v) for v in rc.roi_rect)
+        rect = f"{x0}_{y0}_{w}x{h}"
+        parts.append(rect if parts else f"rect_{rect}")
+    return "_".join(parts) if parts else "roi"
+
+
+def _roi_assets_dir(rc, json_dir: Path) -> "tuple[Path, str | None]":
+    """(cartella di destinazione degli output di Step 3/4, tag della ROI).
+
+    Senza ROI è la radice della run, identico a prima. Con una ROI attiva è la
+    sandbox <output_dir>/roi/<tag>/, che replica il layout della radice: le cache
+    full-res non vengono mai toccate.
+    """
+    if not _roi_is_active(rc):
+        return json_dir, None
+    tag = rc.roi_tag or _roi_default_tag(rc)
+    return json_dir / "roi" / tag, tag
+
+
+def _load_roi(rc, ium_w: int, ium_h: int) -> "tuple[np.ndarray | None, dict]":
+    """ROI → (maschera flat bool (ium_w·ium_h,) | None, fingerprint).
+
+    ROI = AND del rettangolo roi_rect e dell'immagine roi_mask_path, ognuno
+    opzionale. Il fingerprint descrive la ROI *risolta* alla risoluzione IUM: è
+    quello che la guardia confronta, così due ROI scritte in modo diverso ma
+    equivalenti texel per texel restano la stessa ROI.
+    """
+    if not _roi_is_active(rc):
+        return None, {}
+
+    roi = np.ones((ium_h, ium_w), dtype=bool)
+
+    if rc.roi_rect:
+        if len(rc.roi_rect) != 4:
+            raise ValueError(
+                f"roi_rect deve essere [x0, y0, w, h], ricevuto {rc.roi_rect!r}")
+        x0, y0, w, h = (int(v) for v in rc.roi_rect)
+        if w <= 0 or h <= 0:
+            raise ValueError(f"roi_rect con lato non positivo: {rc.roi_rect!r}")
+        x1, y1 = min(x0 + w, ium_w), min(y0 + h, ium_h)
+        x0, y0 = max(x0, 0), max(y0, 0)
+        if x1 <= x0 or y1 <= y0:
+            raise ValueError(f"roi_rect {rc.roi_rect!r} è interamente fuori dalla "
+                             f"IUM {ium_w}×{ium_h}")
+        rect = np.zeros_like(roi)
+        rect[y0:y1, x0:x1] = True
+        roi &= rect
+
+    if rc.roi_mask_path:
+        if not os.path.exists(rc.roi_mask_path):
+            raise FileNotFoundError(f"roi_mask_path non trovato: {rc.roi_mask_path}")
+        img = _load_image_hw3_native(rc.roi_mask_path)[..., 0]
+        m = img > rc.roi_mask_threshold
+        if m.shape != (ium_h, ium_w):
+            # NEAREST e non LANCZOS: su una maschera binaria l'interpolazione
+            # sposterebbe il bordo di qualche texel, ed è lo stesso ringing che
+            # ha reso necessario dichiarare external_normal_range invece di
+            # dedurlo.
+            from PIL import Image
+            m = np.array(Image.fromarray(m.astype(np.uint8) * 255)
+                         .resize((ium_w, ium_h), Image.NEAREST)) > 127
+            print(f"[ROI] maschera ricampionata {img.shape[1]}×{img.shape[0]} → "
+                  f"{ium_w}×{ium_h} (NEAREST)")
+        roi &= m
+
+    flat = np.ascontiguousarray(roi.reshape(-1))
+    if not flat.any():
+        raise ValueError("La ROI non contiene texel: controllare roi_rect / "
+                         "roi_mask_path (e la soglia roi_mask_threshold).")
+
+    fingerprint = {
+        "rect": [int(v) for v in rc.roi_rect] if rc.roi_rect else None,
+        "mask_path": rc.roi_mask_path or None,
+        "mask_threshold": float(rc.roi_mask_threshold) if rc.roi_mask_path else None,
+        "ium_size": [int(ium_w), int(ium_h)],
+        "texels": int(flat.sum()),
+        "sha1": hashlib.sha1(np.packbits(flat).tobytes()).hexdigest(),
+    }
+    return flat, fingerprint
+
+
+def _check_roi_guard(assets_dir: Path, fingerprint: dict) -> None:
+    """Scrive roi.json nella sandbox, o solleva se ne descrive già un'altra.
+
+    I bake saltano il lavoro che trovano su disco (le camere di
+    _precompute_spec_cone, irradiance_indirect.exr, la color texture in cache):
+    riusare lo stesso tag con una ROI diversa mescolerebbe due regioni in un unico
+    set di file senza alcun segnale, esattamente come farebbe un ri-bake con
+    ring_samples diversi.
+    """
+    path = assets_dir / "roi.json"
+    if path.exists():
+        with open(path, encoding="utf-8") as fh:
+            old = json.load(fh)
+        if old.get("sha1") != fingerprint.get("sha1"):
+            raise RuntimeError(
+                f"ROI incompatibile in {assets_dir}\n"
+                f"    su disco:  {old.get('texels')} texel, rect={old.get('rect')}, "
+                f"maschera={old.get('mask_path')}, sha1={str(old.get('sha1'))[:12]}\n"
+                f"    richiesta: {fingerprint['texels']} texel, "
+                f"rect={fingerprint['rect']}, maschera={fingerprint['mask_path']}, "
+                f"sha1={fingerprint['sha1'][:12]}\n"
+                f"  Gli output già presenti verrebbero saltati e mescolati con la "
+                f"ROI nuova. Cancellare la cartella oppure usare un roi_tag diverso.")
+        return
+    os.makedirs(assets_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(fingerprint, fh, indent=2)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Parsing transforms.json
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -979,6 +1113,24 @@ class RenderConfig:
     albedo_format: ImageFormat = ImageFormat.OPENEXR
     albedo_eps: float = 1e-3             # clamp minimo dell'irradiance per evitare /0
 
+    # ── ROI di test in spazio texture (Step 3 + Step 4) ──────────────────────
+    # Restringe il calcolo a una porzione della texture per iterare in fretta su
+    # parametri di bake o di fit senza pagare i 16.7 M texel di una IUM 4096².
+    # Non è un'approssimazione: la ROI si applica come fattore sulla maschera IUM,
+    # e ogni kernel a valle esce già sui texel mascherati, quindi i texel calcolati
+    # danno gli stessi identici valori di una run piena. I texel fuori restano a 0.
+    # Con una ROI attiva TUTTI gli output di Step 3 e Step 4 finiscono in una
+    # sandbox <output_dir>/roi/<tag>/ che replica il layout normale: le cache
+    # full-res non vengono mai toccate e per ripulire basta cancellare la cartella.
+    # Restano condivisi con la run piena gli input (images/, nerf_render_images/)
+    # e skybox_nerf_baked.exr, che quindi non viene ri-bakato.
+    roi_rect: "list[int] | None" = None   # [x0, y0, w, h] in texel IUM
+    roi_mask_path: str = ""               # PNG/EXR: canale 0 > threshold = dentro la ROI
+    roi_mask_threshold: float = 0.5
+    # ROI effettiva = AND di rettangolo e maschera (ognuno opzionale). Entrambi
+    # vuoti = comportamento identico a prima (nessuna sandbox).
+    roi_tag: str = ""                     # nome della sandbox ("" = derivato da rect/maschera)
+
 
 @dataclass
 class PipelineConfig:
@@ -1168,10 +1320,22 @@ def _precompute_indirect_irradiance(
     ium_normals_np   = ium_res.normals_np.astype(np.float32)
     eps              = 1e-4
 
+    # Tile senza un solo texel attivo: il kernel esce su ogni thread e il tile
+    # produrrebbe count=0. Saltare il lancio è quindi equivalente e basta a far
+    # scalare il costo con la ROI invece che con la risoluzione della texture.
+    # Utile anche senza ROI, dove le zone vuote dell'atlante pagano comunque il lancio.
+    ium_mask_flat = np.asarray(ium_res.masks_np).reshape(-1) > 0
+    n_skipped = 0
+
     print(f"  Indirect precompute: {n_tiles} tile × {cfg.indirect_tile_size} texel, "
           f"N={cfg.indirect_sample_side}")
 
     for tile_idx in range(n_tiles):
+        off = tile_idx * cfg.indirect_tile_size
+        if not ium_mask_flat[off:off + cfg.indirect_tile_size].any():
+            n_skipped += 1
+            continue
+
         tile_res = ind_gen.render_tile(tile_idx)
         count    = tile_res.count
         if count == 0:
@@ -1182,8 +1346,7 @@ def _precompute_indirect_irradiance(
         cos_np    = tile_res.cos_np.copy()
         t_hit_np  = tile_res.t_hit_np.copy()
 
-        tile_offset = tile_idx * cfg.indirect_tile_size
-        global_idx  = tile_offset + local_idx
+        global_idx  = off + local_idx
 
         origins_np = (ium_positions_np[global_idx]
                       + ium_normals_np[global_idx] * eps)
@@ -1195,6 +1358,9 @@ def _precompute_indirect_irradiance(
 
         if (tile_idx + 1) % max(1, n_tiles // 10) == 0:
             print(f"    tile {tile_idx+1}/{n_tiles}, raggi occlusi: {count}")
+
+    if n_skipped:
+        print(f"    {n_skipped}/{n_tiles} tile saltati (nessun texel attivo)")
 
     irr_indirect = (irr_indirect * scale).astype(np.float32)
 
@@ -1578,6 +1744,7 @@ def _precompute_spec_cone(
     ium_normals_np   = ium_res.normals_np.astype(np.float32)
     eps = 1e-4
 
+    ium_mask_flat = np.asarray(ium_res.masks_np).reshape(-1) > 0
     vis2d = np.asarray(visibility_map, dtype=np.uint8).reshape(num_pix, n_cams)
     cam_indices = (list(cfg.spec_cone_cameras) if cfg.spec_cone_cameras
                    else list(range(len(frames))))
@@ -1640,7 +1807,20 @@ def _precompute_spec_cone(
         ring_sum = np.zeros((num_pix, K, 3), dtype=np.float64)
         valid    = np.zeros((num_pix, K),    dtype=np.int64)
 
+        # Texel su cui questa camera produce qualcosa: il kernel esce sia sulla
+        # maschera IUM sia sulla visibility (deviceProgramsSpecCone.cu:107-109).
+        active = ium_mask_flat & (vis2d[:, j] > 0)
+
         for tile_idx in range(n_tiles):
+            off = tile_idx * tile_sz
+            # Tile senza texel attivi: il kernel esce su ogni thread e
+            # renderTile azzera sky_sum/valid_count a ogni lancio
+            # (SpecCone_Generator.cpp:336), quindi lasciare ring_sum/valid a
+            # zero è identico a lanciarlo.
+            if not active[off:off + tile_sz].any():
+                _tile_bar_step(bar, rays_per_tile)
+                continue
+
             tile_res = gen.render_tile(tile_idx)
             if tile_res.overflow:
                 raise RuntimeError(
@@ -1648,7 +1828,6 @@ def _precompute_spec_cone(
                     f"compatto ({tile_res.requested} raggi richiesti). La "
                     f"capacità è il worst case esatto, quindi il bake sarebbe "
                     f"incompleto: interrotto invece di salvare medie parziali.")
-            off = tile_idx * tile_sz
             tt  = tile_res.tile_texels
             ring_sum[off:off + tt] += tile_res.sky_sum_np.astype(np.float64)
             valid[off:off + tt]    += tile_res.valid_count_np
@@ -1906,10 +2085,28 @@ def _precompute_spec_cone_shared(
                for j in cam_indices}
 
     bar = _tile_bar(n_tiles, "spec_cone shared")
+    n_skipped = 0
     try:
         for tile_idx in range(n_tiles):
-            tile_res = gen.render_tile(tile_idx)
             off = tile_idx * tile_sz
+
+            # Tile senza texel attivi: niente raggi da tracciare né da interrogare
+            # sul NeRF, ma il blocco di scanline va comunque scritto perché
+            # IncrementalExrWriter è in streaming e le righe devono restare in
+            # ordine. Gli zeri sono esattamente ciò che produce il percorso
+            # completo: texel_ok falso → sums/counts a zero → _cones_from_rings_torch
+            # restituisce 0, e valid è la somma dei counts.
+            if not ium_mask[off:off + tile_sz].any():
+                rows_out = min(tile_sz, num_pix - off) // ium_w
+                zeros = np.zeros((rows_out, ium_w), dtype=np.float32)
+                zero_block = {name: zeros for name in channels}
+                for wr in writers.values():
+                    wr.write_block(zero_block)
+                n_skipped += 1
+                _tile_bar_step(bar, rays_per_tile)
+                continue
+
+            tile_res = gen.render_tile(tile_idx)
             tt  = tile_res.tile_texels
             t_hit_tile = tile_res.t_hit_np          # (tt, S)
             t_mir_tile = tile_res.t_hit_mirror_np   # (tt, n_sel)
@@ -2007,6 +2204,9 @@ def _precompute_spec_cone_shared(
             _tile_bar_step(bar, rays_per_tile)
 
         bar.close()
+        if n_skipped:
+            print(f"    {n_skipped}/{n_tiles} tile saltati (nessun texel attivo), "
+                  f"scritti come zeri")
         for wr in writers.values():
             wr.close()
     except BaseException:
@@ -2853,8 +3053,16 @@ def _step3_posttrain_assets(
     print(f"[Step 3] {len(tf.frames)} frame  [{intr.w}×{intr.h}]")
 
     json_dir = Path(rc.output_dir).resolve()
-    json_dir_str = json_dir.as_posix()
     os.makedirs(json_dir, exist_ok=True)
+
+    # Con una ROI attiva TUTTI gli output di questo step vanno nella sandbox
+    # roi/<tag>/, che replica il layout della radice. json_dir resta la sorgente
+    # degli input condivisi (images/, nerf_render_images/) e di skybox_nerf_baked.exr,
+    # che la run ROI riusa invece di ri-bakarlo.
+    assets_dir, roi_tag = _roi_assets_dir(rc, json_dir)
+    assets_dir_str = assets_dir.as_posix()
+    os.makedirs(assets_dir, exist_ok=True)
+    roi_fp: dict = {}   # fingerprint della ROI, risolto insieme alla IUM
 
     model = optix_mod.TriangleMesh()
     model.add_from_obj_file(rc.model_path)
@@ -2889,14 +3097,36 @@ def _step3_posttrain_assets(
         if rc.external_normal_path:
             _apply_external_normal(rc, ium_res, ium_w, ium_h)
 
-        ium_out_dir = json_dir / "ium"
+        # ── ROI: unico punto in cui viene applicata ──────────────────────────
+        # masks_np è una view scrivibile sul vettore C++ e ogni generatore a valle
+        # ricarica la maschera dall'host al proprio set_inputs, quindi da qui in poi
+        # visibility, color texture, irradiance, indirect e spec cone lavorano solo
+        # sui texel della ROI. Dopo _apply_external_normal e non prima, così
+        # ium_normals resta la normale piena e solo la maschera porta la ROI.
+        roi_flat, roi_fp = _load_roi(rc, ium_w, ium_h)
+        if roi_flat is not None:
+            if not ium_res.has_masks():
+                raise RuntimeError(
+                    "ROI richiesta ma l'IUM non ha prodotto maschere: la ROI si "
+                    "applica proprio come fattore su ium_masks, senza non c'è nulla "
+                    "da restringere.")
+            _check_roi_guard(assets_dir, roi_fp)
+            m = ium_res.masks_np
+            n_before = int(np.count_nonzero(m))
+            m[~roi_flat] = 0
+            n_after = int(np.count_nonzero(m))
+            print(f"[ROI] tag '{roi_tag}': {n_after} texel attivi su {ium_w * ium_h} "
+                  f"({100.0 * n_after / (ium_w * ium_h):.2f} %), "
+                  f"{n_before} sulla mesh senza ROI → {assets_dir}")
+
+        ium_out_dir = assets_dir / "ium"
         os.makedirs(ium_out_dir, exist_ok=True)
 
         if ium_res.has_positions():
             pos_arr = _reshape_flat(ium_res.positions_np.astype(np.float32), ium_w, ium_h)
             ium_pos_path = (ium_out_dir / f"ium_positions{rc.ium_format.extension}").resolve().as_posix()
             _save_layer(pos_arr, ium_pos_path, rc.ium_format, DataLayer.POSITION)
-            ium_result_data["ium_positions_path"] = _as_relative_to(ium_pos_path, json_dir_str)
+            ium_result_data["ium_positions_path"] = _as_relative_to(ium_pos_path, assets_dir_str)
 
         if ium_res.has_normals():
             norm_arr = _reshape_flat(ium_res.normals_np.astype(np.float32), ium_w, ium_h)
@@ -2907,13 +3137,13 @@ def _step3_posttrain_assets(
             )
             ium_norm_path = (ium_out_dir / f"ium_normals{norm_save_fmt.extension}").resolve().as_posix()
             _save_layer(norm_arr, ium_norm_path, norm_save_fmt, DataLayer.NORMAL)
-            ium_result_data["ium_normals_path"] = _as_relative_to(ium_norm_path, json_dir_str)
+            ium_result_data["ium_normals_path"] = _as_relative_to(ium_norm_path, assets_dir_str)
 
         if ium_res.has_masks():
             mask_arr = _reshape_flat(ium_res.masks_np, ium_w, ium_h)
             ium_mask_path = (ium_out_dir / f"ium_masks{rc.ium_format.extension}").resolve().as_posix()
             _save_layer(mask_arr, ium_mask_path, rc.ium_format, DataLayer.MASK)
-            ium_result_data["ium_masks_path"] = _as_relative_to(ium_mask_path, json_dir_str)
+            ium_result_data["ium_masks_path"] = _as_relative_to(ium_mask_path, assets_dir_str)
 
         all_cameras = []
         for frame in tf.frames:
@@ -2936,10 +3166,10 @@ def _step3_posttrain_assets(
             vis_gen.set_traversable(model)
             visibility_map = vis_gen.check_visibility(ium_res, ium_w, ium_h, all_cameras)
 
-            vis_out_dir = json_dir / "visibility"
+            vis_out_dir = assets_dir / "visibility"
             os.makedirs(vis_out_dir, exist_ok=True)
             vis_path = (vis_out_dir / f"visibility{rc.visibility_format.extension}").resolve().as_posix()
-            ium_result_data["visibility_path"] = _as_relative_to(vis_path, json_dir_str)
+            ium_result_data["visibility_path"] = _as_relative_to(vis_path, assets_dir_str)
             if timer is not None:
                 timer.record("step3/visibility", time.perf_counter() - _t3_vis)
 
@@ -2952,7 +3182,7 @@ def _step3_posttrain_assets(
         # Le maschere per-camera di color_texture (occlusione∧frustum∧grazing, pre-peak)
         # sono source-indipendenti: le salviamo una sola volta come <out>/camera_mask/
         # {stem}.exr e le riusiamo come visibility condivisa raffinata.
-        cam_mask_dir = json_dir / "camera_mask"
+        cam_mask_dir = assets_dir / "camera_mask"
         stems = [f.stem for f in tf.frames]
         if (rc.render_color_texture and rc.render_ium and rc.render_visibility
                 and visibility_map is not None):
@@ -2964,7 +3194,7 @@ def _step3_posttrain_assets(
                 raise ValueError("color_texture_image_sources non può essere vuota")
 
             for src in ct_sources:
-                src_dir = json_dir / "sources" / src
+                src_dir = assets_dir / "sources" / src
                 ct_dir = src_dir / "color_texture"
                 os.makedirs(ct_dir, exist_ok=True)
                 ct_path = (ct_dir / f"color_texture{rc.color_texture_format.extension}").resolve().as_posix()
@@ -2980,7 +3210,7 @@ def _step3_posttrain_assets(
                         if loaded is not None:
                             print(f"[Step 3] Color texture trovata su disco ({src}): {ct_path}")
                             color_by_source[src] = loaded
-                            ium_result_data[f"color_texture_path_{src}"] = _as_relative_to(ct_path, json_dir_str)
+                            ium_result_data[f"color_texture_path_{src}"] = _as_relative_to(ct_path, assets_dir_str)
                             if not visibility_refined and vis_path is not None:
                                 visibility_map = masks_disk
                                 _save_visibility_map(visibility_map, vis_path, ium_h, ium_w,
@@ -3005,7 +3235,7 @@ def _step3_posttrain_assets(
                 # Salva color_texture per questa sorgente
                 ct_arr = _reshape_flat(_ct_res.colors_np.astype(np.float32), ium_w, ium_h)
                 _save_layer(ct_arr, ct_path, rc.color_texture_format, DataLayer.POSITION)
-                ium_result_data[f"color_texture_path_{src}"] = _as_relative_to(ct_path, json_dir_str)
+                ium_result_data[f"color_texture_path_{src}"] = _as_relative_to(ct_path, assets_dir_str)
 
                 # Copia leggera di colors_np per il calcolo albedo a valle
                 color_by_source[src] = np.array(_ct_res.colors_np, dtype=np.float32)
@@ -3114,12 +3344,12 @@ def _step3_posttrain_assets(
                                rc.irradiance_sample_side, rc.skybox_yaw_degrees)
             irr_gen.render()
             irr_res = irr_gen.get_result()
-            irr_out_dir = json_dir / "irradiance"
+            irr_out_dir = assets_dir / "irradiance"
             os.makedirs(irr_out_dir, exist_ok=True)
             irr_path = (irr_out_dir / f"irradiance{rc.irradiance_format.extension}").resolve().as_posix()
             irr_arr = _reshape_flat(irr_res.irradiance_np.astype(np.float32), ium_w, ium_h)
             _save_layer(irr_arr, irr_path, rc.irradiance_format, DataLayer.IRRADIANCE)
-            ium_result_data["irradiance_path"] = _as_relative_to(irr_path, json_dir_str)
+            ium_result_data["irradiance_path"] = _as_relative_to(irr_path, assets_dir_str)
             if timer is not None:
                 timer.record("step3/irradiance", time.perf_counter() - _t3_irr)
 
@@ -3150,7 +3380,7 @@ def _step3_posttrain_assets(
         irr_indirect_flat = None
         if rc.precompute_indirect and ium_res.has_positions() and ium_res.has_normals():
             _t3_ind = time.perf_counter()
-            ind_out_dir = json_dir / "irradiance"
+            ind_out_dir = assets_dir / "irradiance"
             os.makedirs(ind_out_dir, exist_ok=True)
             ind_path = (ind_out_dir / f"irradiance_indirect{rc.indirect_format.extension}").resolve().as_posix()
             if not os.path.exists(ind_path):
@@ -3162,7 +3392,7 @@ def _step3_posttrain_assets(
             ind_arr = _load_exr_as_flat(ind_path)
             if ind_arr is not None:
                 irr_indirect_flat = ind_arr
-                ium_result_data["irradiance_indirect_path"] = _as_relative_to(ind_path, json_dir_str)
+                ium_result_data["irradiance_indirect_path"] = _as_relative_to(ind_path, assets_dir_str)
             if timer is not None:
                 timer.record("step3/indirect", time.perf_counter() - _t3_ind)
 
@@ -3173,7 +3403,7 @@ def _step3_posttrain_assets(
             sky_w, sky_h = rc.skybox_size[0], rc.skybox_size[1]
             if skybox_flat_step3 is None and (rc.skybox_path or rc.skybox_source == "nerf"):
                 skybox_flat_step3 = _resolve_skybox_flat(rc, output_json, json_dir, sky_w, sky_h)
-            spec_dir = json_dir / "spec_cone"
+            spec_dir = assets_dir / "spec_cone"
             if rc.spec_cone_scheme == "shared":
                 print(f"[Step 3] Precompute Specular Cone L_j(r), raggi condivisi "
                       f"(aperture={rc.spec_cone_apertures_deg}°, "
@@ -3195,16 +3425,26 @@ def _step3_posttrain_assets(
                     f"spec_cone_scheme sconosciuto: {rc.spec_cone_scheme!r} "
                     "(attesi 'per_camera' o 'shared')")
             ium_result_data["spec_cone_dir"] = _as_relative_to(
-                spec_dir.resolve().as_posix(), json_dir_str)
+                spec_dir.resolve().as_posix(), assets_dir_str)
             if timer is not None:
                 timer.record("step3/spec_cone", time.perf_counter() - _t3_spec)
 
-    # Aggiorna il JSON in-place e riscrivi
+    # Aggiorna il JSON e riscrivi. Con una ROI attiva il JSON di radice resta
+    # intatto e quello arricchito va nella sandbox, con i file_path riscritti in
+    # assoluto: nella radice sono relativi a output_dir e load_transforms li
+    # risolverebbe rispetto alla sandbox. solve_pbr ne usa solo gli stem, ma così
+    # anche `python pbr_solver.py <sandbox>` continua a funzionare.
     if ium_result_data:
         output_json["ium"] = ium_result_data
-    with open(transforms_extended_path, "w", encoding="utf-8") as fh:
+    out_json_path = transforms_extended_path
+    if roi_tag is not None:
+        out_json_path = assets_dir / "transforms_extended.json"
+        output_json["roi"] = roi_fp
+        for entry, frame in zip(output_json.get("frames", []), tf.frames):
+            entry["file_path"] = frame.file_path
+    with open(out_json_path, "w", encoding="utf-8") as fh:
         json.dump(output_json, fh, indent=4)
-    print(f"\n[Step 3] JSON aggiornato: {transforms_extended_path}")
+    print(f"\n[Step 3] JSON aggiornato: {out_json_path}")
     return output_json
 
 
@@ -3221,10 +3461,24 @@ def _step4_reconstruction(
     (run_step1/2/3=False, run_step4=True) per iterare sulla ricostruzione senza ri-bake
     dei coni. Aggiorna transforms_extended.json in-place con le chiavi
     metallic/roughness/albedo_pbr/albedo.
+
+    Con una ROI attiva legge e scrive nella sandbox roi/<tag>/, dove lo Step 3 ha
+    lasciato ium/, spec_cone/ e sources/ già ristretti: qui non serve nessuna
+    logica ROI, il fit e l'albedo si limitano da soli rileggendo ium_masks.
     """
     rc = cfg.render
     json_dir = Path(rc.output_dir).resolve()
-    json_dir_str = json_dir.as_posix()
+    assets_dir, roi_tag = _roi_assets_dir(rc, json_dir)
+    assets_dir_str = assets_dir.as_posix()
+
+    if roi_tag is not None:
+        roi_json = assets_dir / "transforms_extended.json"
+        if not roi_json.exists():
+            raise FileNotFoundError(
+                f"Step 4 con ROI '{roi_tag}': la sandbox {assets_dir} non contiene "
+                f"gli output dello Step 3. Eseguire prima run_step3=True con la "
+                f"stessa ROI.")
+        transforms_extended_path = roi_json
 
     with open(transforms_extended_path, encoding="utf-8") as fh:
         output_json = json.load(fh)
@@ -3235,11 +3489,11 @@ def _step4_reconstruction(
     # solve_pbr legge tutto da disco (spec_cone/, camera_texture/, pixel_change/).
     if rc.render_pbr_maps:
         _t4_pbr = time.perf_counter()
-        spec_meta = json_dir / "spec_cone" / "spec_cone_meta.json"   # source-indipendente
+        spec_meta = assets_dir / "spec_cone" / "spec_cone_meta.json"   # source-indipendente
         if spec_meta.exists():
             from pbr_solver import solve_pbr
             for src in rc.color_texture_image_sources:
-                cmin_path = json_dir / "sources" / src / "pixel_change" / "color_min.exr"
+                cmin_path = assets_dir / "sources" / src / "pixel_change" / "color_min.exr"
                 if not cmin_path.exists():
                     print(f"    ⚠  render_pbr_maps ({src}): manca {cmin_path} → skip "
                           "(serve render_pixel_change nello Step 3)")
@@ -3247,7 +3501,7 @@ def _step4_reconstruction(
                 print(f"[Step 4] Fit PBR ({src}) → metallic/roughness "
                       f"(cv_gate={rc.pbr_diffuse_cv_gate}, "
                       f"spec_threshold={rc.pbr_spec_threshold})…")
-                pbr_out = solve_pbr(json_dir_str, source=src,
+                pbr_out = solve_pbr(assets_dir_str, source=src,
                                     cv_gate=rc.pbr_diffuse_cv_gate,
                                     spec_threshold=rc.pbr_spec_threshold,
                                     min_views=rc.pbr_min_views,
@@ -3255,12 +3509,12 @@ def _step4_reconstruction(
                                     blender_rgb=rc.pbr_write_blender_rgb,
                                     tile_texels=rc.pbr_tile_texels)
                 ium_result_data[f"metallic_path_{src}"] = _as_relative_to(
-                    pbr_out["metallic_path"], json_dir_str)
+                    pbr_out["metallic_path"], assets_dir_str)
                 ium_result_data[f"roughness_path_{src}"] = _as_relative_to(
-                    pbr_out["roughness_path"], json_dir_str)
+                    pbr_out["roughness_path"], assets_dir_str)
                 if pbr_out.get("albedo_pbr_path"):
                     ium_result_data[f"albedo_pbr_path_{src}"] = _as_relative_to(
-                        pbr_out["albedo_pbr_path"], json_dir_str)
+                        pbr_out["albedo_pbr_path"], assets_dir_str)
                 # Il dict di ritorno porta anche le mappe a piena risoluzione
                 # (~900 MiB): qui servono solo i path, e senza il del resterebbero
                 # vive per tutta la sorgente successiva.
@@ -3275,7 +3529,7 @@ def _step4_reconstruction(
     # Riletta interamente da disco: color_texture per sorgente, irradiance condivisa.
     if rc.render_albedo:
         _t4_alb = time.perf_counter()
-        irr_path = json_dir / "irradiance" / f"irradiance{rc.irradiance_format.extension}"
+        irr_path = assets_dir / "irradiance" / f"irradiance{rc.irradiance_format.extension}"
         if not irr_path.exists():
             print(f"    ⚠  render_albedo: manca {irr_path} → skip "
                   "(serve render_irradiance nello Step 3)")
@@ -3284,19 +3538,19 @@ def _step4_reconstruction(
 
             # Denominatore condiviso: irradiance diretta (+ indiretta se presente)
             irr = _load_image_hw3_native(irr_path.as_posix())
-            ind_path = json_dir / "irradiance" / f"irradiance_indirect{rc.indirect_format.extension}"
+            ind_path = assets_dir / "irradiance" / f"irradiance_indirect{rc.indirect_format.extension}"
             if ind_path.exists():
                 irr = irr + _load_image_hw3_native(ind_path.as_posix())
             denom = np.maximum(irr, rc.albedo_eps)
 
             # Maschera IUM (canale 0 > 0.5 = texel valido); salvata con rc.ium_format
-            mask_path = json_dir / "ium" / f"ium_masks{rc.ium_format.extension}"
+            mask_path = assets_dir / "ium" / f"ium_masks{rc.ium_format.extension}"
             mask = None
             if mask_path.exists():
                 mask = _load_image_hw3_native(mask_path.as_posix())[..., 0] > 0.5
 
             for src in rc.color_texture_image_sources:
-                color_path = (json_dir / "sources" / src / "color_texture"
+                color_path = (assets_dir / "sources" / src / "color_texture"
                               / f"color_texture{rc.color_texture_format.extension}")
                 if not color_path.exists():
                     print(f"    ⚠  albedo ({src}): manca {color_path} → skip "
@@ -3308,11 +3562,11 @@ def _step4_reconstruction(
                     albedo[~mask] = 0.0
                 albedo = np.clip(albedo, 0.0, 1.0).astype(np.float32)
 
-                alb_dir = json_dir / "sources" / src / "albedo"
+                alb_dir = assets_dir / "sources" / src / "albedo"
                 os.makedirs(alb_dir, exist_ok=True)
                 alb_path = (alb_dir / f"albedo{rc.albedo_format.extension}").resolve().as_posix()
                 _save_layer(albedo, alb_path, rc.albedo_format, DataLayer.ALBEDO)
-                ium_result_data[f"albedo_path_{src}"] = _as_relative_to(alb_path, json_dir_str)
+                ium_result_data[f"albedo_path_{src}"] = _as_relative_to(alb_path, assets_dir_str)
 
                 # — TensorBoard: albedo è già in [0,1] → no tonemap —
                 if tb_logger is not None:
@@ -3634,10 +3888,10 @@ if __name__ == "__main__":
     # skybox_path) sono vuoti qui e vengono sovrascritti per ogni SceneConfig.
     # Tutti gli altri parametri di rendering/NeRF sono condivisi tra le scene.
     template = PipelineConfig(
-        run_step1 = True,  # output Step 1 già su disco (exp_l1_d02)
-        run_step2 = True,  # checkpoint NeRF e render Step 2b già su disco
-        run_step3 = False,   # pass texture-space fino al bake dello spec-cone
-        run_step4 = False,   # ricostruzione PBR+albedo (metti run_step3=False per iterare solo qui)
+        run_step1 = False,  # output Step 1 già su disco (exp_l1_d02)
+        run_step2 = False,  # checkpoint NeRF e render Step 2b già su disco
+        run_step3 = True,   # pass texture-space fino al bake dello spec-cone
+        run_step4 = True,   # ricostruzione PBR+albedo (metti run_step3=False per iterare solo qui)
 
         resume_skip_step2_if_ckpt = True,   # salta il training NeRF se il checkpoint esiste già
 
@@ -3726,6 +3980,9 @@ if __name__ == "__main__":
             # Heatmap diagnostica skybox GT vs NeRF-baked (richiede skybox_path nella SceneConfig)
             compare_skybox_to_gt = True,
 
+            roi_rect=[3623,2712, 473,473],
+            roi_tag="top_table_test_irradiance_newcuda"
+
         ),
 
         nerf_num_iters       = 50000,
@@ -3790,14 +4047,14 @@ if __name__ == "__main__":
         #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
         #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # ),
-        # SceneConfig(
-        #             name             = "TableAndOtherInteriorWithSpecularNight",
-        #             transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmoothNight/transforms.json",
-        #             model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
-        #             external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmoothNight/BakedMaterial_normal.exr",
-        #             # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
-        #             # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
-        #         ),
+        SceneConfig(
+                    name             = "TableAndOtherInteriorWithSpecularNight",
+                    transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmoothNight/transforms.json",
+                    model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+                    external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmoothNight/BakedMaterial_normal.exr",
+                    # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
+                    # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+                ),
         # SceneConfig(
         #     name             = "TableAndOtherInteriorNoSpecular",
         #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenExrSmoothNoDiffuse/transforms.json",
@@ -3817,12 +4074,12 @@ if __name__ == "__main__":
         #     model_path       = f"{REPO}/Scenes/SwordShield Thesis/BakedStudio/Baked.obj",
         #     external_normal_path = f"{REPO}/Scenes/SwordShield Thesis/BakedStudio/BakedMaterial_normal.exr",
         # ),
-        SceneConfig(
-            name             = "SwordShieldNight",
-            transforms_path  = f"{REPO}/Scenes/SwordShield Thesis/NerfNight/transforms.json",
-            model_path       = f"{REPO}/Scenes/SwordShield Thesis/BakedNight/Baked.obj",
-            external_normal_path = f"{REPO}/Scenes/SwordShield Thesis/BakedNight/BakedMaterial_normal.exr",
-        )
+        # SceneConfig(
+        #     name             = "SwordShieldNight",
+        #     transforms_path  = f"{REPO}/Scenes/SwordShield Thesis/NerfNight/transforms.json",
+        #     model_path       = f"{REPO}/Scenes/SwordShield Thesis/BakedNight/Baked.obj",
+        #     external_normal_path = f"{REPO}/Scenes/SwordShield Thesis/BakedNight/BakedMaterial_normal.exr",
+        # )
 
     ]
 
@@ -3844,7 +4101,7 @@ if __name__ == "__main__":
         # ("exp_mse",            "exp",      "mse")
     ]
     DECAYS     = (0.2,)
-    SWEEP_ROOT = "D:/tesi_output/test_sword_shield_test_retrain"
+    SWEEP_ROOT = "D:/tesi_output/test_mask_irradiance"
 
     for name, act, loss in EXPERIMENTS:
         for decay in DECAYS:

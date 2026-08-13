@@ -25,8 +25,8 @@ def _run_network(pts, viewdirs, model, embed_fn, embeddirs_fn, chunk):
 
 
 def render_rays_depth(rays_o, rays_d, model, embed_fn, embeddirs_fn, cfg: NerfConfig,
-                      t_hit, *, near=None, far=None, perturb=False, return_acc=False,
-                      bg_color=None,
+                      t_hit, *, near=None, far=None, return_acc=False,
+                      bg_color=None, noise_std: float = 0.0,
                       window=None, window_end=None, n_samples=None):
     """Single-pass render for a batch of rays using a known surface distance t_hit.
 
@@ -37,6 +37,10 @@ def render_rays_depth(rays_o, rays_d, model, embed_fn, embeddirs_fn, cfg: NerfCo
 
     rays_d is normalized here: t_hit is a metric distance (OptiX depth, or a sphere
     radius), so direction and distance must share the same parametrization.
+
+    noise_std: rumore gaussiano sulla densità, regolarizzatore di training. Il
+    default 0.0 rende deterministico ogni percorso di inferenza; solo il forward
+    che produce il gradiente passa cfg.raw_noise_std (train.py).
     """
     device = rays_o.device
     N = rays_o.shape[0]
@@ -50,16 +54,12 @@ def render_rays_depth(rays_o, rays_d, model, embed_fn, embeddirs_fn, cfg: NerfCo
     t_low  = (t_hit.to(device) - _win).clamp(min=_near)
     t_high = (t_hit.to(device) + _win_end).clamp(max=_far)
 
-    if perturb:
-        u = torch.rand(N, _n, device=device)
-    else:
-        u = torch.linspace(0., 1., _n, device=device).expand(N, _n)
-
+    u = torch.linspace(0., 1., _n, device=device).expand(N, _n)
     z_vals, _ = torch.sort(t_low[:, None] + (t_high - t_low)[:, None] * u, dim=-1)
 
     pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[:, :, None]
     raw = _run_network(pts, rays_d, model, embed_fn, embeddirs_fn, cfg.chunk)
-    rgb, _, acc, _, _ = raw2outputs(raw, z_vals, rays_d, cfg.raw_noise_std,
+    rgb, _, acc, _, _ = raw2outputs(raw, z_vals, rays_d, noise_std,
                                     bg_color=bg_color,
                                     rgb_activation=cfg.rgb_activation)
     if return_acc:
@@ -69,7 +69,7 @@ def render_rays_depth(rays_o, rays_d, model, embed_fn, embeddirs_fn, cfg: NerfCo
 
 def render_bg(dirs, center: torch.Tensor, sphere_radius: float,
               model, embed_fn, embeddirs_fn, cfg: NerfConfig,
-              *, perturb=False, return_acc=False):
+              *, return_acc=False, noise_std: float = 0.0):
     """Render background rays as a spherical shell centred at `center`.
 
     Each ray is re-anchored at the scene centre and marched outward:
@@ -93,8 +93,8 @@ def render_bg(dirs, center: torch.Tensor, sphere_radius: float,
         t_hit,
         near=cfg.near,
         far=sphere_radius + cfg.bg_depth_window_end + 1.0,
-        perturb=perturb,
         return_acc=return_acc,
+        noise_std=noise_std,
         window=cfg.bg_depth_window,
         window_end=cfg.bg_depth_window_end,
         n_samples=cfg.depth_window_samples,
@@ -103,7 +103,7 @@ def render_bg(dirs, center: torch.Tensor, sphere_radius: float,
 
 def render_unified(rays_o, rays_d, depths, in_mask, model, embed_fn, embeddirs_fn,
                    cfg: NerfConfig, center: torch.Tensor, sphere_radius: float,
-                   *, perturb=False, return_acc=False):
+                   *, return_acc=False, noise_std: float = 0.0):
     """Single fixed-shape render for both fg (mesh hit) and bg (sphere shell) rays.
 
     in_mask=True  → fg: use ray origin + t_hit from depths, mesh depth window.
@@ -134,15 +134,11 @@ def render_unified(rays_o, rays_d, depths, in_mask, model, embed_fn, embeddirs_f
     t_low  = (eff_t_hit - win_lo).clamp(min=cfg.near)
     t_high = (eff_t_hit + win_hi).clamp(max=cfg.far)
 
-    if perturb:
-        u = torch.rand(N, n_s, device=device)
-    else:
-        u = torch.linspace(0., 1., n_s, device=device).expand(N, n_s)
-
+    u = torch.linspace(0., 1., n_s, device=device).expand(N, n_s)
     z_vals, _ = torch.sort(t_low[:, None] + (t_high - t_low)[:, None] * u, dim=-1)
     pts = eff_origin[:, None, :] + eff_dir[:, None, :] * z_vals[:, :, None]
     raw = _run_network(pts, eff_dir, model, embed_fn, embeddirs_fn, cfg.chunk)
-    rgb, _, acc, _, _ = raw2outputs(raw, z_vals, eff_dir, cfg.raw_noise_std,
+    rgb, _, acc, _, _ = raw2outputs(raw, z_vals, eff_dir, noise_std,
                                     rgb_activation=cfg.rgb_activation)
     if return_acc:
         return rgb, acc
@@ -202,13 +198,13 @@ def render_image(model_bundle, H: int, W: int, focal_x: float, pose_4x4,
             result_rgb[idx] = render_rays_depth(
                 rays_o_all[idx], rays_d_all[idx],
                 model, embed_fn, embeddirs_fn, cfg,
-                t_hit_all[idx], perturb=False)
+                t_hit_all[idx])
 
         for i in range(0, bg_idx.numel(), cfg.chunk):
             idx = bg_idx[i:i + cfg.chunk]
             result_rgb[idx] = render_bg(
                 rays_d_all[idx], center, sphere_radius,
-                model, embed_fn, embeddirs_fn, cfg, perturb=False)
+                model, embed_fn, embeddirs_fn, cfg)
 
     return result_rgb.reshape(H, W, 3).cpu().numpy().astype(np.float32)
 
@@ -251,7 +247,7 @@ def bake_envmap(model_bundle, cfg: NerfConfig, width: int, height: int,
     with torch.no_grad():
         for i in range(0, dirs.shape[0], cfg.chunk):
             chunks.append(render_bg(dirs[i:i + cfg.chunk], center, sphere_radius,
-                                    model, embed_fn, embeddirs_fn, cfg, perturb=False))
+                                    model, embed_fn, embeddirs_fn, cfg))
     rgb = torch.cat(chunks, 0).cpu().numpy().astype(np.float32)
     return rgb.reshape(height, width, 3)
 
@@ -302,17 +298,17 @@ def query_radiance(model_bundle, origins_np, dirs_np,
                     chunk_rgb[fg_idx] = render_rays_depth(
                         ro[fg_idx], rd[fg_idx],
                         model, embed_fn, embeddirs_fn, cfg,
-                        th[fg_idx], near=0.01, perturb=False)
+                        th[fg_idx], near=0.01)
 
                 if bg_idx.numel() > 0:
                     chunk_rgb[bg_idx] = render_bg(
                         rd[bg_idx], center, sphere_radius,
-                        model, embed_fn, embeddirs_fn, cfg, perturb=False)
+                        model, embed_fn, embeddirs_fn, cfg)
             else:
                 # No hit info: treat all as background
                 chunk_rgb = render_bg(
                     rd, center, sphere_radius,
-                    model, embed_fn, embeddirs_fn, cfg, perturb=False)
+                    model, embed_fn, embeddirs_fn, cfg)
 
             results.append(chunk_rgb)
 
