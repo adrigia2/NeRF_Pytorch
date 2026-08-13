@@ -53,10 +53,7 @@ scanline: una sola decompressione per banda invece di una per canale (a 4096²
 con 14 aperture il file dei coni ha 43 canali, quindi 43 decompressioni
 dell'intero file per camera).
 
-Gate e validità:
-  - gate diffuso scale-invariant sul coefficiente di variazione tra camere
-    (da pixel_change/, usato SOLO per il gate — color_min non entra più nel
-    fit): sqrt(var) < cv_gate · luminanza(color_min) → x=1, metallic=0;
+Validità:
   - il lobo è attendibile solo dove la specularità supera spec_threshold:
     sotto, roughness viene posta a 1.0 e il texel è marcato in pbr/r_valid.png.
 
@@ -258,7 +255,6 @@ def read_cones(path: Path, apertures_deg, y0: int = 0,
 
 def solve_pbr(output_dir: str,
               source: str = "gt",
-              cv_gate: float = 0.05,
               spec_threshold: float = 0.2,
               min_views: int = 2,
               albedo_eps: float = 1e-3,
@@ -301,9 +297,11 @@ def solve_pbr(output_dir: str,
     param_vals = np.asarray([c[2] for c in candidates], dtype=np.float32)
 
     # ── Input: solo geometria dagli header, i pixel si leggono per banda ─────
-    cmin_path = src_dir / "pixel_change" / "color_min.exr"
-    cvar_path = src_dir / "pixel_change" / "color_variance.exr"
-    with _ExrBandReader(cmin_path) as rd:
+    # La risoluzione viene dal primo EXR dei coni: è un file che il solver deve
+    # comunque leggere per ogni camera, mentre la maschera IUM è opzionale e
+    # pixel_change non viene più aperta affatto.
+    cone_paths = [spec_dir / meta["cam_file_pattern"].format(cam=j) for j in cams]
+    with _ExrBandReader(cone_paths[0]) as rd:
         H, W = rd.height, rd.width
     N = H * W
 
@@ -327,7 +325,6 @@ def solve_pbr(output_dir: str,
     has_ind  = has_irr and ind_path.exists()
 
     cam_paths  = [src_dir / "camera_texture" / f"{stems[j]}.exr" for j in cams]
-    cone_paths = [spec_dir / meta["cam_file_pattern"].format(cam=j) for j in cams]
 
     # ── Partizione in bande di scanline intere ───────────────────────────────
     # Il fit è puramente per-texel, quindi partizionare la texture non cambia il
@@ -354,7 +351,7 @@ def solve_pbr(output_dir: str,
     alpha      = np.zeros((N, 3), dtype=np.float32)
     albedo_flat = np.zeros((N, 3), dtype=np.float32) if has_irr else None
 
-    tot_solvable = tot_gated = tot_rvalid = 0
+    tot_solvable = tot_rvalid = 0
     best_counts  = np.zeros(n_cand, dtype=np.int64)
 
     bar = _tile_bar(n_tiles, f"Fit PBR ({source})")
@@ -378,8 +375,6 @@ def solve_pbr(output_dir: str,
             bar.update(1)
             continue
 
-        D_t   = _read_band(cmin_path, y0, r).astype(np.float64)   # (T, 3)
-        var_t = _read_band(cvar_path, y0, r)                      # (T, 3) f32
         # Una sola lettura per banda invece di una per camera.
         vis_t = (_read_band(vis_path, y0, r, vis_cols) > 0.5) if has_vis else None
 
@@ -416,12 +411,6 @@ def solve_pbr(output_dir: str,
 
         solvable = mask_t & (nv_t >= min_views)
 
-        # Gate diffuso scale-invariant: variazione tra camere piccola rispetto
-        # alla luminanza del texel → x=1, metallic=0, lobo non vincolato
-        lum_D   = D_t.mean(axis=-1)
-        lum_std = np.sqrt(np.maximum(var_t.mean(axis=-1), 0.0))
-        diffuse_gate = solvable & (lum_std < cv_gate * np.maximum(lum_D, 1e-6))
-
         # ── Fit per candidato: regressione centrata in forma chiusa ─────────
         Sw  = np.maximum(nv_t.astype(np.float64), 1.0)
         VLL = np.maximum(SLL - (SL ** 2).sum(axis=-1) / Sw[:, None], 0.0)
@@ -432,7 +421,7 @@ def solve_pbr(output_dir: str,
         res_all  = VCC[:, None] - 2.0 * beta_all * VCL + beta_all ** 2 * VLL
         res_all /= np.maximum(3.0 * nv_t, 1.0)[:, None]  # residuo medio per equazione
 
-        target    = solvable & ~diffuse_gate
+        target    = solvable
         best_k    = np.argmin(res_all, axis=1).astype(np.int32)
         _idx      = np.arange(T)
         best_res  = res_all[_idx, best_k]
@@ -442,7 +431,6 @@ def solve_pbr(output_dir: str,
         fitted = target & np.isfinite(best_res)
 
         dw_t = np.zeros(T, dtype=np.float32)
-        dw_t[diffuse_gate] = 1.0
         dw_t[fitted] = (1.0 - best_beta[fitted]).astype(np.float32)
 
         met_t = np.zeros(T, dtype=np.float32)
@@ -496,14 +484,12 @@ def solve_pbr(output_dir: str,
             albedo_flat[sl] = alb_t.astype(np.float32)
 
         tot_solvable += int(solvable.sum())
-        tot_gated    += int(diffuse_gate.sum())
         tot_rvalid   += int(rval_t.sum())
         best_counts  += np.bincount(best_k[fitted], minlength=n_cand)
         bar.update(1)
     bar.close()
 
-    print(f"  texel risolvibili: {tot_solvable}, "
-          f"di cui gated come diffusi (CV<{cv_gate}): {tot_gated}")
+    print(f"  texel risolvibili: {tot_solvable}")
     for c_idx, (label, rough, _param) in enumerate(candidates):
         print(f"  candidato {label:>11} (roughness={rough:.3f}) → migliore per "
               f"{int(best_counts[c_idx])} texel")
@@ -604,8 +590,6 @@ if __name__ == "__main__":
     ap.add_argument("output_dir", help="output_dir del pipeline (contiene spec_cone/, ...)")
     ap.add_argument("--source", type=str, default="gt",
                     help="sorgente da processare (sources/{source}/, es. gt o nerf)")
-    ap.add_argument("--cv-gate", type=float, default=0.05,
-                    help="gate diffuso: std tra camere < cv_gate·luminanza → metallic=0")
     ap.add_argument("--spec-threshold", type=float, default=0.2,
                     help="metallic minimo perché r sia attendibile (sotto: roughness=1)")
     ap.add_argument("--min-views", type=int, default=2,
@@ -620,7 +604,7 @@ if __name__ == "__main__":
                          "(EXR R/G/B nella convenzione dei bake di Blender)")
     args = ap.parse_args()
     solve_pbr(args.output_dir, source=args.source,
-              cv_gate=args.cv_gate, spec_threshold=args.spec_threshold,
+              spec_threshold=args.spec_threshold,
               min_views=args.min_views, albedo_eps=args.albedo_eps,
               blender_rgb=not args.no_blender_rgb,
               tile_texels=args.tile_texels)

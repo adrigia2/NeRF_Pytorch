@@ -1096,7 +1096,6 @@ class RenderConfig:
     # roughness/roughness.exr (= r/180 dove attendibile, 1.0 altrove), come l'albedo.
     render_pbr_maps: bool = False
     pbr_min_views: int = 2
-    pbr_diffuse_cv_gate: float = 0.05  # std tra camere < gate·luminanza → diffuso (0 = gate disattivato)
     pbr_spec_threshold: float = 0.2    # metallic minimo perché r sia attendibile (0 = nessuna censura)
     # Copia metallic/roughness anche come EXR R/G/B (metallic_rgb.exr,
     # roughness_rgb.exr): il canale singolo 'Z' che scrive ExrWriter non è la
@@ -3493,16 +3492,9 @@ def _step4_reconstruction(
         if spec_meta.exists():
             from pbr_solver import solve_pbr
             for src in rc.color_texture_image_sources:
-                cmin_path = assets_dir / "sources" / src / "pixel_change" / "color_min.exr"
-                if not cmin_path.exists():
-                    print(f"    ⚠  render_pbr_maps ({src}): manca {cmin_path} → skip "
-                          "(serve render_pixel_change nello Step 3)")
-                    continue
                 print(f"[Step 4] Fit PBR ({src}) → metallic/roughness "
-                      f"(cv_gate={rc.pbr_diffuse_cv_gate}, "
-                      f"spec_threshold={rc.pbr_spec_threshold})…")
+                      f"(spec_threshold={rc.pbr_spec_threshold})…")
                 pbr_out = solve_pbr(assets_dir_str, source=src,
-                                    cv_gate=rc.pbr_diffuse_cv_gate,
                                     spec_threshold=rc.pbr_spec_threshold,
                                     min_views=rc.pbr_min_views,
                                     albedo_eps=rc.albedo_eps,
@@ -3943,7 +3935,6 @@ if __name__ == "__main__":
 
             precompute_spec_cone = True,
             render_pbr_maps      = True,
-            pbr_diffuse_cv_gate  = 0.0,        # gate diffuso disattivato: fit ovunque
             pbr_spec_threshold   = 0.0,        # roughness fittata scritta ovunque
             spec_cone_cameras=None,
 
@@ -3980,8 +3971,8 @@ if __name__ == "__main__":
             # Heatmap diagnostica skybox GT vs NeRF-baked (richiede skybox_path nella SceneConfig)
             compare_skybox_to_gt = True,
 
-            roi_rect=[3623,2712, 473,473],
-            roi_tag="top_table_test_irradiance_newcuda"
+            # roi_rect=[3623,2712, 473,473],
+            # roi_tag="top_table_test_irradiance_newcuda"
 
         ),
 

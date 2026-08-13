@@ -66,7 +66,13 @@ RUNS_ROOT = Path("D:/tesi_output")
 # La run che copre tutte e cinque le scene sotto entrambe le configurazioni.  Tenere
 # tutte le colonne su una sola run e' cio' che rende confrontabili le griglie: fra due
 # run cambierebbero anche i parametri che non sono il soggetto della figura.
-SWEEP = RUNS_ROOT / "test_sword_shield"
+#
+# Dal 13/08/2026 si legge la copia rigenerata dopo il fix dell'azimut in doppia
+# precisione di deviceProgramsIrradiance.cu: in `test_sword_shield` le mappe derivate
+# dall'irradiance (irradiance stessa, albedo, albedo_pbr) sono stale.  Tutto il resto
+# e' bit-identico fra i due alberi, verificato, quindi cambiare qui la sorgente tocca
+# in pratica solo la riga dell'albedo delle due griglie.
+SWEEP = RUNS_ROOT / "test_sword_shield_after_fix_irradiance"
 EXP, SOFT = "exp_l1_d02", "softplus_relmseraw_d02"
 
 # La variante ad alta frequenza si ferma al NeRF e vive in una run sua.

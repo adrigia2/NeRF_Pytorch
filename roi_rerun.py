@@ -45,6 +45,10 @@ _EXPECTED_DIFFS = {
     "render.output_dir",
     "render.roi_rect", "render.roi_mask_path", "render.roi_mask_threshold",
     "render.roi_tag",
+    # Campo CANCELLATO dalla config, non un override: il gate diffuso del solver
+    # e' stato rimosso, ma i manifest gia' scritti lo contengono ancora e senza
+    # questa voce ogni run precedente verrebbe rifiutata.
+    "render.pbr_diffuse_cv_gate",
 }
 
 
@@ -99,8 +103,16 @@ def config_from_manifest(manifest_path: Path) -> tuple[PipelineConfig, dict, lis
     return cfg, manifest, notes_c + notes_r
 
 
-def check_against_manifest(cfg: PipelineConfig, manifest: dict) -> list[str]:
-    """Differenze fra la config ricostruita e quella del manifest, esclusi gli override."""
+def check_against_manifest(cfg: PipelineConfig, manifest: dict,
+                           expected_diffs: "set[str] | None" = None) -> list[str]:
+    """Differenze fra la config ricostruita e quella del manifest, esclusi gli override.
+
+    `expected_diffs` è l'insieme delle chiavi che il chiamante cambia di proposito;
+    di default quelle della ROI. Lo parametrizza `rerun_irradiance.py`, che riusa
+    questa validazione con un insieme di override diverso.
+    """
+    if expected_diffs is None:
+        expected_diffs = _EXPECTED_DIFFS
     got, want = _encode_config(cfg), manifest["config"]
     diffs = []
 
@@ -110,7 +122,14 @@ def check_against_manifest(cfg: PipelineConfig, manifest: dict) -> list[str]:
             va, vb = a.get(k, "<assente>"), b.get(k, "<assente>")
             if isinstance(va, dict) and isinstance(vb, dict):
                 walk(va, vb, f"{key}.")
-            elif va != vb and key not in _EXPECTED_DIFFS:
+            elif vb == "<assente>":
+                # Campo aggiunto alla dataclass DOPO quella run: il manifest non
+                # può contenerlo e la ricostruzione usa il default, cosa che
+                # `_build` ha già segnalato fra le notes. Contarlo come divergenza
+                # renderebbe inutilizzabile lo script su ogni run precedente
+                # all'ultimo campo introdotto, cioè proprio il caso d'uso.
+                continue
+            elif va != vb and key not in expected_diffs:
                 diffs.append(f"{key}: ricostruita={va!r}  manifest={vb!r}")
 
     walk(got, want, "")

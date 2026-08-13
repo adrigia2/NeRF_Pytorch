@@ -64,19 +64,56 @@ def content_box(mask: np.ndarray, margin: float) -> tuple[slice, slice]:
             slice(max(xs.min() - mx, 0), min(xs.max() + 1 + mx, w)))
 
 
-def position_rgb(pos: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Posizione mappata su RGB sull'estensione della geometria, sfondo nero.
+def position_rgb(pos: np.ndarray, mask: "np.ndarray | None" = None) -> np.ndarray:
+    """Posizione mappata su RGB con l'IDENTITA', sfondo nero.
 
-    Gli estremi si prendono sul solo primo piano: fuori dalla superficie il file porta
-    zero, che e' anche una posizione legittima, e includerlo sposterebbe la mappatura.
-    Stampa gli intervalli, che senza didascalia non vogliono dire niente.
+    Nessuna riscalatura e nessuna gamma: il valore finisce sul pixel com'e', i negativi
+    vengono portati a zero e quello che supera uno satura.  Prima questa funzione
+    riscalava per canale sull'estensione della geometria: rendeva ogni pannello
+    leggibile per conto suo, ma con un fattore diverso da quello di ogni altro, per cui
+    due figure che mostrano la stessa scena non erano confrontabili e lo stesso colore
+    non significava lo stesso punto.  Con l'identita' il colore e' la coordinata, che e'
+    l'unica lettura che serva a chi guarda una mappa di posizioni.
+
+    `mask` e' opzionale: senza, si mappa tutto il fotogramma (il pannello in world space
+    non ha una maschera da applicare).  Stampa gli estremi e quanto viene tagliato:
+    sono i numeri che la didascalia deve riportare.
     """
-    lo = pos[mask].min(axis=0)
-    hi = pos[mask].max(axis=0)
+    sel = mask if mask is not None else np.ones(pos.shape[:2], bool)
+    lo, hi = pos[sel].min(axis=0), pos[sel].max(axis=0)
     print("  position " + "  ".join(f"{a}[{lo[i]:.2f}, {hi[i]:.2f}]"
                                     for i, a in enumerate("xyz")))
-    rgb = (pos - lo) / np.maximum(hi - lo, 1e-9)
-    rgb[~mask] = 0.0
+    print(f"  clamp: portati a 0 {100.0 * (pos[sel] < 0).mean():.2f}%, "
+          f"saturati a 1 {100.0 * (pos[sel] > 1).mean():.2f}%")
+    rgb = np.clip(pos, 0.0, 1.0).astype(np.float32)
+    if mask is not None:
+        rgb[~mask] = 0.0
+    return rgb
+
+
+def normal_rgb(nrm: np.ndarray, mask: "np.ndarray | None" = None) -> np.ndarray:
+    """Normale mappata su RGB con la codifica delle normal map, sfondo nero.
+
+    Porta $[-1, 1]$ in $[0, 1]$ con 0.5 + 0.5*n, che e' come le normal map sono scritte e
+    come questa pipeline legge quella esterna (`external_normal_range="0_1"`), quindi il
+    pannello e' confrontabile con la mappa che lo sostituisce.  NON si usa il clamp delle
+    posizioni: azzererebbe ogni componente negativa e farebbe sparire tutte le facce
+    rivolte verso -x, -y o -z, cioe' meta' della geometria.
+
+    Normalizza prima di codificare.  Il kernel costruisce la normale come prodotto
+    vettoriale degli spigoli del triangolo e i consumatori la normalizzano al momento
+    dell'uso (deviceProgramsIrradiance.cu lo fa esplicitamente), quindi il buffer non e'
+    garantito unitario: senza normalizzare il colore direbbe l'area del triangolo invece
+    della direzione.
+    """
+    n = np.linalg.norm(nrm, axis=-1, keepdims=True)
+    unit = np.divide(nrm, n, out=np.zeros_like(nrm), where=n > 1e-8)
+    degenerate = float((n[..., 0] <= 1e-8).mean())
+    print(f"  normal   |n| in [{n.min():.3f}, {n.max():.3f}], "
+          f"degeneri {100.0 * degenerate:.2f}%")
+    rgb = np.clip(0.5 + 0.5 * unit, 0.0, 1.0).astype(np.float32)
+    if mask is not None:
+        rgb[~mask] = 0.0
     return rgb
 
 
