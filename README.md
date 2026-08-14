@@ -407,7 +407,7 @@ python scripts/<name>.py ...
 | `retrain_from_manifest.py` | Retrains the scenes of a sweep into a new folder, changing a few parameters. | `python scripts/retrain_from_manifest.py <src_root> <dst_root> --iters N` |
 | `bake_skyboxes.py` | Bakes the NeRF skybox for every run of a sweep. | `python scripts/bake_skyboxes.py <root> --gt <hdr.exr>` |
 | `rerender_run.py` | Re-renders a finished run in Blender using its reconstructed textures. | `python scripts/rerender_run.py <run_dir>` |
-| `blender_renderer.py` | Standalone Blender rendering helper (renders a model against a transforms.json). | `python scripts/blender_renderer.py --model M.obj --transforms t.json` |
+| `blender_renderer.py` | Standalone Blender rendering helper: renders a model from every camera of a `transforms.json`. Runs **inside Blender's Python**, not the conda env. | `blender --background --python scripts/blender_renderer.py -- --model M.obj --transforms t.json --output-dir out/` |
 | `nerf_viewer.py` | Interactive novel-view viewer for a trained NeRF (OpenCV window, orbit camera, live checkpoint reload). | `python scripts/nerf_viewer.py --ckpt <model.pt> --transforms t.json --obj m.obj` |
 | `inspect_final_maps.py` | Summary figure of the final metallic/roughness maps. | `python scripts/inspect_final_maps.py <run_dir> [source]` |
 | `inspect_spec_cone.py` | Browses the baked cones: contact sheets per camera, optional full-res unpack. | `python scripts/inspect_spec_cone.py <output_dir> --cams 0 1 2` |
