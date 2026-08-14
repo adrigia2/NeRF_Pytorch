@@ -272,7 +272,7 @@ def verify_run(run_dir: Path, ref_dir: Path, label: str) -> "list[str]":
     problems: list[str] = []
     stamp_path = run_dir / "irradiance_fix.json"
     if not stamp_path.exists():
-        return [f"{label}: manca irradiance_fix.json (rerun non eseguito?)"]
+        return [f"{label}: irradiance_fix.json missing (rerun not executed?)"]
     with open(stamp_path, encoding="utf-8") as fh:
         stamp = json.load(fh)
     pinned, frac = albedo_is_pinned(run_dir)
@@ -332,7 +332,7 @@ def main() -> int:
     runs = discover_runs(root, args.only)
     if not runs:
         print(f"✗ no run found under {root}" +
-              (f" con --only {args.only}" if args.only else ""))
+              (f" with --only {args.only}" if args.only else ""))
         return 2
 
     if args.verify:

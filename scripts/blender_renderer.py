@@ -82,7 +82,7 @@ class FrameInfo:
 class TransformsFile:
     intrinsics: CameraIntrinsics
     frames: list[FrameInfo]
-    transforms_dir: str     # cartella del transforms.json originale
+    transforms_dir: str     # folder holding the original transforms.json
     scale: float = 1.0
     aabb_scale: int = 16
     raw: dict = field(default_factory=dict)
