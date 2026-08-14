@@ -46,9 +46,9 @@ from pbr_solver import _ExrBandReader  # noqa: E402
 
 GROUP_DESC = {
     "A": "deterministic, bit-identical",
-    "B": "stocastico (raw_noise_std)",
-    "C": "derivate dal fit",
-    "D": "argmin fra candidati",
+    "B": "stochastic (raw_noise_std)",
+    "C": "derived from the fit",
+    "D": "argmin over candidates",
 }
 # Only group A has a threshold on the values: the others are stochastic in themselves.
 STRICT = {"A"}
@@ -232,7 +232,7 @@ def main() -> int:
     # The reference is the full run, or a second sandbox with the same ROI
     # (in that case the table measures the intrinsic noise, not the ROI's effect).
     if args.reference == "full":
-        ref, ref_label = full, "run piena"
+        ref, ref_label = full, "full run"
     else:
         ref = roi_root / args.reference
         if not ref.is_dir():
@@ -264,8 +264,8 @@ def main() -> int:
           f"'outside the ROI must be zero' holds.\n")
 
     targets = build_targets(full, roi, args.source, cams)
-    hdr = (f"{'gr':3} {'file':50} {'texel':>10} {'esatti':>8} "
-           f"{'max|Δ|':>10} {'rel p50':>9} {'rel p99':>9} {'rel max':>9} {'fuori':>8}  esito")
+    hdr = (f"{'gr':3} {'file':50} {'texel':>10} {'exact':>8} "
+           f"{'max|Δ|':>10} {'rel p50':>9} {'rel p99':>9} {'rel max':>9} {'outside':>8}  verdict")
     print(hdr)
     print("-" * len(hdr))
 
@@ -283,7 +283,7 @@ def main() -> int:
             st = compare_file(fp_ref, fp_roi, mask2d, scope, args.band)
         except Exception as exc:  # noqa: BLE001
             failures.append(f"{rel}: {exc}")
-            print(f"{group:3} {rel[-50:]:50} {'ERRORE':>10}  {exc}")
+            print(f"{group:3} {rel[-50:]:50} {'ERROR':>10}  {exc}")
             continue
 
         rows_by_group[group].append(st)
@@ -294,7 +294,7 @@ def main() -> int:
             failures.append(f"{rel}: outside the ROI max {st.max_outside:.3e}")
         if not ok_val:
             failures.append(f"{rel}: {st.n - st.n_exact} differing values "
-                            f"(gruppo deterministico)")
+                            f"(deterministic group)")
 
         if group in STRICT:
             verdict = "OK" if (ok_val and ok_out) else "✗"

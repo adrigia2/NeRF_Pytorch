@@ -20,7 +20,7 @@ Usage:
   --yaw     : override skybox_yaw_degrees; default = the manifest's (or 0.0).
   --dry-run : list the runs found and what would be done, without importing torch.
 
-Esempi:
+Examples:
   conda run --no-capture-output -n nerfpytorch python -u bake_skyboxes.py ^
       D:/tesi_output/sweep_nerf_activation_loss_decay_find_better_nerf ^
       --gt C:/Users/adria/Documents/GitHub/Tesi/OptixProjectCMake/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr
@@ -100,7 +100,7 @@ def bake_one(run_dir: Path, width: int, height: int, yaw: float) -> None:
 
 
 def compare_one(run_dir: Path, gt_path: Path) -> None:
-    """Scrive <run_dir>/skybox_compare/skybox_heatmap.png (baked vs GT HDR)."""
+    """Write <run_dir>/skybox_compare/skybox_heatmap.png (baked vs GT HDR)."""
     from nerf.metrics import plot_skybox_compare
     from regen_heatmaps import _load_exr_hw3
 
@@ -124,7 +124,7 @@ def compare_one(run_dir: Path, gt_path: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Bake the NeRF skybox for every run of a sweep (checkpoint only, no Step 3).")
-    parser.add_argument("root", type=Path, help="root dello sweep o singola run dir")
+    parser.add_argument("root", type=Path, help="sweep root, or a single run dir")
     parser.add_argument("--gt", type=Path, default=None,
                         help="ground-truth HDR for the comparison heatmap")
     parser.add_argument("--force", action="store_true",

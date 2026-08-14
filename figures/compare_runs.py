@@ -33,7 +33,7 @@ The methodological point, which is why this script exists:
   same set of pixels as the matrix.  A run can have the lowest per-pixel error and the
   most skewed spectrum.  The final section decomposes that same spectrum per channel,
   per frame and on the skybox.
-  (originale contro quelle bakate dai NeRF).
+  (the original against the ones baked from the NeRFs).
 
 Formulas replicated from other modules are flagged in the comments with their source
 file, so that a future divergence is findable: the script is standalone by choice (it
@@ -58,7 +58,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Costanti
+# Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_ROOT = "D:/tesi_output/sweep_nerf_activation_loss_decay_find_better_nerf"
@@ -280,7 +280,7 @@ def discover_runs(root: Path, only: list[str] | None) -> list[Run]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Accumulatori
+# Accumulators
 # ──────────────────────────────────────────────────────────────────────────────
 
 N_CELLS = 2 * N_DEC     # set (0=fg, 1=bg) x luminance band
@@ -470,7 +470,7 @@ def metrics_from(n: float, s: dict[str, float], mu_scale: float) -> dict[str, fl
 class GtCtx:
     g: np.ndarray            # (H, W, 3) float32
     cell_flat: np.ndarray    # (H*W*3,) int32  -> set*N_DEC + band
-    n_cell: np.ndarray       # (N_CELLS,) conteggi
+    n_cell: np.ndarray       # (N_CELLS,) counts
     log_g: np.ndarray        # (H, W, 3) float32  log(g + EPS)
     t_g: np.ndarray          # (H, W, 3) float32  mu-law of the GT
     clip_g: np.ndarray
@@ -572,7 +572,7 @@ class GtStats:
     fg_frac: float
     hl_in_fg: float          # share of the highlights (L>1) that falls in the foreground
     percentiles: dict[float, float]
-    # (F, 3, 4, NS): frame x pixel set (PIXEL_SETS) x canale x bin
+    # (F, 3, 4, NS): frame x pixel set (PIXEL_SETS) x channel x bin
     spec_gt: np.ndarray = field(
         default_factory=lambda: np.zeros((0, len(PIXEL_SETS), N_SPEC_CH, NS)))
     n_pixels: int = 0        # pixels per frame, for the histogram check
@@ -859,7 +859,7 @@ def verify_decomposition(results: dict[str, RunResult], mu_scale: float) -> list
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Scrittura tabelle
+# Table writing
 # ──────────────────────────────────────────────────────────────────────────────
 
 def write_metrics_global(out: Path, results: dict[str, RunResult], mu_scale: float) -> None:
@@ -988,7 +988,7 @@ def _save(fig, path: Path, dpi: int = 150, constrained: bool = True) -> None:
     if constrained:
         # keeps the panel titles from landing on the labels of the row above;
         # bbox_inches="tight" trims the borders but does not fix it
-        # collisioni interne
+        # internal collisions
         fig.set_layout_engine("constrained")
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
@@ -1000,7 +1000,7 @@ def _legend_runs(ax, *_unused, **kw) -> None:
 
 
 def rank_of(values: np.ndarray, higher_is_better: bool) -> np.ndarray:
-    """Rank 1 = migliore.  NaN in fondo."""
+    """Rank 1 = best.  NaNs go last."""
     v = values.copy()
     if higher_is_better:
         v = -v
@@ -1011,7 +1011,7 @@ def rank_of(values: np.ndarray, higher_is_better: bool) -> np.ndarray:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Figure -- dai training_metrics.csv
+# Figures -- from the training_metrics.csv files
 # ──────────────────────────────────────────────────────────────────────────────
 
 def fig_training(runs: list[Run], figdir: Path) -> None:
@@ -1087,7 +1087,7 @@ def fig_training(runs: list[Run], figdir: Path) -> None:
     _legend_runs(ax)
     _save(fig, figdir / "train_mse.png")
 
-    # 4. diagnostica
+    # 4. diagnostics
     fig, axes = plt.subplots(2, 2, figsize=(11, 7))
     panels = [("lr", "learning rate", True), ("acc_fg", "accumulated opacity (fg)", False),
               ("iters_per_s", "iterations / s", False), ("wall_s", "wall clock [s]", False)]
@@ -1197,7 +1197,7 @@ def fig_existing_per_frame(runs: list[Run], figdir: Path) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Figure -- dalle metriche ricalcolate
+# Figures -- from the recomputed metrics
 # ──────────────────────────────────────────────────────────────────────────────
 
 def fig_quality_boxplots(results: dict[str, RunResult], runs: list[Run], figdir: Path) -> None:
@@ -1604,11 +1604,11 @@ def fig_visual(runs: list[Run], gt_paths: list[Path], mask_paths: list[Path],
 
 @dataclass
 class SpectrumAnalysis:
-    keys: list[str]                  # run, nell'ordine di `runs`
+    keys: list[str]                  # runs, in the order of `runs`
     # The per-frame quantities stay on the WHOLE FRAME: they are what feeds the figures
     # and the tables of this section.  The split by pixel set lives only in the
     # `*_pooled_set` arrays, which feed the three run x metric matrices.
-    w1: np.ndarray                   # (n_run, n_frame, 4)  distanza per frame
+    w1: np.ndarray                   # (n_run, n_frame, 4)  per-frame distance
     dmean: np.ndarray                # (n_run, n_frame, 4)  signed bias
     w1_pooled: np.ndarray            # (n_run, 4)   over every frame together, full
     dmean_pooled: np.ndarray         # (n_run, 4)
@@ -1638,7 +1638,7 @@ def analyze_spectrum(results: dict[str, RunResult], runs: list[Run],
     spec_gt_tot = spec_gt.sum(0)                              # (4, NS)
     spec_run_tot = spec_runs.sum(1)                           # (R, 4, NS)
 
-    # pooling sui frame per ciascun pixel set: (R, 3, 4, NS) contro (1, 3, 4, NS)
+    # pooled over the frames for each pixel set: (R, 3, 4, NS) against (1, 3, 4, NS)
     gt_tot_set = spec_gt_set.sum(0)                           # (3, 4, NS)
     run_tot_set = spec_runs_set.sum(1)                        # (R, 3, 4, NS)
     w1_pooled_set = spec_w1_dex(run_tot_set, gt_tot_set[None])
@@ -1646,10 +1646,10 @@ def analyze_spectrum(results: dict[str, RunResult], runs: list[Run],
     w1_pooled = w1_pooled_set[:, 0]
     dmean_pooled = dmean_pooled_set[:, 0]
 
-    # ── frame notevoli ───────────────────────────────────────────────────────
+    # ── notable frames ───────────────────────────────────────────────────────
     # Reference: the `norm` channel, which is the quantity the rest of the pipeline
     # consumes (the pixel's radiance, not the single channel).
-    per_frame_mean = w1[:, :, NORM_CH].mean(axis=0)           # (F,) media sui run
+    per_frame_mean = w1[:, :, NORM_CH].mean(axis=0)           # (F,) mean over the runs
     spread = w1[:, :, NORM_CH].max(axis=0) - w1[:, :, NORM_CH].min(axis=0)
     order_frames = np.argsort(per_frame_mean)
     notable = {
@@ -1699,7 +1699,7 @@ def verify_spectrum(results: dict[str, RunResult], stats: GtStats) -> list[str]:
 
     # The three sets are binned independently (spectrum_hist_sets), so this equality is
     # a real check on the mask: it proves no pixel ends up
-    # in due insiemi o in nessuno.
+    # in two of the sets, or in none.
     worst = max(float(np.abs(s[:, 0] - s[:, 1] - s[:, 2]).max()) for s in all_spec)
     lines.append(f"  [{'OK ' if worst == 0.0 else 'FAIL'}] spectrum: full == fg + bg bin "
                  f"by bin (max gap {worst:.3e})")
@@ -2035,7 +2035,7 @@ def fig_spectrum_skybox(spec_gt: np.ndarray, per_run: dict[str, np.ndarray],
     _save(fig, figdir / "spectrum_skybox.png")
 
 
-# ── tabelle ───────────────────────────────────────────────────────────────────
+# ── tables ───────────────────────────────────────────────────────────────────
 
 def write_spectrum_tables(out: Path, an: SpectrumAnalysis, runs: list[Run]) -> None:
     rows = []

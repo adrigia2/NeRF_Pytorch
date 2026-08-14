@@ -2931,7 +2931,7 @@ def _step2b_render_train_images(cfg: PipelineConfig,
         writer.writeheader()
         writer.writerows(metrics_rows)
 
-    # ── Scatter aggregato + bias_bins.csv ─────────────────────────────────────
+    # ── Aggregate scatter + bias_bins.csv ─────────────────────────────────────
     all_pred = np.concatenate(agg_pred_rgb, axis=0)   # (N_total, 3)
     all_gt   = np.concatenate(agg_gt_rgb,   axis=0)
     n_agg    = all_pred.shape[0]

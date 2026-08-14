@@ -198,18 +198,18 @@ class NerfViewer:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Viewer interattivo NeRF (OptiX depth + render depth-guided)")
+    ap = argparse.ArgumentParser(description="Interactive NeRF viewer (OptiX depth + depth-guided render)")
     ap.add_argument("--ckpt",       required=True, help="checkpoint NeRF (nerf_model_cache.pt)")
-    ap.add_argument("--transforms", required=True, help="transforms_extended.json dello Step 1")
+    ap.add_argument("--transforms", required=True, help="the transforms_extended.json from Step 1")
     ap.add_argument("--obj",        required=True, help="the scene's OBJ mesh")
     ap.add_argument("--res",   type=int, default=256, help="long side of the preview (default 256)")
-    ap.add_argument("--chunk", type=int, default=None, help="override cfg.chunk (riduci se VRAM scarsa)")
+    ap.add_argument("--chunk", type=int, default=None, help="override cfg.chunk (lower it when VRAM is tight)")
     args = ap.parse_args()
 
     import cv2
 
     viewer = NerfViewer(args.ckpt, args.transforms, args.obj, args.res, args.chunk)
-    print(__doc__.split("Comandi")[1].join(["Comandi", ""]))
+    print(__doc__.split("Controls")[1].join(["Controls", ""]))
     print(f"Checkpoint: iter {viewer.iter_done} — preview {viewer.vw}x{viewer.vh}")
 
     win = "nerf_viewer"
@@ -273,7 +273,7 @@ def main() -> None:
                 viewer.center += cam_right * step
             elif kraw in (65362, 2490368):    # ↑  forward (along the camera's forward)
                 viewer.center += cam_fwd * step
-            else:                             # ↓  indietro
+            else:                             # ↓  backwards
                 viewer.center -= cam_fwd * step
             dirty = True
         elif k in (ord("+"), ord("=")):

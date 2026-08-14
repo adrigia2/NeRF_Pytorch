@@ -13,7 +13,7 @@ Usage:
   gt_skybox.exr  : (optional) path to the GT HDR for the skybox comparison; when
                    omitted, the skybox comparison is skipped.
 
-Esempi:
+Examples:
   conda run --no-capture-output -n nerfpytorch python -u regen_heatmaps.py ^
       D:/tesi_output/heatmap_norm_diff/TableAndOtherInterior ^
       C:/Users/adria/Documents/GitHub/Tesi/OptixProjectCMake/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr

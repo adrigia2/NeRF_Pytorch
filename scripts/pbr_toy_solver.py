@@ -5,7 +5,7 @@ Model (split-sum, metallic workflow, per texel, camera j):
     C_j = (1 - X) * (d / pi) * E  +  F_j * L_j(r)
 
     F_j  = F0 + (1 - F0) * (1 - cos(theta_j))^5        (Schlick)
-    F0   = 0.04 * (1 - X) + d * X                       (accoppiamento spettrale)
+    F0   = 0.04 * (1 - X) + d * X                       (spectral coupling)
     E    = cosine-weighted irradiance over the hemisphere (view-independent)
     L_j(r) = GGX-prefiltered ambient radiance around reflect(v_j, n)
              (in the real pipeline: cone-traced NeRF query, here: analytic envmap + MC)
@@ -50,7 +50,7 @@ WALL_COLOR = np.array([3.0, 0.6, 0.3])
 
 
 def env_radiance(w):
-    """Radianza ambiente analitica, w: (...,3) -> (...,3). Colorata e
+    """Analytic environment radiance, w: (...,3) -> (...,3). Coloured and
     angularly varied (warm sun + red wall) so that different reflection
     directions see different colours."""
     t = 0.5 * (w[..., 2:3] + 1.0)
@@ -107,7 +107,7 @@ def prefiltered_env(R, rough, n_samples=8192):
 
 def make_cameras(n):
     """n view directions over the upper hemisphere (Fibonacci spiral,
-    elevazioni da ~radente a ~zenitale)."""
+    elevations from ~grazing to ~zenithal)."""
     i = np.arange(n)
     z = 0.15 + 0.8 * (i + 0.5) / n
     rxy = np.sqrt(1.0 - z * z)
@@ -175,7 +175,7 @@ def cone_mean_env(R, aperture_deg, n_samples=8192):
         return env_radiance(R)
     cos_b = np.cos(np.radians(aperture_deg) * 0.5)
     u1, u2 = rng.random(n_samples), rng.random(n_samples)
-    z = 1.0 - u1 * (1.0 - cos_b)              # cos uniforme in [cos_b, 1]
+    z = 1.0 - u1 * (1.0 - cos_b)              # cos uniform in [cos_b, 1]
     s = np.sqrt(np.maximum(0.0, 1.0 - z * z))
     phi = 2.0 * np.pi * u2
     t, b, d = _frame(R)
@@ -192,9 +192,9 @@ def render_cone_model(a, x, E, L):
 
 def solve_cone_model(C_obs, E, L_levels, apertures, x_eps=1e-3):
     """Closed-form fit of the pbr_solver model: for each candidate r, a regression
-    centrata C_jc = alpha_c + beta*L_jc (beta condiviso sui canali); argmin
+    centred, C_jc = alpha_c + beta*L_jc (beta shared across channels); argmin
     of the residual over r; then x = 1-beta, a = pi*alpha/(E*x). Identical to the
-    pipeline reale (statistiche sufficienti centrate)."""
+    real pipeline (centred sufficient statistics)."""
     best = (np.inf, None)
     for k, ap in enumerate(apertures):
         L = L_levels[k]
@@ -238,10 +238,10 @@ def main():
     print(f"Irradianza E = {np.round(E, 3)}  (RGB)\n")
 
     materials = {
-        "dielettrico opaco  (d rosso,  X=0.0, r=0.80)": (np.array([0.70, 0.15, 0.10]), 0.0, 0.80),
-        "dielettrico lucido (d blu,    X=0.0, r=0.12)": (np.array([0.10, 0.20, 0.65]), 0.0, 0.12),
-        "metallo oro        (d oro,    X=1.0, r=0.25)": (np.array([1.00, 0.71, 0.29]), 1.0, 0.25),
-        "semi-metallo       (d grigio, X=0.5, r=0.45)": (np.array([0.50, 0.50, 0.50]), 0.5, 0.45),
+        "matte dielectric   (d red,    X=0.0, r=0.80)": (np.array([0.70, 0.15, 0.10]), 0.0, 0.80),
+        "glossy dielectric  (d blue,   X=0.0, r=0.12)": (np.array([0.10, 0.20, 0.65]), 0.0, 0.12),
+        "gold metal         (d gold,   X=1.0, r=0.25)": (np.array([1.00, 0.71, 0.29]), 1.0, 0.25),
+        "semi-metal         (d grey,   X=0.5, r=0.45)": (np.array([0.50, 0.50, 0.50]), 0.5, 0.45),
     }
 
     for n_cams in (16, 6, 3):
@@ -270,7 +270,7 @@ def main():
     views = make_cameras(16)
     cos_t = views[:, 2]
     refl = 2.0 * cos_t[:, None] * N_NORMAL - views
-    d_gt, X_gt, r_gt = materials["metallo oro        (d oro,    X=1.0, r=0.25)"]
+    d_gt, X_gt, r_gt = materials["gold metal         (d gold,   X=1.0, r=0.25)"]
     L_true = np.stack([prefiltered_env(R, r_gt) for R in refl])
     C = render(d_gt, X_gt, cos_t, E, L_true)
     for X, resid, d_rec in solve_naive(C, E, L_true, np.array([0.1, 0.3, 0.5, 0.7, 0.9])):
@@ -282,7 +282,7 @@ def main():
     experiment_cone_model()
 
 
-# ------------------------------------------- modello pbr_solver (2026-07-16)
+# -------------------------------------------- pbr_solver model (2026-07-16)
 
 APERTURES_TOY = np.array([0.0, 10.0, 25.0, 50.0, 90.0, 130.0, 180.0])
 
@@ -292,12 +292,12 @@ def experiment_cone_model():
     Same closed-form fit as pbr_solver.py; r quantized to the aperture grid
     (the 'off-grid' material has to fall on the adjacent level)."""
     E = irradiance()
-    print("\n=== Modello pbr_solver: C = (a*x/pi)*E + (1-x)*mean-cone(r) ===")
+    print("\n=== pbr_solver model: C = (a*x/pi)*E + (1-x)*mean-cone(r) ===")
     print(f"aperture grid: {APERTURES_TOY.astype(int).tolist()} degrees\n")
 
     materials = {
-        "diffuso puro   (a rosso,  x=1.00, r=n/d)": (np.array([0.70, 0.15, 0.10]), 1.00, 90.0),
-        "lucido         (a blu,    x=0.70, r=25)": (np.array([0.10, 0.20, 0.65]), 0.70, 25.0),
+        "pure diffuse   (a red,    x=1.00, r=n/d)": (np.array([0.70, 0.15, 0.10]), 1.00, 90.0),
+        "glossy         (a blue,   x=0.70, r=25)": (np.array([0.10, 0.20, 0.65]), 0.70, 25.0),
         "near mirror    (a grey,   x=0.20, r=0)": (np.array([0.50, 0.50, 0.50]), 0.20, 0.0),
         "off-grid       (a green,  x=0.50, r=35)": (np.array([0.20, 0.60, 0.25]), 0.50, 35.0),
     }

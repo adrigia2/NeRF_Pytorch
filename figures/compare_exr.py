@@ -236,7 +236,7 @@ def main(argv=None) -> int:
         type=float,
         default=1e-4,
         help="floor of the log scale; below this value the difference is "
-        "rumore float (default: 1e-4)",
+        "float noise (default: 1e-4)",
     )
     ap.add_argument(
         "--vmax-exact",
@@ -278,8 +278,8 @@ def main(argv=None) -> int:
 
     os.makedirs(args.output, exist_ok=True)
 
-    # ---------------- Pass 1: statistiche globali ---------------- #
-    print("\n[1/2] statistiche globali...")
+    # ---------------- Pass 1: global statistics ------------------ #
+    print("\n[1/2] global statistics...")
     t0 = time.time()
     stats_all: dict[str, dict] = {}
     vmax_global = 0.0

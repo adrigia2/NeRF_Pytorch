@@ -439,7 +439,7 @@ def do_spectrum(out: Path) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# grids -- le otto griglie preview: originale | ricostruzione | heatmap, su 4 viste
+# grids -- the eight preview grids: original | reconstruction | heatmap, over 4 views
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Threshold below which a difference is numerically irrelevant and the panel goes solid

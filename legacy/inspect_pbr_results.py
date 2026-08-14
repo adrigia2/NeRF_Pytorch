@@ -73,9 +73,9 @@ panels = [
     (tm(cvar),   "color_variance",        {}),
     (tm(albedo), "albedo",                {}),
     (tm(C0),     "camera_texture cam0 (C_0)", {}),
-    (tm(L0),     "L specchio cam0",           {}),
-    (tm(L180),   "L lobo s=0 cam0",           {}),
-    (np.log10(cvar.mean(-1) + 1e-9), "log10 varianza media", dict(cmap="inferno")),
+    (tm(L0),     "L mirror cam0",           {}),
+    (tm(L180),   "L lobe s=0 cam0",           {}),
+    (np.log10(cvar.mean(-1) + 1e-9), "log10 mean variance", dict(cmap="inferno")),
 ]
 for ax, (img, title, kw) in zip(axs.flat, panels):
     im = ax.imshow(img, **kw)

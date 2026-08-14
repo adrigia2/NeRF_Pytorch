@@ -24,7 +24,6 @@ Three choices are not negotiable, and are the reason this script exists:
      the diffuse variant might look so because of the exposure rather than the material,
      which is exactly what the figure is there to show.  The night variant has its own,
      because at the daytime exposure it would be black.
-     nera.
 
   3. The crop is taken from the full-resolution linear image and tonemapped with the same
      exposure as the view it comes from.  Cropping after the downsample would throw away
@@ -35,7 +34,6 @@ variants and two exposure groups, the sword has two which are also the two group
 `column_exposure()` is where rule 2 is written down once:
 make_results_figures.py calls it to tonemap the "NeRF render" row of the grids with the
 exposure of the original row of the same column, which is what the caption promises.
-didascalia promette al lettore.
 """
 from __future__ import annotations
 
