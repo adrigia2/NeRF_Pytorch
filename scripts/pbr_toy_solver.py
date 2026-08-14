@@ -1,33 +1,33 @@
-"""Toy numerico per verificare l'identificabilita' del sistema PBR multi-vista.
+"""Numerical toy that checks the identifiability of the multi-view PBR system.
 
-Modello (split-sum, workflow metallic, per texel, camera j):
+Model (split-sum, metallic workflow, per texel, camera j):
 
     C_j = (1 - X) * (d / pi) * E  +  F_j * L_j(r)
 
     F_j  = F0 + (1 - F0) * (1 - cos(theta_j))^5        (Schlick)
     F0   = 0.04 * (1 - X) + d * X                       (accoppiamento spettrale)
-    E    = irradianza coseno-pesata sull'emisfero (vista-indipendente)
+    E    = cosine-weighted irradiance over the hemisphere (view-independent)
     L_j(r) = radianza ambiente prefiltrata GGX attorno a reflect(v_j, n)
-             (nel pipeline reale: query NeRF cone-traced, qui: envmap analitica + MC)
+             (in the real pipeline: cone-traced NeRF query, here: analytic envmap + MC)
 
-Incognite per texel: d (3), X (1), r (1).
-Strategia: scan su griglia (X, r) + minimi quadrati chiusi su d (lineare!),
-con L(r) interpolata da K livelli precalcolati (la "catena di mip").
+Unknowns per texel: d (3), X (1), r (1).
+Strategy: grid scan over (X, r) + closed-form least squares on d (linear!),
+with L(r) interpolated from K precomputed levels (the "mip chain").
 
-Lo script verifica anche la degenerazione del modello naive
+The script also checks the degeneracy of the naive model
     C_j = X*d*E + (1-X)*s*L_j(r)
-in cui X non e' identificabile (si assorbe in d ed s).
+in which X is not identifiable (it is absorbed into d and s).
 
-Infine verifica l'identificabilita' del modello adottato da pbr_solver.py
-(2026-07-16, media pura sul cono, s ≡ 1):
+Finally it checks the identifiability of the model pbr_solver.py adopted
+(2026-07-16, pure mean over the cone, s ≡ 1):
 
-    C_j = (a*x/pi) * E + (1 - x) * L_j(r)      L_j = media sul cono
+    C_j = (a*x/pi) * E + (1 - x) * L_j(r)      L_j = mean over the cone
 
 Qui la pendenza di C rispetto a L tra le camere identifica direttamente
-beta = 1-x (il termine diffuso e' vista-indipendente) e l'intercetta
-identifica a*x*E/pi: a differenza del modello naive non c'e' scala libera
-sullo speculare, quindi (a, x, r) sono recuperabili. Il fit e' la stessa
-regressione centrata in forma chiusa usata da pbr_solver.py.
+beta = 1-x (the diffuse term is view-independent) and the intercept identifies
+a*x*E/pi: unlike the naive model there is no free scale on the specular, so
+(a, x, r) are recoverable. The fit is the same centred closed-form regression
+pbr_solver.py uses.
 """
 
 import numpy as np
@@ -51,8 +51,8 @@ WALL_COLOR = np.array([3.0, 0.6, 0.3])
 
 def env_radiance(w):
     """Radianza ambiente analitica, w: (...,3) -> (...,3). Colorata e
-    angolarmente variata (sole caldo + parete rossa) cosi' direzioni di
-    riflessione diverse vedono colori diversi."""
+    angularly varied (warm sun + red wall) so that different reflection
+    directions see different colours."""
     t = 0.5 * (w[..., 2:3] + 1.0)
     sky = (1.0 - t) * HORIZON + t * ZENITH
     sun = SUN_COLOR * np.exp((np.sum(w * SUN_DIR, -1, keepdims=True) - 1.0) / 0.02)
@@ -60,12 +60,12 @@ def env_radiance(w):
     return sky + sun + wall
 
 
-N_NORMAL = np.array([0.0, 0.0, 1.0])  # texel con normale +Z (Z-up come nel progetto)
+N_NORMAL = np.array([0.0, 0.0, 1.0])  # texel with a +Z normal (Z-up, as in the project)
 
 
 def irradiance(n_samples=200_000):
-    """E = integrale di L*cos sull'emisfero. Campionamento coseno: pdf=cos/pi
-    quindi E = pi * media(L)."""
+    """E = integral of L*cos over the hemisphere. Cosine sampling: pdf=cos/pi
+    so E = pi * mean(L)."""
     u1, u2 = rng.random(n_samples), rng.random(n_samples)
     z = np.sqrt(u1)
     rxy = np.sqrt(1.0 - u1)
@@ -75,7 +75,7 @@ def irradiance(n_samples=200_000):
 
 
 def _frame(d):
-    """Base ortonormale con terzo asse d."""
+    """Orthonormal basis with d as the third axis."""
     a = np.array([1.0, 0.0, 0.0]) if abs(d[2]) < 0.9 else np.array([0.0, 1.0, 0.0])
     t = _normalize(np.cross(a, d))
     b = np.cross(d, t)
@@ -83,8 +83,8 @@ def _frame(d):
 
 
 def prefiltered_env(R, rough, n_samples=8192):
-    """L(R, r): prefiltro split-sum con campionamento GGX (assunzione n=v=R).
-    Nel pipeline reale questa e' la query NeRF con cono di apertura ~r."""
+    """L(R, r): split-sum prefilter with GGX sampling (assuming n=v=R).
+    In the real pipeline this is the NeRF query with a cone of aperture ~r."""
     if rough < 1e-3:
         return env_radiance(R)
     alpha = rough * rough
@@ -106,7 +106,7 @@ def prefiltered_env(R, rough, n_samples=8192):
 
 
 def make_cameras(n):
-    """n direzioni di vista sull'emisfero superiore (spirale di Fibonacci,
+    """n view directions over the upper hemisphere (Fibonacci spiral,
     elevazioni da ~radente a ~zenitale)."""
     i = np.arange(n)
     z = 0.15 + 0.8 * (i + 0.5) / n
@@ -123,7 +123,7 @@ def schlick_g(cos_t):
 
 
 def render(d, X, cos_t, E, L):
-    """C_j per tutte le camere. d:(3,) X:scalar cos_t:(N,) E:(3,) L:(N,3)."""
+    """C_j for every camera. d:(3,) X:scalar cos_t:(N,) E:(3,) L:(N,3)."""
     F0 = 0.04 * (1.0 - X) + d * X
     g = schlick_g(cos_t)[:, None]
     F = F0 * (1.0 - g) + g
@@ -136,7 +136,7 @@ R_LEVELS = np.array([0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.55, 0.7, 0.85, 1.0])
 
 
 def lerp_levels(L_levels, r):
-    """Interpola la catena di livelli L(r_k) -> L(r). L_levels: (K, N, 3)."""
+    """Interpolate the level chain L(r_k) -> L(r). L_levels: (K, N, 3)."""
     k = np.clip(np.searchsorted(R_LEVELS, r) - 1, 0, len(R_LEVELS) - 2)
     t = (r - R_LEVELS[k]) / (R_LEVELS[k + 1] - R_LEVELS[k])
     return (1.0 - t) * L_levels[k] + t * L_levels[k + 1]
@@ -145,7 +145,7 @@ def lerp_levels(L_levels, r):
 def solve_texel(C_obs, cos_t, E, L_levels,
                 r_grid=np.linspace(0.0, 1.0, 51),
                 X_grid=np.linspace(0.0, 1.0, 41)):
-    """Scan (X, r); per ciascuna coppia d ha soluzione chiusa per canale:
+    """Scan (X, r); for each pair, d has a closed-form solution per channel:
 
         C_jc = A_jc * d_c + b_jc
         A_jc = (1-X) E_c / pi + X (1-g_j) L_jc
@@ -168,9 +168,9 @@ def solve_texel(C_obs, cos_t, E, L_levels,
 
 
 def cone_mean_env(R, aperture_deg, n_samples=8192):
-    """Media pura della radianza su un cono di apertura totale aperture_deg
-    attorno a R (campionamento uniforme in angolo solido, nessun peso cos).
-    Nel pipeline reale e' la ricostruzione ring_weights_mean di pbr_solver.py."""
+    """Pure mean of the radiance over a cone of total aperture aperture_deg
+    around R (uniform sampling in solid angle, no cos weight).
+    In the real pipeline this is the ring_weights_mean reconstruction of pbr_solver.py."""
     if aperture_deg < 1e-3:
         return env_radiance(R)
     cos_b = np.cos(np.radians(aperture_deg) * 0.5)
@@ -186,14 +186,14 @@ def cone_mean_env(R, aperture_deg, n_samples=8192):
 
 
 def render_cone_model(a, x, E, L):
-    """C_j = (a*x/pi)*E + (1-x)*L_j  (modello pbr_solver, media pura sul cono)."""
+    """C_j = (a*x/pi)*E + (1-x)*L_j  (the pbr_solver model, pure mean over the cone)."""
     return (x * a * E / np.pi)[None, :] + (1.0 - x) * L
 
 
 def solve_cone_model(C_obs, E, L_levels, apertures, x_eps=1e-3):
-    """Fit chiuso del modello pbr_solver: per ogni candidato r, regressione
+    """Closed-form fit of the pbr_solver model: for each candidate r, a regression
     centrata C_jc = alpha_c + beta*L_jc (beta condiviso sui canali); argmin
-    del residuo su r; poi x = 1-beta, a = pi*alpha/(E*x). Identica alla
+    of the residual over r; then x = 1-beta, a = pi*alpha/(E*x). Identical to the
     pipeline reale (statistiche sufficienti centrate)."""
     best = (np.inf, None)
     for k, ap in enumerate(apertures):
@@ -215,8 +215,8 @@ def solve_cone_model(C_obs, E, L_levels, apertures, x_eps=1e-3):
 
 
 def solve_naive(C_obs, E, L, X_grid):
-    """Modello naive C = X d E + (1-X) s L: per X fissato e' lineare in (d,s).
-    Mostra che il residuo e' piatto in X -> X non identificabile."""
+    """Naive model C = X d E + (1-X) s L: for fixed X it is linear in (d,s).
+    Shows that the residual is flat in X -> X is not identifiable."""
     out = []
     for X in X_grid:
         resid, d_rec = 0.0, np.zeros(3)
@@ -264,9 +264,9 @@ def main():
                       f"   (residuo {resid:.2e})")
             print()
 
-    # --- degenerazione del modello naive --------------------------------
-    print("=== Degenerazione del blend lineare C = X*d*E + (1-X)*s*L ===")
-    print("(metallo oro, 16 camere, r fissato al valore vero, nessun rumore)")
+    # --- degeneracy of the naive model ----------------------------------
+    print("=== Degeneracy of the linear blend C = X*d*E + (1-X)*s*L ===")
+    print("(gold metal, 16 cameras, r fixed at the true value, no noise)")
     views = make_cameras(16)
     cos_t = views[:, 2]
     refl = 2.0 * cos_t[:, None] * N_NORMAL - views
@@ -276,7 +276,7 @@ def main():
     for X, resid, d_rec in solve_naive(C, E, L_true, np.array([0.1, 0.3, 0.5, 0.7, 0.9])):
         print(f"  X assunto={X:.1f} -> residuo {resid:.3e},"
               f"  d recuperato={np.round(d_rec, 3)}")
-    print("  -> residuo identico per ogni X: il sistema non vincola X,"
+    print("  -> identical residual for every X: the system does not constrain X,"
           " e d scala di conseguenza.")
 
     experiment_cone_model()
@@ -288,9 +288,9 @@ APERTURES_TOY = np.array([0.0, 10.0, 25.0, 50.0, 90.0, 130.0, 180.0])
 
 
 def experiment_cone_model():
-    """Identificabilita' del modello adottato: C = (a*x/pi)E + (1-x)*mean-cone(r).
-    Stesso fit chiuso di pbr_solver.py; r quantizzato alla griglia di aperture
-    (il materiale 'fuori griglia' deve cadere sul livello adiacente)."""
+    """Identifiability of the adopted model: C = (a*x/pi)E + (1-x)*mean-cone(r).
+    Same closed-form fit as pbr_solver.py; r quantized to the aperture grid
+    (the 'off-grid' material has to fall on the adjacent level)."""
     E = irradiance()
     print("\n=== Modello pbr_solver: C = (a*x/pi)*E + (1-x)*mean-cone(r) ===")
     print(f"griglia aperture: {APERTURES_TOY.astype(int).tolist()} gradi\n")
@@ -299,7 +299,7 @@ def experiment_cone_model():
         "diffuso puro   (a rosso,  x=1.00, r=n/d)": (np.array([0.70, 0.15, 0.10]), 1.00, 90.0),
         "lucido         (a blu,    x=0.70, r=25)": (np.array([0.10, 0.20, 0.65]), 0.70, 25.0),
         "quasi specchio (a grigio, x=0.20, r=0)": (np.array([0.50, 0.50, 0.50]), 0.20, 0.0),
-        "fuori griglia  (a verde,  x=0.50, r=35)": (np.array([0.20, 0.60, 0.25]), 0.50, 35.0),
+        "off-grid       (a green,  x=0.50, r=35)": (np.array([0.20, 0.60, 0.25]), 0.50, 35.0),
     }
 
     for n_cams in (16, 6, 3):
@@ -323,8 +323,8 @@ def experiment_cone_model():
                 print(f"    rec a={np.round(a, 3)}  x={x:.2f}  r={r:.0f}"
                       f"   (residuo {resid:.2e})")
             print()
-    print("  -> con x=1 (diffuso puro) r non e' vincolato: qualunque livello"
-          " da' lo stesso residuo, ma a e x restano corretti.")
+    print("  -> with x=1 (pure diffuse) r is not constrained: any level"
+          " gives the same residual, but a and x stay correct.")
 
 
 if __name__ == "__main__":

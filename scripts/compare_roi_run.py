@@ -1,30 +1,30 @@
 #!/usr/bin/env python
-"""Confronta una run ristretta a una ROI con la run piena da cui deriva.
+"""Compare a run restricted to a ROI with the full run it derives from.
 
-Verifica la proprietà che giustifica la ROI: **dentro** la ROI i texel devono
-ricevere gli stessi valori della run piena, **fuori** tutto deve restare a zero.
+It checks the property that justifies the ROI: **inside** the ROI the texels must receive
+the same values as the full run, **outside** everything must stay zero.
 
-Il criterio non è uniforme, e la distinzione è il contenuto informativo del test:
+The criterion is not uniform, and the distinction is the informative content of the test:
 
-  A  DETERMINISTICO, deve essere bit-identico.  Pass per-texel senza query NeRF:
+  A  DETERMINISTIC, must be bit-identical.  Per-texel passes with no NeRF query:
      IUM, visibility, color texture, camera_texture, camera_mask, pixel_change,
-     irradiance, n_views. Una sola differenza qui è un bug della ROI.
-  B  STOCASTICO per costruzione.  Tutto ciò che passa da query_radiance:
-     indirect e spec_cone. raw2outputs aggiunge rumore gaussiano alla densità
+     irradiance, n_views. A single difference here is a bug in the ROI.
+  B  STOCHASTIC by construction.  Everything that goes through query_radiance:
+     indirect and spec_cone. raw2outputs adds Gaussian noise to the density and
      (nerf/rays.py:68, `noise = torch.randn_like(...) * raw_noise_std`) e
-     raw_noise_std arriva dal checkpoint SENZA guardia di eval, quindi due
-     esecuzioni identiche dello stesso bake danno già mappe diverse.
-  C  come B, propagato: mappe derivate dal fit PBR.
-  D  come B, ma passato per un argmin su 14 candidati: roughness e lobe_param
+     raw_noise_std comes from the checkpoint WITHOUT an eval guard, so two identical
+     executions of the same bake already give different maps.
+  C  like B, propagated: maps derived from the PBR fit.
+  D  like B, but passed through an argmin over 14 candidates: roughness and lobe_param
      saltano da un candidato all'altro dove due residui quasi pareggiano.
 
-Solo il gruppo A dà un verdetto pass/fail sui valori; per B, C e D il confronto
-con la run piena non ha una soglia sensata a priori. Per dargliene una si passa
-`--reference <altro-tag>`: due sandbox generate con la STESSA ROI misurano il
-rumore intrinseco, ed è quello il metro con cui leggere la colonna full-vs-ROI.
+Only group A gives a pass/fail verdict on the values; for B, C and D the comparison with
+the full run has no sensible a-priori threshold. To give it one, pass
+`--reference <other-tag>`: two sandboxes generated with the SAME ROI measure the
+intrinsic noise, and that is the yardstick for reading the full-vs-ROI column.
 
-Il controllo "fuori dalla ROI tutto zero" è invece deterministico e vale per
-tutti i gruppi: un valore non nullo lì è sempre un bug.
+The "everything zero outside the ROI" check is deterministic instead, and holds for every
+group: a non-zero value there is always a bug.
 
 Uso:
     python compare_roi_run.py <run_dir> [--tag TAG] [--reference full|TAG2]
@@ -50,14 +50,14 @@ GROUP_DESC = {
     "C": "derivate dal fit",
     "D": "argmin fra candidati",
 }
-# Solo il gruppo A ha una soglia sui valori: gli altri sono stocastici di loro.
+# Only group A has a threshold on the values: the others are stochastic in themselves.
 STRICT = {"A"}
 
-_SAMPLE_PER_BAND = 60_000    # per i percentili del relativo, senza tenere tutto in RAM
+_SAMPLE_PER_BAND = 60_000    # for the percentiles of the relative error, without keeping everything in RAM
 
 
 class Stats:
-    """Accumulo per bande: dentro la ROI il confronto, fuori il controllo di zero."""
+    """Band accumulator: inside the ROI the comparison, outside the zero check."""
 
     def __init__(self, seed: int = 0) -> None:
         self.n = 0
@@ -82,10 +82,10 @@ class Stats:
         self.max_abs = max(self.max_abs, float(np.nanmax(d)) if d.size else 0.0)
         peak = float(np.abs(a[~np.isnan(a)]).max()) if (~np.isnan(a)).any() else 0.0
         self.ref_peak = max(self.ref_peak, peak)
-        # Relativo per elemento, solo dove il riferimento è significativamente
-        # diverso da zero: sotto quella soglia il rapporto esplode senza dire
-        # nulla, e l'errore assoluto è già riportato. Il massimo resta comunque
-        # dominato da denominatori piccoli, quindi si tengono anche i percentili.
+        # Element-wise relative error, only where the reference is significantly
+        # different from zero: below that threshold the ratio blows up without saying
+        # anything, and the absolute error is already reported. The maximum stays
+        # dominated by small denominators anyway, so the percentiles are kept too.
         floor = max(peak * 1e-6, 1e-30)
         sig = np.abs(a) > floor
         if sig.any():
@@ -106,7 +106,7 @@ class Stats:
         return self.n_exact / self.n if self.n else 1.0
 
     def percentiles(self) -> "tuple[float, float]":
-        """(mediana, p99) del relativo, da un campione limitato."""
+        """(median, p99) of the relative error, from a bounded sample."""
         if not self._rel:
             return 0.0, 0.0
         s = np.concatenate(self._rel)
@@ -115,7 +115,7 @@ class Stats:
 
 def compare_file(full_p: Path, roi_p: Path, roi_rows: np.ndarray,
                  scope: str, band: int = 128) -> Stats:
-    """Confronta due EXR banda per banda. `roi_rows` è la maschera (H, W) della ROI."""
+    """Compare two EXRs band by band. `roi_rows` is the (H, W) mask of the ROI."""
     st = Stats()
     with _ExrBandReader(full_p) as ra, _ExrBandReader(roi_p) as rb:
         if (ra.height, ra.width) != (rb.height, rb.width):
@@ -143,12 +143,12 @@ def compare_file(full_p: Path, roi_p: Path, roi_rows: np.ndarray,
 
 
 def build_targets(full: Path, roi: Path, source: str, cams: "list[str] | None") -> list:
-    """(relpath, gruppo, scope) di tutto ciò che va confrontato."""
+    """(relpath, group, scope) of everything that has to be compared."""
     t: list[tuple[str, str, str]] = []
     s = f"sources/{source}"
 
-    # ium_positions/normals sono identici su TUTTA la texture: la ROI si applica
-    # dopo l'iniezione della normale esterna, quindi solo la maschera la porta.
+    # ium_positions/normals are identical over the WHOLE texture: the ROI is applied
+    # after the external normal is injected, so only the mask carries it.
     t += [("ium/ium_positions.exr", "A", "everywhere"),
           ("ium/ium_normals.exr",   "A", "everywhere"),
           ("ium/ium_masks.exr",     "A", "roi"),
@@ -185,15 +185,15 @@ def build_targets(full: Path, roi: Path, source: str, cams: "list[str] | None") 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("run_dir", help="run piena di riferimento (contiene roi/<tag>/)")
+    ap.add_argument("run_dir", help="the full reference run (holds roi/<tag>/)")
     ap.add_argument("--tag", default="", help="sandbox da confrontare (default: unica presente)")
     ap.add_argument("--reference", default="full",
-                    help="'full' (default) oppure il tag di una seconda sandbox con la "
-                         "STESSA ROI, per misurare il rumore intrinseco")
+                    help="'full' (default) or the tag of a second sandbox with the "
+                         "SAME ROI, to measure the intrinsic noise")
     ap.add_argument("--source", default="gt")
     ap.add_argument("--cams", default="all",
-                    help="'all' oppure lista di indici, es. 0,12,24 (filtra i file per-camera)")
-    ap.add_argument("--band", type=int, default=128, help="scanline per banda di lettura")
+                    help="'all' or a list of indices, e.g. 0,12,24 (filters the per-camera files)")
+    ap.add_argument("--band", type=int, default=128, help="scanlines per read band")
     args = ap.parse_args()
 
     full = Path(args.run_dir).resolve()
@@ -207,7 +207,7 @@ def main() -> int:
             return 2
         roi = tags[0]
     if not roi.is_dir():
-        print(f"✗ sandbox non trovata: {roi}")
+        print(f"✗ sandbox not found: {roi}")
         return 2
 
     with open(roi / "roi.json", encoding="utf-8") as fh:
@@ -218,37 +218,37 @@ def main() -> int:
         x0, y0, w, h = fp["rect"]
         mask2d[max(y0, 0):min(y0 + h, H), max(x0, 0):min(x0 + w, W)] = True
     if fp.get("mask_path"):
-        # La ROI risolta non è ricostruibile dal solo rect: se c'era anche una
-        # maschera immagine, il confronto "fuori" resterebbe corretto ma quello
-        # "dentro" includerebbe texel che la ROI escludeva (e che valgono 0).
-        print(f"  ⚠  la ROI include la maschera {fp['mask_path']}: il confronto "
+        # The resolved ROI cannot be rebuilt from the rect alone: if there was also an
+        # image mask, the "outside" comparison would stay correct but the "inside" one
+        # would include texels the ROI excluded (and which are 0).
+        print(f"  ⚠  the ROI includes the mask {fp['mask_path']}: the comparison "
               f"'dentro' usa il solo rettangolo, quindi è più severo del dovuto")
     if not fp.get("rect") and not fp.get("mask_path"):
-        print("✗ roi.json non descrive nessuna ROI")
+        print("✗ roi.json describes no ROI")
         return 2
 
     cams = None if args.cams == "all" else [c.strip() for c in args.cams.split(",") if c.strip()]
 
-    # Il riferimento è la run piena, oppure una seconda sandbox con la stessa ROI
-    # (in quel caso la tabella misura il rumore intrinseco, non l'effetto ROI).
+    # The reference is the full run, or a second sandbox with the same ROI
+    # (in that case the table measures the intrinsic noise, not the ROI's effect).
     if args.reference == "full":
         ref, ref_label = full, "run piena"
     else:
         ref = roi_root / args.reference
         if not ref.is_dir():
-            print(f"✗ sandbox di riferimento non trovata: {ref}")
+            print(f"✗ reference sandbox not found: {ref}")
             return 2
         with open(ref / "roi.json", encoding="utf-8") as fh:
             ref_fp = json.load(fh)
         if ref_fp["sha1"] != fp["sha1"]:
-            print(f"✗ {args.reference} ha una ROI diversa ({ref_fp['texels']} texel "
-                  f"vs {fp['texels']}): il confronto non misurerebbe il rumore intrinseco")
+            print(f"✗ {args.reference} has a different ROI ({ref_fp['texels']} texels "
+                  f"vs {fp['texels']}): the comparison would not measure the intrinsic noise")
             return 2
         ref_label = f"sandbox {args.reference} (stessa ROI → rumore intrinseco)"
 
     print(f"Riferimento : {ref}\n              {ref_label}")
     print(f"Confrontata : {roi}")
-    print(f"ROI         : rect={fp.get('rect')}  {fp['texels']} texel  "
+    print(f"ROI         : rect={fp.get('rect')}  {fp['texels']} texels  "
           f"su IUM {W}×{H}  (sha1 {fp['sha1'][:12]})")
 
     manifest = full / "run_manifest.json"
@@ -260,7 +260,7 @@ def main() -> int:
                   f"gaussiano alla densità a OGNI query NeRF, senza guardia di eval\n"
                   f"     (nerf/rays.py:68). I gruppi B/C/D sono quindi stocastici di "
                   f"loro: usare --reference <altro-tag> per il metro.")
-    print(f"\n  Verdetto sui valori solo per il gruppo A; per tutti i gruppi vale "
+    print(f"\n  Verdict on the values only for group A; for every group the "
           f"'fuori dalla ROI deve essere zero'.\n")
 
     targets = build_targets(full, roi, args.source, cams)
@@ -299,7 +299,7 @@ def main() -> int:
         if group in STRICT:
             verdict = "OK" if (ok_val and ok_out) else "✗"
         elif not ok_out:
-            verdict = "✗ fuori"
+            verdict = "✗ outside"
         else:
             verdict = f"info ({100 * (1 - st.frac_exact):.3f}% diversi)"
         print(f"{group:3} {rel[-50:]:50} {st.n:>10,} {100 * st.frac_exact:7.3f}% "
@@ -320,7 +320,7 @@ def main() -> int:
               f"max fuori ROI {max(s.max_outside for s in sts):.1e}")
 
     if missing:
-        print(f"\n  {len(missing)} file non confrontati:")
+        print(f"\n  {len(missing)} files not compared:")
         for m in missing[:10]:
             print(f"    · {m}")
         if len(missing) > 10:
@@ -331,11 +331,11 @@ def main() -> int:
         for f in failures:
             print(f"    {f}")
         return 1
-    print("\n✓ controlli superati: i pass deterministici sono bit-identici dentro "
-          "la ROI e tutto è zero fuori.")
+    print("\n✓ checks passed: the deterministic passes are bit-identical inside "
+          "the ROI and everything is zero outside.")
     if args.reference == "full":
-        print("  I gruppi B/C/D sono informativi: per pesarli servono due sandbox "
-              "con la stessa ROI (--reference).")
+        print("  Groups B/C/D are informational: weighing them needs two sandboxes "
+              "with the same ROI (--reference).")
     return 0
 
 
