@@ -1,10 +1,11 @@
 """
-nerf_render_pipeline.py
------------------------
-Legge un file transforms.json (formato NeRF), renderizza per ogni frame
-depth / position / normal / mask tramite OptixProgrammablePasses e genera la IUM.
-Salva ogni output nel formato scelto (openexr | png); quando il formato
-non supporta dati raw (float), normalizza automaticamente i valori in [0,1].
+images_generator.py
+-------------------
+Driver of the hybrid rendering pipeline. Reads a transforms.json (NeRF format)
+and runs four toggle-able steps: per-frame depth/position/normal/mask via
+OptixProgrammablePasses, NeRF training, the texture-space bake (IUM, visibility,
+colour texture, irradiance, specular cones) and the PBR reconstruction. It has no
+command line: the configuration lives in __main__ at the bottom. See README.md.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from typing import Protocol
 import numpy as np
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Enumerazioni
+# Enumerations
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ImageFormat(Enum):
@@ -40,32 +41,32 @@ class ImageFormat(Enum):
 
     @property
     def supports_raw_float(self) -> bool:
-        """True se il formato può salvare float a 32 bit senza perdita."""
+        """True when the format can store 32-bit floats without loss."""
         return self in {ImageFormat.OPENEXR}
 
 
 class DataLayer(Enum):
-    """Tipo semantico del layer — determina se serve normalizzazione."""
-    DEPTH    = auto()   # valori in unità-scena → raw float
-    POSITION = auto()   # coordinate world-space → raw float
-    NORMAL   = auto()   # vettori [-1,1] → NO raw richiesto ma float ok
-    MASK     = auto()   # uint8 0/1 → non raw, nessuna normalizzazione float
-    VISIBILITY = auto() # ratio float [0, 1] o bool uint8
-    IRRADIANCE          = auto() # energia HDR per texel (RGB float)
-    IRRADIANCE_INDIRECT = auto() # contributo indiretto NeRF per texel (RGB float)
-    ALBEDO              = auto() # riflettanza HDR per texel (RGB float)
-    SPEC_CONE           = auto() # radianza media cono speculare L_j(r) (RGB float HDR)
-    METALLIC            = auto() # specularità 1−X del fit PBR, [0,1] (float)
-    ROUGHNESS           = auto() # apertura cono / 180 dove attendibile, [0,1] (float)
-    SPEC_CONE_R         = auto() # apertura cono best-fit in gradi (float)
+    """Semantic type of the layer — decides whether normalization is needed."""
+    DEPTH    = auto()   # values in scene units → raw float
+    POSITION = auto()   # world-space coordinates → raw float
+    NORMAL   = auto()   # vectors in [-1,1] → raw not required, but float is fine
+    MASK     = auto()   # uint8 0/1 → not raw, no float normalization
+    VISIBILITY = auto() # float ratio in [0, 1], or uint8 bool
+    IRRADIANCE          = auto() # HDR energy per texel (RGB float)
+    IRRADIANCE_INDIRECT = auto() # indirect NeRF contribution per texel (RGB float)
+    ALBEDO              = auto() # HDR reflectance per texel (RGB float)
+    SPEC_CONE           = auto() # mean specular-cone radiance L_j(r) (RGB float HDR)
+    METALLIC            = auto() # specularity 1−X from the PBR fit, [0,1] (float)
+    ROUGHNESS           = auto() # cone aperture / 180 where reliable, [0,1] (float)
+    SPEC_CONE_R         = auto() # best-fit cone aperture in degrees (float)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Protocollo writer (estensibile senza modificare il core)
+# Writer protocol (extensible without touching the core)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ImageWriter(Protocol):
-    """Interfaccia che ogni writer deve implementare."""
+    """Interface every writer has to implement."""
     def write(self, array: np.ndarray, path: str) -> None: ...
 
 
@@ -74,17 +75,17 @@ class ImageWriter(Protocol):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ExrWriter:
-    """Scrive array NumPy float32 in un file OpenEXR.
+    """Write float32 NumPy arrays to an OpenEXR file.
 
-    Shape supportate:
-      (H, W)      → canale singolo  'Z'
-      (H, W, 3)   → canali RGB      'R','G','B'
-      (H, W, 4)   → canali RGBA     'R','G','B','A'
+    Supported shapes:
+      (H, W)      → single channel  'Z'
+      (H, W, 3)   → RGB channels    'R','G','B'
+      (H, W, 4)   → RGBA channels   'R','G','B','A'
       (H, W, C)   → arbitrary       'Cam0', 'Cam1', ...
     """
 
     def write(self, array: np.ndarray, path: str) -> None:
-        import OpenEXR, Imath  # importazione locale — non obbligatori se non si usa EXR
+        import OpenEXR, Imath  # local import — not required unless EXR is used
 
         array = array.astype(np.float32)
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -113,27 +114,27 @@ class ExrWriter:
             f = OpenEXR.OutputFile(path, header)
             f.writePixels({n: array[..., i].tobytes() for i, n in enumerate(names)})
         else:
-            raise ValueError(f"ExrWriter: ndim={array.ndim} non supportato")
+            raise ValueError(f"ExrWriter: ndim={array.ndim} not supported")
 
         f.close()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Writer: OpenEXR incrementale (per blocchi di scanline)
+# Writer: incremental OpenEXR (scanline blocks)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class IncrementalExrWriter:
-    """EXR scritto per blocchi di scanline consecutive, senza mai tenere in RAM
-    l'immagine intera.
+    """EXR written in blocks of consecutive scanlines, never holding the whole
+    image in RAM.
 
-    Serve al bake spec_cone condiviso, dove il loop esterno è sul tile e non sulla
-    camera: gli accumulatori di tutte le camere a piena risoluzione non ci starebbero
-    (a 4096², K=14, 58 camere sarebbero ~200 GiB), mentre un blocco di scanline per
-    camera costa qualche centinaio di KB.
+    This is what the shared spec_cone bake needs, where the outer loop is over
+    tiles rather than cameras: full-resolution accumulators for every camera would
+    not fit (at 4096², K=14, 58 cameras that is ~200 GiB), whereas one scanline
+    block per camera costs a few hundred KB.
 
-    channels: dict {nome: dtype}, con dtype np.float16 → canale HALF, altrimenti FLOAT.
-    Ogni write_block riceve {nome: array (rows, width)} e avanza di `rows` scanline;
-    i blocchi vanno scritti in ordine e devono coprire esattamente `height` righe.
+    channels: dict {name: dtype}, where dtype np.float16 → HALF channel, else FLOAT.
+    Each write_block takes {name: array (rows, width)} and advances by `rows`
+    scanlines; blocks must be written in order and cover exactly `height` rows.
     """
 
     def __init__(self, path: str, width: int, height: int,
@@ -160,23 +161,23 @@ class IncrementalExrWriter:
         header["compression"] = Imath.Compression(comp)
         self._file = OpenEXR.OutputFile(path, header)
 
-    HALF_MAX = 65504.0   # massimo rappresentabile in float16
+    HALF_MAX = 65504.0   # largest value representable in float16
 
     def _check_half_range(self, name: str, arr: np.ndarray) -> None:
-        """Un valore oltre HALF_MAX diventerebbe inf nel cast a half, e numpy lo
-        segnala con un RuntimeWarning che il filtro di default stampa UNA SOLA
-        VOLTA per posizione nel codice: un bake intero può corrompersi lasciando
-        una riga sola nel log. A valle è peggio che rumoroso, è muto — un inf in
-        un canale dei coni rende nan la varianza centrata del solver, np.argmin
-        restituisce l'indice del nan e il texel esce dal fit. Meglio fermarsi qui.
+        """A value beyond HALF_MAX would become inf in the cast to half, and numpy
+        reports that with a RuntimeWarning which the default filter prints ONLY
+        ONCE per code location: a whole bake can be corrupted leaving a single
+        line in the log. Downstream it is worse than noisy, it is silent — one inf
+        in a cone channel makes the solver's centred variance nan, np.argmin
+        returns the index of that nan and the texel drops out of the fit entirely.
         """
         a = np.asarray(arr)
-        mx = float(np.abs(a).max()) if a.size else 0.0   # nan/inf si propagano al max
+        mx = float(np.abs(a).max()) if a.size else 0.0   # nan/inf propagate to the max
         if not np.isfinite(mx) or mx > self.HALF_MAX:
             raise ValueError(
-                f"IncrementalExrWriter: {self.path}: il canale {name!r} è half ma "
-                f"contiene {mx:.6g} (limite {self.HALF_MAX:g}): il cast produrrebbe "
-                f"inf. Passare il canale a np.float32 oppure ridurre i valori a monte.")
+                f"IncrementalExrWriter: {self.path}: channel {name!r} is half but "
+                f"holds {mx:.6g} (limit {self.HALF_MAX:g}): the cast would produce "
+                f"inf. Switch the channel to np.float32, or reduce the values upstream.")
 
     def write_block(self, block: "dict[str, np.ndarray]") -> None:
         rows = None
@@ -186,18 +187,18 @@ class IncrementalExrWriter:
                 self._check_half_range(name, block[name])
             arr = np.ascontiguousarray(block[name], dtype=dt)
             if arr.ndim != 2 or arr.shape[1] != self.width:
-                raise ValueError(f"IncrementalExrWriter: canale {name!r} ha shape "
-                                 f"{arr.shape}, attese (righe, {self.width})")
+                raise ValueError(f"IncrementalExrWriter: channel {name!r} has shape "
+                                 f"{arr.shape}, expected (rows, {self.width})")
             if rows is None:
                 rows = arr.shape[0]
             elif arr.shape[0] != rows:
-                raise ValueError("IncrementalExrWriter: i canali di un blocco devono "
-                                 "avere lo stesso numero di righe")
+                raise ValueError("IncrementalExrWriter: the channels of a block must "
+                                 "have the same number of rows")
             payload[name] = arr.tobytes()
 
         if self.row + rows > self.height:
-            raise ValueError(f"IncrementalExrWriter: {self.path} sforerebbe "
-                             f"{self.height} righe (riga {self.row} + {rows})")
+            raise ValueError(f"IncrementalExrWriter: {self.path} would overrun "
+                             f"{self.height} rows (row {self.row} + {rows})")
         self._file.writePixels(payload, rows)
         self.row += rows
 
@@ -205,8 +206,8 @@ class IncrementalExrWriter:
         if self._file is None:
             return
         if self.row != self.height:
-            raise ValueError(f"IncrementalExrWriter: {self.path} chiuso a {self.row} "
-                             f"righe su {self.height} (file troncato)")
+            raise ValueError(f"IncrementalExrWriter: {self.path} closed at {self.row} "
+                             f"rows out of {self.height} (truncated file)")
         self._file.close()
         self._file = None
 
@@ -215,7 +216,7 @@ class IncrementalExrWriter:
     def __exit__(self, exc_type, exc, tb):
         if exc_type is None:
             self.close()
-        else:                      # non validare l'altezza se stiamo già fallendo
+        else:                      # do not validate the height if we are already failing
             self._file = None
 
 
@@ -224,7 +225,7 @@ class IncrementalExrWriter:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class PngWriter:
-    """Scrive array NumPy in PNG (uint8). I float vengono normalizzati in [0,255]."""
+    """Write NumPy arrays as PNG (uint8). Floats are normalised to [0,255]."""
 
     def write(self, array: np.ndarray, path: str) -> None:
         from PIL import Image
@@ -235,7 +236,7 @@ class PngWriter:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Registry writer (aperto all'estensione)
+# Writer registry (open for extension)
 # ──────────────────────────────────────────────────────────────────────────────
 
 _WRITER_REGISTRY: dict[ImageFormat, ImageWriter] = {
@@ -245,13 +246,13 @@ _WRITER_REGISTRY: dict[ImageFormat, ImageWriter] = {
 
 
 def register_writer(fmt: ImageFormat, writer: ImageWriter) -> None:
-    """Registra un writer per un formato personalizzato."""
+    """Register a writer for a custom format."""
     _WRITER_REGISTRY[fmt] = writer
 
 
 def get_writer(fmt: ImageFormat) -> ImageWriter:
     if fmt not in _WRITER_REGISTRY:
-        raise NotImplementedError(f"Nessun writer registrato per il formato: {fmt}")
+        raise NotImplementedError(f"No writer registered for format: {fmt}")
     return _WRITER_REGISTRY[fmt]
 
 
@@ -260,7 +261,7 @@ def get_writer(fmt: ImageFormat) -> ImageWriter:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _to_uint8(array: np.ndarray) -> np.ndarray:
-    """Normalizza un array float in [0, 255] uint8 (per PNG, ecc.)."""
+    """Normalise a float array to uint8 in [0, 255] (for PNG and similar)."""
     arr = array.astype(np.float32)
     mn, mx = arr.min(), arr.max()
     if mx > mn:
@@ -270,20 +271,20 @@ def _to_uint8(array: np.ndarray) -> np.ndarray:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Logging: tee stdout+stderr su file (diagnostica per run notturni)
+# Logging: tee stdout+stderr to a file (diagnostics for overnight runs)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class _Tee:
-    """Scrive su due stream contemporaneamente; flush dopo ogni write."""
+    """Write to two streams at once; flush after every write."""
     def __init__(self, original, file_stream):
         self._orig = original
         self._file = file_stream
 
     def write(self, data):
         self._orig.write(data)
-        # Il file può essere già chiuso: colorama (init lazy via tqdm) registra un
-        # atexit reset legato al _Tee attivo in quel momento, che può scattare dopo
-        # l'uscita da _console_to_file.
+        # The file may already be closed: colorama (lazily initialised via tqdm)
+        # registers an atexit reset bound to whichever _Tee was active at the time,
+        # and that can fire after _console_to_file has exited.
         if not self._file.closed:
             self._file.write(data)
             self._file.flush()
@@ -293,14 +294,14 @@ class _Tee:
         if not self._file.closed:
             self._file.flush()
 
-    # Propagate altri attributi al flusso originale (es. encoding, isatty)
+    # Forward every other attribute to the original stream (e.g. encoding, isatty)
     def __getattr__(self, name):
         return getattr(self._orig, name)
 
 
 @contextlib.contextmanager
 def _console_to_file(log_path: str):
-    """Context manager: redirige stdout e stderr anche su *log_path* (append, flush per riga)."""
+    """Context manager: also redirect stdout and stderr to *log_path* (append, line-flushed)."""
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     with open(log_path, "a", encoding="utf-8", buffering=1) as fh:
         orig_out, orig_err = sys.stdout, sys.stderr
@@ -314,43 +315,43 @@ def _console_to_file(log_path: str):
 
 
 def _reshape_flat(array: np.ndarray, w: int, h: int) -> np.ndarray:
-    """Porta un array flat restituito dalla libreria Optix nella shape (H, W) o (H, W, C).
+    """Bring a flat array returned by the OptiX library into shape (H, W) or (H, W, C).
 
-    La libreria restituisce sempre array flat:
-      depths_np    → (N,)    con N = W*H
-      positions_np → (N, 3)  con N = W*H
-      normals_np   → (N, 3)  con N = W*H
-      masks_np     → (N,)    con N = W*H  (uint8)
+    The library always returns flat arrays:
+      depths_np    → (N,)    with N = W*H
+      positions_np → (N, 3)  with N = W*H
+      normals_np   → (N, 3)  with N = W*H
+      masks_np     → (N,)    with N = W*H  (uint8)
 
-    Casi gestiti:
-      (H, W)      → già nella forma corretta, ritorna invariato
-      (H, W, C)   → già nella forma corretta, ritorna invariato
-      (N,)        → N == W*H  → reshape a (H, W)
-      (N, C)      → N == W*H  → reshape a (H, W, C)
+    Cases handled:
+      (H, W)      → already the right shape, returned unchanged
+      (H, W, C)   → already the right shape, returned unchanged
+      (N,)        → N == W*H  → reshaped to (H, W)
+      (N, C)      → N == W*H  → reshaped to (H, W, C)
     """
     pixels = w * h
 
-    # Già nella forma corretta
+    # Already the right shape
     if array.ndim == 2 and array.shape == (h, w):
         return array
     if array.ndim == 3 and array.shape[:2] == (h, w):
         return array
 
-    # (N,) flat moncanale
+    # (N,) flat single-channel
     if array.ndim == 1:
         if array.size != pixels:
             raise ValueError(
-                f"_reshape_flat: size={array.size} non corrisponde a {w}×{h}={pixels}"
+                f"_reshape_flat: size={array.size} does not match {w}×{h}={pixels}"
             )
         return array.reshape(h, w)
 
-    # (N, C) flat multicanale  — shape restituita da positions_np e normals_np
+    # (N, C) flat multi-channel — the shape returned by positions_np and normals_np
     if array.ndim == 2 and array.shape[0] == pixels:
         c = array.shape[1]
         return array.reshape(h, w, c)
 
     raise ValueError(
-        f"_reshape_flat: shape={array.shape} non gestita per dimensioni {w}×{h}"
+        f"_reshape_flat: shape={array.shape} not handled for dimensions {w}×{h}"
     )
 
 
@@ -360,13 +361,13 @@ def _save_layer(
     fmt: ImageFormat,
     layer: DataLayer,
 ) -> None:
-    """Salva un layer nel formato richiesto, normalizzando se necessario.
+    """Save a layer in the requested format, normalising when necessary.
 
-    Logica di normalizzazione:
-      - DEPTH / POSITION  → valori raw float; se il formato non supporta float
-                            vengono normalizzati in [0, 1] prima di passare al writer.
-      - NORMAL            → vettori in [-1, 1]; stessa regola del raw float.
-      - MASK              → già uint8 0/1; nessuna normalizzazione applicata.
+    Normalization rules:
+      - DEPTH / POSITION  → raw float values; if the format cannot store float,
+                            they are normalised to [0, 1] before reaching the writer.
+      - NORMAL            → vectors in [-1, 1]; same rule as raw float.
+      - MASK              → already uint8 0/1; no normalization applied.
     """
     needs_raw = layer in {DataLayer.DEPTH, DataLayer.POSITION, DataLayer.NORMAL,
                           DataLayer.IRRADIANCE, DataLayer.IRRADIANCE_INDIRECT, DataLayer.ALBEDO,
@@ -374,14 +375,14 @@ def _save_layer(
                           DataLayer.SPEC_CONE_R}
 
     if needs_raw and not fmt.supports_raw_float:
-        print(f"    ⚠  {fmt.value} non supporta float raw ({layer.name}) → normalizzo in [0,1]")
+        print(f"    ⚠  {fmt.value} does not support raw float ({layer.name}) → normalising to [0,1]")
         array = array.astype(np.float32)
         mn, mx = array.min(), array.max()
         if mx > mn:
             array = (array - mn) / (mx - mn)
 
     get_writer(fmt).write(array, path)
-    print(f"    ✓ Salvato: {path}  shape={array.shape}")
+    print(f"    ✓ Saved: {path}  shape={array.shape}")
 
 
 def _build_output_path(base_dir: str, stem: str, layer_name: str, fmt: ImageFormat) -> str:
@@ -389,8 +390,8 @@ def _build_output_path(base_dir: str, stem: str, layer_name: str, fmt: ImageForm
 
 
 def _as_relative_to(abs_path: str, base_dir: str) -> str:
-    """Restituisce abs_path come path relativo rispetto a base_dir in formato posix.
-    Se non è sotto base_dir, ritorna il path posix invariato."""
+    """Return abs_path relative to base_dir, in posix form.
+    If it is not under base_dir, the posix path is returned unchanged."""
     try:
         return Path(abs_path).relative_to(Path(base_dir)).as_posix()
     except ValueError:
@@ -435,7 +436,7 @@ def _save_debug_pixel_change(
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Normalizza ogni immagine in [0,1] per la visualizzazione
+    # Normalise each image to [0,1] for display
     def _norm(arr: np.ndarray) -> np.ndarray:
         mn, mx = arr.min(), arr.max()
         if mx > mn:
@@ -459,17 +460,17 @@ def _save_debug_pixel_change(
     out_path = out_dir / "pixel_change_comparison.png"
     fig.savefig(out_path, dpi=100)
     plt.close(fig)
-    print(f"    ✓ Debug pixel_change salvato: {out_path}")
+    print(f"    ✓ pixel_change debug saved: {out_path}")
 
 
 def _compute_peak(image_np: np.ndarray, percentile: float) -> float:
-    """Calcola il peak dell'immagine come percentile della luminanza massima per pixel."""
+    """Image peak, as a percentile of the per-pixel maximum luminance."""
     max_per_pixel = image_np.astype(np.float32).max(axis=-1)  # (H, W)
     return float(np.percentile(max_per_pixel, percentile))
 
 
 def _load_image_as_vec3(path: str, w: int, h: int) -> np.ndarray:
-    """Carica immagine, ridimensiona a (w, h), ritorna float32 (H*W, 3)."""
+    """Load an image, resize it to (w, h), return float32 (H*W, 3)."""
     if path.lower().endswith(".exr"):
         import OpenEXR, Imath
         from PIL import Image
@@ -501,8 +502,8 @@ def _load_image_as_vec3(path: str, w: int, h: int) -> np.ndarray:
 
 
 def _load_image_hw3_native(path: str) -> np.ndarray:
-    """Carica un'immagine a risoluzione nativa come float32 (H, W, 3).
-    EXR → valori HDR raw. LDR (PNG/JPG) → uint8/255 scalato in [0, 1]."""
+    """Load an image at its native resolution as float32 (H, W, 3).
+    EXR → raw HDR values. LDR (PNG/JPG) → uint8/255, scaled into [0, 1]."""
     if path.lower().endswith(".exr"):
         import OpenEXR, Imath
         exr = OpenEXR.InputFile(path)
@@ -527,7 +528,7 @@ def _load_image_hw3_native(path: str) -> np.ndarray:
 
 
 def _load_exr_as_flat(path: str) -> np.ndarray | None:
-    """Carica un EXR RGB a dimensione nativa e restituisce (H*W, 3) float32."""
+    """Load an RGB EXR at native size and return (H*W, 3) float32."""
     try:
         import OpenEXR, Imath
         exr = OpenEXR.InputFile(path)
@@ -540,17 +541,17 @@ def _load_exr_as_flat(path: str) -> np.ndarray | None:
         b = np.frombuffer(exr.channel("B", pt), dtype=np.float32).reshape(h, w)
         return np.stack([r, g, b], axis=-1).reshape(-1, 3)
     except Exception as e:
-        print(f"    ⚠  Impossibile caricare {path}: {e}")
+        print(f"    ⚠  Cannot load {path}: {e}")
         return None
 
 
 def _save_visibility_map(visibility_map: np.ndarray, vis_path: str,
                          ium_h: int, ium_w: int, n_cams: int,
                          fmt: ImageFormat) -> None:
-    """Salva la visibility (num_pix, n_cams) uint8 su disco.
+    """Write the (num_pix, n_cams) uint8 visibility to disk.
 
-    EXR → multi-canale, un canale 0/1 per camera (formato letto da pbr_solver e
-    dagli inspector). Formati non-EXR → frazione di camere visibili per texel.
+    EXR → multi-channel, one 0/1 channel per camera (the format pbr_solver and the
+    inspectors read). Non-EXR formats → fraction of cameras seeing each texel.
     """
     if fmt == ImageFormat.OPENEXR:
         vis_arr = visibility_map.reshape((ium_h, ium_w, n_cams)).astype(np.float32)
@@ -561,10 +562,10 @@ def _save_visibility_map(visibility_map: np.ndarray, vis_path: str,
 
 
 def _load_camera_masks(mask_dir: Path, stems: "list[str]", num_pix: int) -> "np.ndarray | None":
-    """Ricarica le maschere per-camera da <mask_dir>/{stem}.exr → (num_pix, n_cams) uint8.
+    """Reload the per-camera masks from <mask_dir>/{stem}.exr → (num_pix, n_cams) uint8.
 
-    Ritorna None se la cartella o anche una sola maschera manca (così il chiamante
-    sa che deve ricalcolare color_texture per rigenerarle).
+    Returns None if the folder or even a single mask is missing, so the caller knows
+    it has to recompute color_texture to regenerate them.
     """
     if not mask_dir.is_dir():
         return None
@@ -582,17 +583,17 @@ def _resolve_external_normal_size(
     default_w: int,
     default_h: int,
 ) -> tuple[int, int, str | None]:
-    """Determina larghezza/altezza effettiva per l'IUM quando si usa una normale esterna.
+    """Decide the effective IUM width/height when an external normal map is used.
 
-    Se rc.external_normal_path è None restituisce (default_w, default_h, None).
+    When rc.external_normal_path is None it returns (default_w, default_h, None).
 
-    Se la risoluzione nativa della normale coincide già con default_w×default_h
-    restituisce quella stessa risoluzione con mode="match".
+    When the normal map's native resolution already matches default_w×default_h it
+    returns that same resolution with mode="match".
 
-    Altrimenti:
+    Otherwise:
       - rc.external_normal_resolution_mode == "resample" → (default_w, default_h, "resample")
       - rc.external_normal_resolution_mode == "adapt"    → (native_w, native_h, "adapt")
-      - rc.external_normal_resolution_mode is None       → chiede all'utente a runtime
+      - rc.external_normal_resolution_mode is None       → asks the user at runtime
     """
     if not rc.external_normal_path:
         return default_w, default_h, None
@@ -601,99 +602,99 @@ def _resolve_external_normal_size(
     native_h, native_w = native.shape[:2]
 
     if native_w == default_w and native_h == default_h:
-        print(f"[IUM] Normale esterna: risoluzione nativa {native_w}×{native_h} "
-              f"coincide con ium_texture_size → nessun ricampionamento necessario.")
+        print(f"[IUM] External normal: native resolution {native_w}×{native_h} "
+              f"matches ium_texture_size → no resampling needed.")
         return default_w, default_h, "match"
 
-    print(f"[IUM] Normale esterna: risoluzione nativa {native_w}×{native_h}, "
-          f"ium_texture_size={default_w}×{default_h} — risoluzioni diverse.")
+    print(f"[IUM] External normal: native resolution {native_w}×{native_h}, "
+          f"ium_texture_size={default_w}×{default_h} — resolutions differ.")
 
     mode = rc.external_normal_resolution_mode
     if mode is None:
         while True:
             ans = input(
-                f"  Scegli la strategia di risoluzione:\n"
-                f"    1 = resample: ridimensiona la normale a {default_w}×{default_h}\n"
-                f"    2 = adapt: adatta ium_texture_size a {native_w}×{native_h}\n"
-                f"  Scelta [1/2]: "
+                f"  Choose the resolution strategy:\n"
+                f"    1 = resample: resize the normal map to {default_w}×{default_h}\n"
+                f"    2 = adapt: adapt ium_texture_size to {native_w}×{native_h}\n"
+                f"  Choice [1/2]: "
             ).strip()
             if ans in ("1", "2"):
                 mode = "resample" if ans == "1" else "adapt"
                 break
-            print("  Input non valido, inserisci 1 o 2.")
+            print("  Invalid input, enter 1 or 2.")
 
     if mode == "resample":
-        print(f"[IUM] Strategia: resample → la normale verrà ridimensionata a {default_w}×{default_h}.")
+        print(f"[IUM] Strategy: resample → the normal map will be resized to {default_w}×{default_h}.")
         return default_w, default_h, "resample"
     elif mode == "adapt":
-        print(f"[IUM] Strategia: adapt → IUM verrà eseguita a {native_w}×{native_h}.")
+        print(f"[IUM] Strategy: adapt → the IUM will run at {native_w}×{native_h}.")
         return native_w, native_h, "adapt"
     else:
         raise ValueError(
-            f"external_normal_resolution_mode non riconosciuto: {mode!r}. "
-            "Usa 'resample', 'adapt' o None."
+            f"unrecognised external_normal_resolution_mode: {mode!r}. "
+            "Use 'resample', 'adapt' or None."
         )
 
 
 def _apply_external_normal(rc, ium_res, ium_w: int, ium_h: int) -> None:
-    """Decodifica la normale esterna da [0,1] a [-1,1] e la inietta nel buffer C++
-    di IUM_Generator::Result, sovrascrivendo la face-normal calcolata da OptiX.
+    """Decode the external normal map from [0,1] to [-1,1] and inject it into the
+    C++ buffer of IUM_Generator::Result, overwriting the face normal OptiX computed.
 
-    Dopo questa chiamata ium_res.normals_np (e il corrispondente buffer GPU usato
-    da IrradianceGenerator / IndirectGenerator) contiene la normale esterna.
+    After this call ium_res.normals_np (and the matching GPU buffer used by
+    IrradianceGenerator / IndirectGenerator) holds the external normal.
     """
     path = rc.external_normal_path
-    print(f"[IUM] Carico normale esterna: {path}")
+    print(f"[IUM] Loading external normal map: {path}")
 
-    # Carica e ridimensiona a ium_texture_size (LANCZOS).
-    # _load_image_as_vec3 restituisce (N, 3) float32:
-    #   - EXR → valori HDR raw (possibilmente già in [-1,1] o [0,1])
-    #   - LDR (PNG/JPG) → uint8/255, quindi in [0,1]
+    # Load and resize to ium_texture_size (LANCZOS).
+    # _load_image_as_vec3 returns (N, 3) float32:
+    #   - EXR → raw HDR values (possibly already in [-1,1] or [0,1])
+    #   - LDR (PNG/JPG) → uint8/255, hence in [0,1]
     ext = _load_image_as_vec3(path, ium_w, ium_h)  # (N, 3)
 
-    # Decodifica dal range sorgente a [-1,1].
-    # Il range va dichiarato esplicitamente in rc.external_normal_range: l'auto-detect
-    # su min() globale era fragile perché il ringing LANCZOS (su downscale aggressivi
-    # tipo 4096→512) spinge alcuni pixel sotto 0, facendo saltare il decode e lasciando
-    # i valori in [0,1] — il bug esatto segnalato.
+    # Decode from the source range into [-1,1].
+    # The range must be declared explicitly in rc.external_normal_range: auto-detecting
+    # it from the global min() was fragile, because LANCZOS ringing (on aggressive
+    # downscales such as 4096→512) pushes some pixels below 0, which skipped the decode
+    # and left the values in [0,1] — exactly the bug that was reported.
     if rc.external_normal_range == "0_1":
         n = ext.astype(np.float32) * 2.0 - 1.0
     elif rc.external_normal_range == "-1_1":
         n = ext.astype(np.float32, copy=True)
     else:
         raise ValueError(
-            f"external_normal_range non riconosciuto: {rc.external_normal_range!r} "
-            f"(attesi '0_1' | '-1_1')."
+            f"unrecognised external_normal_range: {rc.external_normal_range!r} "
+            f"(expected '0_1' | '-1_1')."
         )
 
     if rc.external_normal_flip_green:
         n[:, 1] *= -1.0
 
-    # Renormalizza: LANCZOS/interpolazione può produrre vettori non-unit.
+    # Renormalise: LANCZOS/interpolation can produce non-unit vectors.
     ln = np.linalg.norm(n, axis=1, keepdims=True)
     n = np.divide(n, ln, out=np.zeros_like(n), where=ln > 1e-8)
 
-    # Azzera i texel fuori dal mesh, coerentemente con la normale generata.
+    # Zero the texels outside the mesh, consistently with the generated normal.
     if ium_res.has_masks():
         m = ium_res.masks_np.astype(bool)
         n[~m] = 0.0
 
-    # Scrive nel buffer C++ (normals_np è una view zero-copy scrivibile).
+    # Write into the C++ buffer (normals_np is a writable zero-copy view).
     ium_res.normals_np[:] = n.astype(np.float32)
-    print(f"[IUM] Normale esterna iniettata nel buffer IUM ({ium_w}×{ium_h}, "
-          f"{int(np.count_nonzero(m) if ium_res.has_masks() else ium_w * ium_h)} texel validi).")
+    print(f"[IUM] External normal injected into the IUM buffer ({ium_w}×{ium_h}, "
+          f"{int(np.count_nonzero(m) if ium_res.has_masks() else ium_w * ium_h)} valid texels).")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ROI di test in spazio texture (Step 3 + Step 4)
+# Texture-space test ROI (Step 3 + Step 4)
 #
-# La ROI non è un parametro che attraversa la pipeline: è un fattore in più sulla
-# maschera IUM, applicato una volta sola subito dopo il render IUM. Tutti i kernel
-# a valle escono già sui texel con maschera a zero (deviceProgramsVis.cu:55,
+# The ROI is not a parameter threaded through the pipeline: it is one extra factor
+# on the IUM mask, applied once right after the IUM render. Every downstream kernel
+# already returns early on texels whose mask is zero (deviceProgramsVis.cu:55,
 # ColorTex.cu:22, Irradiance.cu:136, Indirect.cu:39, SpecCone.cu:107,
-# HemiVis.cu:94) e ogni generatore ricarica la maschera dall'host a ogni
-# set_inputs, quindi restringere masks_np basta a restringere tutto il bake.
-# Il fit PBR e l'albedo la ereditano rileggendo ium/ium_masks.exr da disco.
+# HemiVis.cu:94) and every generator re-uploads the mask from the host at its own
+# set_inputs, so narrowing masks_np is enough to narrow the whole bake.
+# The PBR fit and the albedo inherit it by re-reading ium/ium_masks.exr from disk.
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _roi_is_active(rc) -> bool:
@@ -701,7 +702,7 @@ def _roi_is_active(rc) -> bool:
 
 
 def _roi_default_tag(rc) -> str:
-    """Tag di default della sandbox: deterministico, leggibile, filesystem-safe."""
+    """Default sandbox tag: deterministic, readable, filesystem-safe."""
     parts: list[str] = []
     if rc.roi_mask_path:
         stem = Path(rc.roi_mask_path).stem
@@ -714,11 +715,11 @@ def _roi_default_tag(rc) -> str:
 
 
 def _roi_assets_dir(rc, json_dir: Path) -> "tuple[Path, str | None]":
-    """(cartella di destinazione degli output di Step 3/4, tag della ROI).
+    """(destination folder for the Step 3/4 outputs, ROI tag).
 
-    Senza ROI è la radice della run, identico a prima. Con una ROI attiva è la
-    sandbox <output_dir>/roi/<tag>/, che replica il layout della radice: le cache
-    full-res non vengono mai toccate.
+    Without a ROI this is the run root, exactly as before. With a ROI active it is
+    the sandbox <output_dir>/roi/<tag>/, which mirrors the root layout: the
+    full-resolution caches are never touched.
     """
     if not _roi_is_active(rc):
         return json_dir, None
@@ -727,12 +728,12 @@ def _roi_assets_dir(rc, json_dir: Path) -> "tuple[Path, str | None]":
 
 
 def _load_roi(rc, ium_w: int, ium_h: int) -> "tuple[np.ndarray | None, dict]":
-    """ROI → (maschera flat bool (ium_w·ium_h,) | None, fingerprint).
+    """ROI → (flat bool mask (ium_w·ium_h,) | None, fingerprint).
 
-    ROI = AND del rettangolo roi_rect e dell'immagine roi_mask_path, ognuno
-    opzionale. Il fingerprint descrive la ROI *risolta* alla risoluzione IUM: è
-    quello che la guardia confronta, così due ROI scritte in modo diverso ma
-    equivalenti texel per texel restano la stessa ROI.
+    ROI = AND of the roi_rect rectangle and the roi_mask_path image, each of them
+    optional. The fingerprint describes the ROI *resolved* at the IUM resolution,
+    which is what the guard compares, so two ROIs written differently but equivalent
+    texel by texel count as the same ROI.
     """
     if not _roi_is_active(rc):
         return None, {}
@@ -742,14 +743,14 @@ def _load_roi(rc, ium_w: int, ium_h: int) -> "tuple[np.ndarray | None, dict]":
     if rc.roi_rect:
         if len(rc.roi_rect) != 4:
             raise ValueError(
-                f"roi_rect deve essere [x0, y0, w, h], ricevuto {rc.roi_rect!r}")
+                f"roi_rect must be [x0, y0, w, h], got {rc.roi_rect!r}")
         x0, y0, w, h = (int(v) for v in rc.roi_rect)
         if w <= 0 or h <= 0:
-            raise ValueError(f"roi_rect con lato non positivo: {rc.roi_rect!r}")
+            raise ValueError(f"roi_rect has a non-positive side: {rc.roi_rect!r}")
         x1, y1 = min(x0 + w, ium_w), min(y0 + h, ium_h)
         x0, y0 = max(x0, 0), max(y0, 0)
         if x1 <= x0 or y1 <= y0:
-            raise ValueError(f"roi_rect {rc.roi_rect!r} è interamente fuori dalla "
+            raise ValueError(f"roi_rect {rc.roi_rect!r} lies entirely outside the "
                              f"IUM {ium_w}×{ium_h}")
         rect = np.zeros_like(roi)
         rect[y0:y1, x0:x1] = True
@@ -757,25 +758,25 @@ def _load_roi(rc, ium_w: int, ium_h: int) -> "tuple[np.ndarray | None, dict]":
 
     if rc.roi_mask_path:
         if not os.path.exists(rc.roi_mask_path):
-            raise FileNotFoundError(f"roi_mask_path non trovato: {rc.roi_mask_path}")
+            raise FileNotFoundError(f"roi_mask_path not found: {rc.roi_mask_path}")
         img = _load_image_hw3_native(rc.roi_mask_path)[..., 0]
         m = img > rc.roi_mask_threshold
         if m.shape != (ium_h, ium_w):
-            # NEAREST e non LANCZOS: su una maschera binaria l'interpolazione
-            # sposterebbe il bordo di qualche texel, ed è lo stesso ringing che
-            # ha reso necessario dichiarare external_normal_range invece di
-            # dedurlo.
+            # NEAREST and not LANCZOS: on a binary mask, interpolation would move the
+            # edge by a few texels, and it is the same ringing that made declaring
+            # external_normal_range necessary instead of inferring it.
+            #
             from PIL import Image
             m = np.array(Image.fromarray(m.astype(np.uint8) * 255)
                          .resize((ium_w, ium_h), Image.NEAREST)) > 127
-            print(f"[ROI] maschera ricampionata {img.shape[1]}×{img.shape[0]} → "
+            print(f"[ROI] mask resampled {img.shape[1]}×{img.shape[0]} → "
                   f"{ium_w}×{ium_h} (NEAREST)")
         roi &= m
 
     flat = np.ascontiguousarray(roi.reshape(-1))
     if not flat.any():
-        raise ValueError("La ROI non contiene texel: controllare roi_rect / "
-                         "roi_mask_path (e la soglia roi_mask_threshold).")
+        raise ValueError("The ROI contains no texels: check roi_rect / "
+                         "roi_mask_path (and the roi_mask_threshold).")
 
     fingerprint = {
         "rect": [int(v) for v in rc.roi_rect] if rc.roi_rect else None,
@@ -789,13 +790,13 @@ def _load_roi(rc, ium_w: int, ium_h: int) -> "tuple[np.ndarray | None, dict]":
 
 
 def _check_roi_guard(assets_dir: Path, fingerprint: dict) -> None:
-    """Scrive roi.json nella sandbox, o solleva se ne descrive già un'altra.
+    """Write roi.json into the sandbox, or raise if it already describes another ROI.
 
-    I bake saltano il lavoro che trovano su disco (le camere di
-    _precompute_spec_cone, irradiance_indirect.exr, la color texture in cache):
-    riusare lo stesso tag con una ROI diversa mescolerebbe due regioni in un unico
-    set di file senza alcun segnale, esattamente come farebbe un ri-bake con
-    ring_samples diversi.
+    The bakes skip work they find on disk (the per-camera files of
+    _precompute_spec_cone, irradiance_indirect.exr, the cached colour texture), so
+    reusing the same tag with a different ROI would blend two regions into a single
+    set of files with no signal at all, exactly as a re-bake with different
+    ring_samples would.
     """
     path = assets_dir / "roi.json"
     if path.exists():
@@ -803,14 +804,14 @@ def _check_roi_guard(assets_dir: Path, fingerprint: dict) -> None:
             old = json.load(fh)
         if old.get("sha1") != fingerprint.get("sha1"):
             raise RuntimeError(
-                f"ROI incompatibile in {assets_dir}\n"
-                f"    su disco:  {old.get('texels')} texel, rect={old.get('rect')}, "
-                f"maschera={old.get('mask_path')}, sha1={str(old.get('sha1'))[:12]}\n"
-                f"    richiesta: {fingerprint['texels']} texel, "
-                f"rect={fingerprint['rect']}, maschera={fingerprint['mask_path']}, "
+                f"Incompatible ROI in {assets_dir}\n"
+                f"    on disk:   {old.get('texels')} texels, rect={old.get('rect')}, "
+                f"mask={old.get('mask_path')}, sha1={str(old.get('sha1'))[:12]}\n"
+                f"    requested: {fingerprint['texels']} texels, "
+                f"rect={fingerprint['rect']}, mask={fingerprint['mask_path']}, "
                 f"sha1={fingerprint['sha1'][:12]}\n"
-                f"  Gli output già presenti verrebbero saltati e mescolati con la "
-                f"ROI nuova. Cancellare la cartella oppure usare un roi_tag diverso.")
+                f"  The outputs already present would be skipped and mixed with the "
+                f"new ROI. Delete the folder, or use a different roi_tag.")
         return
     os.makedirs(assets_dir, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
@@ -835,8 +836,8 @@ class CameraIntrinsics:
 
 @dataclass
 class FrameInfo:
-    file_path: str          # path assoluto risolto (per accedere al file su disco)
-    file_path_original: str # path così com'è nel JSON originale
+    file_path: str          # resolved absolute path (used to reach the file on disk)
+    file_path_original: str # path exactly as it appears in the original JSON
     transform_matrix: list[list[float]]
     sharpness: float = 1.0
 
@@ -849,7 +850,7 @@ class FrameInfo:
 class TransformsFile:
     intrinsics: CameraIntrinsics
     frames: list[FrameInfo]
-    transforms_dir: str     # cartella del transforms.json originale
+    transforms_dir: str     # folder holding the original transforms.json
     scale: float = 1.0
     aabb_scale: int = 16
     raw: dict = field(default_factory=dict)
@@ -898,16 +899,16 @@ def load_transforms(path: str) -> TransformsFile:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Estrazione camera da transform_matrix (convenzione NeRF / OpenCV)
+# Camera extraction from transform_matrix (NeRF / OpenCV convention)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _camera_from_matrix(matrix: list[list[float]], fovy: float, frame_size: list[int], optix_mod) -> object:
-    """Ricava posizione, forward e up dalla transform_matrix NeRF 4×4.
+    """Derive position, forward and up from the 4×4 NeRF transform_matrix.
 
-    Convenzione colonne della matrice c2w:
+    Column convention of the c2w matrix:
       col 0 → right
       col 1 → up
-      col 2 → -forward  (NeRF punta la camera lungo -Z)
+      col 2 → -forward  (NeRF points the camera along -Z)
       col 3 → position
     """
     m = matrix
@@ -918,7 +919,7 @@ def _camera_from_matrix(matrix: list[list[float]], fovy: float, frame_size: list
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Pipeline principale
+# Main pipeline
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -927,234 +928,235 @@ class RenderConfig:
     model_path: str
     output_dir: str
 
-    # Normalizzazione HDR delle immagini sorgente (Step 1).
-    # Divisore = skybox.max() se skybox_path è impostato, altrimenti max sulle immagini sorgente.
-    # Lo skybox normalizzato viene salvato come skybox_normalized.exr e usato in Step 3.
+    # HDR normalization of the source images (Step 1).
+    # Divisor = skybox.max() when skybox_path is set, otherwise the max over the source images.
+    # The normalised skybox is saved as skybox_normalized.exr and used in Step 3.
     normalize_images: bool = False
 
-    # Cosa renderizzare
+    # What to render
     render_depth:    bool = True
     render_position: bool = True
     render_normal:   bool = True
-    render_mask     : bool = True   # mask di validità per ogni frame
+    render_mask     : bool = True   # validity mask for every frame
     render_ium      : bool = True
     render_visibility: bool = True
 
-    # Formato di salvataggio per ogni layer
+    # Output format for each layer
     depth_format:    ImageFormat = ImageFormat.OPENEXR
     position_format: ImageFormat = ImageFormat.OPENEXR
     normal_format:   ImageFormat = ImageFormat.OPENEXR
-    mask_format:     ImageFormat = ImageFormat.PNG      # uint8 → PNG è naturale
+    mask_format:     ImageFormat = ImageFormat.PNG      # uint8 → PNG is the natural fit
     ium_format:      ImageFormat = ImageFormat.PNG
     visibility_format: ImageFormat = ImageFormat.OPENEXR
 
-    # Dimensione texture IUM [width, height]
+    # IUM texture size [width, height]
     ium_texture_size: list[int] = field(default_factory=lambda: [512, 512])
 
-    # Normale IUM fornita dall'esterno (override rispetto a quella calcolata da OptiX).
-    # Il file può essere in qualsiasi formato immagine (PNG, JPG, EXR…).
-    # Se None (default) viene usata la normale calcolata dall'IUM.
+    # Externally supplied IUM normal (overrides the one OptiX computes).
+    # The file may be in any image format (PNG, JPG, EXR…).
+    # When None (the default) the normal computed by the IUM pass is used.
     external_normal_path: str | None = None
-    # Strategia da usare se la risoluzione dell'immagine esterna ≠ ium_texture_size.
-    #   "resample"  → ricampiona la normale a ium_texture_size (LANCZOS).
-    #   "adapt"     → adatta ium_texture_size alla risoluzione nativa della normale
-    #                 (positions/mask vengono rigenerati alla stessa risoluzione).
-    #   None        → chiede all'utente a runtime.
+    # Strategy to use when the external image resolution ≠ ium_texture_size.
+    #   "resample"  → resample the normal map to ium_texture_size (LANCZOS).
+    #   "adapt"     → adapt ium_texture_size to the normal map's native resolution
+    #                 (positions/mask are regenerated at that same resolution).
+    #   None        → ask the user at runtime.
     external_normal_resolution_mode: str | None = None
-    # Range dei valori della normale esterna.
-    #   "0_1"  → normal-map standard codificata in [0,1]: applica decode n = ext*2-1.
-    #   "-1_1" → EXR già decodificato in [-1,1] (es. un ium_normals ri-caricato): usa as-is.
-    # Da impostare esplicitamente: l'auto-detect su min() globale era fragile (il
-    # ringing LANCZOS su downscale aggressivi spingeva min sotto 0 saltando il decode).
+    # Value range of the external normal map.
+    #   "0_1"  → standard normal map encoded in [0,1]: applies the decode n = ext*2-1.
+    #   "-1_1" → EXR already decoded to [-1,1] (e.g. a reloaded ium_normals): used as is.
+    # Set this explicitly: auto-detecting from the global min() was fragile (LANCZOS
+    # ringing on aggressive downscales pushed the min below 0 and skipped the decode).
     external_normal_range: str = "0_1"
-    # Inverti il canale verde dopo il decode (utile per baker con convenzione DirectX).
-    # Default False = convenzione OpenGL/Blender (Y+ verso l'alto).
+    # Flip the green channel after the decode (needed for DirectX-convention bakers).
+    # Default False = OpenGL/Blender convention (Y+ upwards).
     external_normal_flip_green: bool = False
 
-    # Scala applicata ai depth — deve essere False: scale nei transforms.json
-    # è da applicare ANCHE alle traslazioni della camera, e non farlo crea un
-    # mismatch (query points NeRF ≠ superficie mesh).  Lasciare False.
+    # Scale applied to the depths — must stay False: the `scale` in transforms.json
+    # has to be applied to the camera translations TOO, and not doing so creates a
+    # mismatch (NeRF query points ≠ mesh surface).  Leave it False.
     apply_scale: bool = False
 
     # Color texture
     render_color_texture: bool = False
     color_texture_format: ImageFormat = ImageFormat.OPENEXR
-    # Percentile usato per calcolare il peak (default 95° = scarta il top 5% più luminoso)
+    # Percentile used to compute the peak (95 would discard the brightest 5 %)
     color_texture_peak_percentile: float = 100.0
-    # Sorgenti da cui produrre TUTTE le uscite source-dipendenti dello Step 3.
-    # Ogni source viene processata per intero e in modo identico, sotto sources/{src}/:
+    # Sources from which ALL the source-dependent Step 3 outputs are produced.
+    # Each source is processed in full and identically, under sources/{src}/:
     # color_texture/, camera_texture/, pixel_change/, albedo/, metallic/, roughness/,
-    # albedo_pbr/, pbr/. I nomi interni NON sono suffissati (il src è nel nome cartella).
-    # I passi source-indipendenti (ium, visibility, irradiance, spec_cone, indirect)
-    # restano al livello superiore, condivisi.
-    # "gt"   → immagini ground-truth
-    # "nerf" → pred EXR salvati dallo Step 2b in nerf_render_images/iter_*/
+    # albedo_pbr/, pbr/. Inner names are NOT suffixed (the source is the folder name).
+    # The source-independent passes (ium, visibility, irradiance, spec_cone, indirect)
+    # stay at the top level, shared.
+    # "gt"   → ground-truth images
+    # "nerf" → predicted EXRs written by Step 2b into nerf_render_images/iter_*/
     color_texture_image_sources: list[str] = field(default_factory=lambda: ["gt"])
-    # Iterazione Step 2b da cui leggere i pred NeRF. -1 = usa l'ultima disponibile.
+    # Step 2b iteration to read the NeRF predictions from. -1 = use the latest available.
     color_texture_nerf_iter: int = -1
-    # Angolo massimo (in gradi) dalla normale del texel oltre il quale il contributo
-    # di una camera viene scartato (vista troppo radente → bleed dello sfondo ai bordi).
-    # 90.0 = filtro disabilitato; default operativo 75° (scarta entro 15° dalla tangente).
+    # Maximum angle (degrees) from the texel normal beyond which a camera's
+    # contribution is discarded (too grazing a view → background bleed at the edges).
+    # 90.0 = filter disabled; operational default 75° (discards within 15° of the tangent).
     color_texture_grazing_max_deg: float = 75.0
 
     # Debug output
-    debug_camera_texture: bool = False   # salva side-by-side camera image vs camera_texture
+    debug_camera_texture: bool = False   # save a side-by-side of camera image vs camera_texture
 
     # Pixel change output
-    render_pixel_change: bool = False    # salva min/max/range texture in pixel_change/
-    debug_pixel_change: bool = False     # salva plot comparativo in debug_pixel_change/
+    render_pixel_change: bool = False    # save the min/max/range textures in pixel_change/
+    debug_pixel_change: bool = False     # save a comparison plot in debug_pixel_change/
 
-    # Irradiance map (skybox per-texel, quadratura deterministica su spirale di Fibonacci)
+    # Irradiance map (per-texel skybox, deterministic quadrature on a Fibonacci spiral)
     render_irradiance: bool = False
     irradiance_format: ImageFormat = ImageFormat.OPENEXR
-    # Sorgente dell'envmap usato dal pass irradiance:
-    #   "file" → EXR equirettangolare letto da skybox_path
-    #   "nerf" → bake della bg-sphere del NeRF allenato (checkpoint risolto come per
-    #            l'indirect: indirect_nerf_cache_path o <output_dir>/model/...).
-    #            skybox_path non è richiesto; la mappa bakata viene salvata come
-    #            skybox_nerf_baked.exr per ispezione/confronto con la GT.
+    # Source of the envmap the irradiance pass uses:
+    #   "file" → equirectangular EXR read from skybox_path
+    #   "nerf" → bake of the trained NeRF's background sphere (the checkpoint is resolved
+    #            as for the indirect pass: indirect_nerf_cache_path or <output_dir>/model/...).
+    #            skybox_path is not required; the baked map is saved as
+    #            skybox_nerf_baked.exr for inspection and comparison against the GT.
     skybox_source: str = "file"
-    skybox_path: str = ""                # path al file EXR equirettangolare
+    skybox_path: str = ""                # path to the equirectangular EXR file
     skybox_size: list[int] = field(default_factory=lambda: [1024, 512])  # resize target
-    irradiance_sample_side: int = 16     # N → N×N campioni per emisfero (16 = 256, 256 = 65536)
-    skybox_yaw_degrees: float = 0.0      # rotazione yaw skybox; 0° = -Y (Blender fwd) al centro
-    compare_skybox_to_gt: bool = False   # True → genera skybox_compare/skybox_heatmap.png dopo il bake
+    irradiance_sample_side: int = 16     # N → N×N samples per hemisphere (16 = 256, 256 = 65536)
+    skybox_yaw_degrees: float = 0.0      # skybox yaw; 0° puts -Y (Blender forward) at the centre
+    compare_skybox_to_gt: bool = False   # True → write skybox_compare/skybox_heatmap.png after the bake
 
     # Indirect irradiance via NeRF (precompute once, cache on disk)
     precompute_indirect: bool = False
-    indirect_sample_side: int = 64       # N → N×N campioni per texel (separato da irradiance)
-    indirect_tile_size: int = 1024       # texel per tile GPU (bilancia memoria/VRAM)
-    indirect_nerf_cache_path: str = ""   # path al checkpoint NeRF (default: auto-detect)
+    indirect_sample_side: int = 64       # N → N×N samples per texel (separate from irradiance)
+    indirect_tile_size: int = 1024       # texels per GPU tile (trades memory against VRAM)
+    indirect_nerf_cache_path: str = ""   # path to the NeRF checkpoint (default: auto-detect)
     indirect_format: ImageFormat = ImageFormat.OPENEXR
-    # Se True, il pass indiretto usa una finestra di campionamento custom attorno al
-    # t_hit OptiX (indirect_depth_window / _end), invece di ereditare quella salvata
-    # nel checkpoint di training. Il campionamento è comunque sempre centrato sul t_hit.
+    # When True the indirect pass uses a custom sampling window around the OptiX t_hit
+    # (indirect_depth_window / _end) instead of inheriting the one stored in the
+    # training checkpoint. Sampling is always centred on t_hit either way.
     indirect_override_depth_window: bool = False
     indirect_depth_window: float = 0.5
     indirect_depth_window_end: float = 0.0
 
-    # Specular cone pass — precompute L_j(r_k) per il fit PBR C_j = X·D + (1-X)·L_j(r).
-    # Campionamento ad anelli concentrici attorno al raggio riflesso: ogni raggio è
-    # tracciato/interrogato una volta e i coni si ricostruiscono per cumulativa pesata
-    # (vedi _precompute_spec_cone). Richiede render_ium, render_visibility e il
-    # checkpoint NeRF (come precompute_indirect); usa la stessa skybox dell'irradiance.
+    # Specular cone pass — precomputes L_j(r_k) for the PBR fit C_j = X·D + (1-X)·L_j(r).
+    # Sampling on concentric rings around the reflected ray: every ray is traced and
+    # queried once, and the cones are closed by a weighted cumulative sum
+    # (see _precompute_spec_cone). Requires render_ium, render_visibility and the NeRF
+    # checkpoint (like precompute_indirect); it reuses the irradiance skybox.
     precompute_spec_cone: bool = False
-    # Schema di campionamento:
-    #   "per_camera" → anelli concentrici attorno a R_j, rilanciati per ogni camera
+    # Sampling scheme:
+    #   "per_camera" → concentric rings around R_j, relaunched for every camera
     #                  (spec_cone_samples_per_ring / _sample_alloc / _budget / _floor)
-    #   "shared"     → un set Fibonacci uniforme sull'emisfero sopra n, tracciato e
-    #                  interrogato UNA volta e classificato da ogni camera nel proprio
-    #                  anello. La radianza incidente non dipende dalla camera, quindi
-    #                  costa S + m raggi/texel invece di m·ΣN_i (m = camere che vedono
-    #                  il texel). Le aperture strette costano però risoluzione: un cono
-    #                  di apertura a riceve S·(1−cos(a/2)) campioni, quindi sotto ~7°
-    #                  (a S=16384) si va sotto i 30 campioni. In compenso raffinare la
-    #                  griglia di aperture non costa un raggio in più.
+    #   "shared"     → one Fibonacci set uniform over the hemisphere above n, traced and
+    #                  queried ONCE, then binned by every camera into its own ring.
+    #                  Incident radiance does not depend on the camera, so this costs
+    #                  S + m rays/texel instead of m·ΣN_i (m = cameras that see the
+    #                  texel). Narrow apertures do cost resolution, though: a cone of
+    #                  aperture a receives S·(1−cos(a/2)) samples, so below ~7° (at
+    #                  S=16384) it drops under 30 samples. In exchange, refining the
+    #                  aperture grid does not cost a single extra ray.
     spec_cone_scheme: str = "per_camera"
-    # Campioni condivisi per texel (S), solo per scheme="shared"
+    # Shared samples per texel (S), only for scheme="shared"
     spec_cone_shared_samples: int = 16384
-    # Texel per sotto-blocco torch: dirs + radianze costano 24 B/raggio, quindi un
-    # tile intero non ci starebbe in VRAM. Non cambia il risultato, solo il picco
-    # e l'efficienza: sotto-blocchi piccoli danno kernel torch piccoli e tanto
-    # overhead Python nel loop sulle camere.
+    # Texels per torch sub-block: dirs + radiances cost 24 B/ray, so a whole tile
+    # would not fit in VRAM. It does not change the result, only the peak usage and
+    # the efficiency: small sub-blocks mean small torch kernels and a lot of Python
+    # overhead in the loop over cameras.
     spec_cone_chunk_texels: int = 256
-    # Raggi per batch nelle query NeRF del bake (override di NerfConfig.chunk, che
-    # arriva dal checkpoint e vale 32768). È il vero limite all'occupazione della
-    # GPU: il batch della rete è cappato lì, quindi alzare spec_cone_chunk_texels
-    # da solo non riempie la scheda. None = usa il valore del checkpoint.
+    # Rays per batch in the bake's NeRF queries (overrides NerfConfig.chunk, which
+    # comes from the checkpoint and is 32768). This is the real limit on GPU
+    # occupancy: the network batch is capped there, so raising spec_cone_chunk_texels
+    # alone will not fill the card. None = use the checkpoint's value.
     spec_cone_nerf_chunk: "int | None" = None
-    # Aperture TOTALI dei coni in gradi, crescenti, primo elemento = 0 (raggio specchio)
+    # TOTAL cone apertures in degrees, increasing, first element = 0 (mirror ray)
     spec_cone_apertures_deg: list[float] = field(
         default_factory=lambda: [0.0, 10.0, 20.0, 40.0, 60.0, 80.0,
                                  100.0, 120.0, 140.0, 160.0, 180.0])
-    # Campioni per anello: int = stesso numero su ogni anello (comportamento
-    # storico), oppure list[int] con un valore per anello (len = aperture - 1;
-    # il livello 0, raggio specchio, è sempre un raggio solo).
+    # Samples per ring: an int = the same number on every ring (the historical
+    # behaviour), or a list[int] with one value per ring (len = apertures - 1;
+    # level 0, the mirror ray, is always a single ray).
     spec_cone_samples_per_ring: int | list[int] = 32
-    # Allocazione automatica quando spec_cone_samples_per_ring è un int:
-    #   "uniform"     → stesso numero ovunque
-    #   "solid_angle" → N_i ∝ Ω_i, cioè densità angolare uniforme. L'anello
-    #                   esterno copre ~45× l'angolo solido del primo, quindi con
-    #                   M costante è di gran lunga il più rumoroso; il rumore su
-    #                   L attenua β e falsa l'argmin su r (errors-in-variables).
+    # Automatic allocation when spec_cone_samples_per_ring is an int:
+    #   "uniform"     → the same number everywhere
+    #   "solid_angle" → N_i ∝ Ω_i, i.e. uniform angular density. The outer ring
+    #                   covers ~45× the solid angle of the first, so with a constant
+    #                   M it is by far the noisiest; noise on L attenuates β and
+    #                   biases the argmin over r (errors-in-variables).
     spec_cone_sample_alloc: str = "uniform"
-    # Σ_i N_i target per l'allocazione automatica (None → int × numero di anelli)
+    # Target Σ_i N_i for the automatic allocation (None → int × number of rings)
     spec_cone_samples_budget: int | None = None
-    # Minimo per anello. Serve ai candidati stretti, che usano SOLO gli anelli
-    # interni: a 32 nessun candidato riceve meno campioni dell'allocazione
-    # uniforme storica, al costo del ~3% di raggi in più.
+    # Per-ring minimum. The narrow candidates need it, since they use ONLY the inner
+    # rings: at 32, no candidate receives fewer samples than the historical uniform
+    # allocation, at the cost of ~3 % more rays.
     spec_cone_samples_floor: int = 32
-    # Texel per lancio OptiX: tile grandi = meno overhead di launch/sync e batch
-    # NeRF più grandi (query_radiance spezza comunque in cfg.chunk). ~40 MB VRAM.
-    # Da ridurre se si alza il budget: la RAM per tile scala con tile × raggi/texel.
+    # Texels per OptiX launch: large tiles mean less launch/sync overhead and larger
+    # NeRF batches (query_radiance splits by cfg.chunk anyway). ~40 MB of VRAM.
+    # Lower it when raising the budget: host RAM per tile scales with tile × rays/texel.
     spec_cone_tile_size: int = 8192
-    spec_cone_cameras: list[int] | None = None  # indici frame da processare (None = tutti)
+    spec_cone_cameras: list[int] | None = None  # frame indices to process (None = all)
     spec_cone_format: ImageFormat = ImageFormat.OPENEXR
 
-    # Mappe PBR finali (pbr_solver) — richiede precompute_spec_cone, color_texture
-    # con pixel_change e visibility. Salva metallic/metallic.exr (= 1−X) e
-    # roughness/roughness.exr (= r/180 dove attendibile, 1.0 altrove), come l'albedo.
+    # Final PBR maps (pbr_solver) — requires precompute_spec_cone, color_texture with
+    # pixel_change, and visibility. Writes metallic/metallic.exr (= 1−X) and
+    # roughness/roughness.exr (= r/180 where reliable, 1.0 elsewhere), like the albedo.
     render_pbr_maps: bool = False
     pbr_min_views: int = 2
-    pbr_spec_threshold: float = 0.2    # metallic minimo perché r sia attendibile (0 = nessuna censura)
-    # Copia metallic/roughness anche come EXR R/G/B (metallic_rgb.exr,
-    # roughness_rgb.exr): il canale singolo 'Z' che scrive ExrWriter non è la
-    # convenzione dei bake di Blender, che replicano il grigio su tre canali.
+    pbr_spec_threshold: float = 0.2    # minimum metallic for r to be trusted (0 = no censoring)
+    # Also copy metallic/roughness as R/G/B EXRs (metallic_rgb.exr,
+    # roughness_rgb.exr): the single 'Z' channel ExrWriter writes is not the
+    # convention of Blender's bakes, which replicate the grey over three channels.
     pbr_write_blender_rgb: bool = True
-    # Texel per banda del solver: il fit è per-texel, quindi la texture viene
-    # partizionata in blocchi di scanline intere e il picco di RAM scala con
-    # questo valore (~tile·n_candidati·8B·20, cioè ~2.5 GiB a 1 M texel e 14
-    # candidati) invece che con la risoluzione. Non cambia il risultato.
+    # Texels per solver band: the fit is per-texel, so the texture is partitioned
+    # into blocks of whole scanlines and the peak RAM scales with this value
+    # (~tile·n_candidates·8B·20, i.e. ~2.5 GiB at 1 M texels and 14 candidates)
+    # rather than with the resolution. It does not change the result.
     pbr_tile_texels: int = 1 << 20
 
-    # Albedo (color_texture / irradiance) — modello Lambertiano ρ = π · L / E
+    # Albedo (color_texture / irradiance) — Lambertian model ρ = π · L / E
     render_albedo: bool = False
     albedo_format: ImageFormat = ImageFormat.OPENEXR
-    albedo_eps: float = 1e-3             # clamp minimo dell'irradiance per evitare /0
+    albedo_eps: float = 1e-3             # lower clamp on the irradiance, to avoid /0
 
-    # ── ROI di test in spazio texture (Step 3 + Step 4) ──────────────────────
-    # Restringe il calcolo a una porzione della texture per iterare in fretta su
-    # parametri di bake o di fit senza pagare i 16.7 M texel di una IUM 4096².
-    # Non è un'approssimazione: la ROI si applica come fattore sulla maschera IUM,
-    # e ogni kernel a valle esce già sui texel mascherati, quindi i texel calcolati
-    # danno gli stessi identici valori di una run piena. I texel fuori restano a 0.
-    # Con una ROI attiva TUTTI gli output di Step 3 e Step 4 finiscono in una
-    # sandbox <output_dir>/roi/<tag>/ che replica il layout normale: le cache
-    # full-res non vengono mai toccate e per ripulire basta cancellare la cartella.
-    # Restano condivisi con la run piena gli input (images/, nerf_render_images/)
-    # e skybox_nerf_baked.exr, che quindi non viene ri-bakato.
-    roi_rect: "list[int] | None" = None   # [x0, y0, w, h] in texel IUM
-    roi_mask_path: str = ""               # PNG/EXR: canale 0 > threshold = dentro la ROI
+    # ── Texture-space test ROI (Step 3 + Step 4) ─────────────────────────────
+    # Restricts the computation to a portion of the texture, so a bake or fit
+    # parameter can be iterated on without paying the 16.7 M texels of a 4096² IUM.
+    # It is not an approximation: the ROI is applied as a factor on the IUM mask,
+    # and every downstream kernel already returns early on masked texels, so the
+    # texels computed get bit-identical values to a full run. The rest stay 0.
+    # With a ROI active, ALL the Step 3 and Step 4 outputs go into a sandbox
+    # <output_dir>/roi/<tag>/ mirroring the normal layout: the full-resolution
+    # caches are never touched, and cleaning up is just deleting the folder.
+    # The inputs (images/, nerf_render_images/) and skybox_nerf_baked.exr stay
+    # shared with the full run, so the skybox is not re-baked.
+    roi_rect: "list[int] | None" = None   # [x0, y0, w, h] in IUM texels
+    roi_mask_path: str = ""               # PNG/EXR: channel 0 > threshold = inside the ROI
     roi_mask_threshold: float = 0.5
-    # ROI effettiva = AND di rettangolo e maschera (ognuno opzionale). Entrambi
-    # vuoti = comportamento identico a prima (nessuna sandbox).
-    roi_tag: str = ""                     # nome della sandbox ("" = derivato da rect/maschera)
+    # Effective ROI = AND of rectangle and mask (each optional). Both empty means
+    # behaviour identical to before (no sandbox).
+    roi_tag: str = ""                     # sandbox name ("" = derived from rect/mask)
 
 
 @dataclass
 class PipelineConfig:
-    """Orchestratore a quattro step toggle-abili.
+    """Four toggle-able steps.
 
-    Step 1: genera depth+mask+immagini+transforms_extended.json (minimo per NeRF).
-    Step 2: allena il NeRF (nerf/train.py) e salva il checkpoint.
-    Step 3: esegue IUM/visibility/color_texture/irradiance/indirect/spec_cone (bake).
-    Step 4: ricostruzione (fit PBR + albedo) leggendo solo la cache su disco dello
-            Step 3 — separato per iterare sulla ricostruzione senza ri-bake dei coni.
+    Step 1: produce depth+mask+images+transforms_extended.json (the NeRF minimum).
+    Step 2: train the NeRF (nerf/train.py) and save the checkpoint.
+    Step 3: run IUM/visibility/color_texture/irradiance/indirect/spec_cone (the bake).
+    Step 4: reconstruction (PBR fit + albedo), reading only the on-disk cache of
+            Step 3 — kept separate so the reconstruction can be iterated on
+            without re-baking the cones.
     """
     run_step1: bool = True
     run_step2: bool = True
     run_step3: bool = True
     run_step4: bool = True
-    # Se True, e se run_step2=True, salta il training NeRF per una scena se il
-    # checkpoint <output_dir>/model/nerf_model_cache.pt esiste già (utile per
-    # riprendere uno sweep interrotto senza ripetere il training).
-    # Caveat: un checkpoint incompleto verrebbe riusato; per forzare il
-    # riaddestramento basta cancellare il file .pt di quella config.
+    # When True, and with run_step2=True, skip the NeRF training for a scene if the
+    # checkpoint <output_dir>/model/nerf_model_cache.pt already exists (useful to
+    # resume an interrupted sweep without repeating the training).
+    # Caveat: an incomplete checkpoint would be reused; to force retraining, delete
+    # that configuration's .pt file.
     resume_skip_step2_if_ckpt: bool = False
 
     render: RenderConfig = field(default_factory=RenderConfig)
 
-    # Parametri di nerf/train.py (Step 2)
+    # Parameters of nerf/train.py (Step 2)
     nerf_num_iters:        int   = 10000
     nerf_batch_size:       int   = 4096
     nerf_lr:               float = 5e-4
@@ -1163,79 +1165,79 @@ class PipelineConfig:
     nerf_ckpt_path:        str   = ""  # default: <output_dir>/model/nerf_model_cache.pt
     nerf_train_output_dir: str   = ""  # default: <output_dir>/nerf_train
 
-    # Depth-guided training (Step 2) — richiede depth+mask dallo Step 1
-    nerf_depth_window_samples: int   = 32    # sample nella finestra mesh per i raggi figura
+    # Depth-guided training (Step 2) — requires depth+mask from Step 1
+    nerf_depth_window_samples: int   = 32    # samples in the mesh window for foreground rays
     nerf_depth_window:         float = 0.5   # [t_hit - window, t_hit + window_end]
     nerf_depth_window_end:     float = 0.5
-    nerf_opacity_weight:       float = 1.0   # peso della loss opacità (fg e bg)
-    nerf_raw_noise_std:        float = 0.0   # rumore pre-ReLU sulla densità
-    nerf_bg_radius_mult:       float = 6.0   # raggio sfera bg = bg_radius_mult × distanza max dall'origine
-    nerf_bg_depth_window:      float = 2.0   # finestra bg [R - window, R + window_end]
+    nerf_opacity_weight:       float = 1.0   # weight of the opacity loss (fg and bg)
+    nerf_raw_noise_std:        float = 0.0   # pre-ReLU noise on the density
+    nerf_bg_radius_mult:       float = 6.0   # bg sphere radius = bg_radius_mult × max distance from the origin
+    nerf_bg_depth_window:      float = 2.0   # bg window [R - window, R + window_end]
     nerf_bg_depth_window_end:  float = 2.0
-    nerf_profile_iters: int = 0         # per-fase timing sincronizzato per i primi N iter (0=off)
+    nerf_profile_iters: int = 0         # synchronized per-phase timing for the first N iters (0=off)
     nerf_multires:       int   = 10
     nerf_multires_views: int   = 4
 
-    # Attivazione RGB e loss del training (Step 2).
+    # RGB activation and training loss (Step 2).
     # nerf_rgb_activation: "exp" (HDR) | "softplus"
-    # nerf_loss_type:      "l1" | "mse" | "rel_mse" (eps fuori dal quadrato) |
-    #                      "rel_mse_raw" (RawNeRF fedele, eps dentro al quadrato) | "log_l1"
-    # N.B. checkpoint salvati con un'attivazione NON sono compatibili con l'altra.
+    # nerf_loss_type:      "l1" | "mse" | "rel_mse" (eps outside the square) |
+    #                      "rel_mse_raw" (faithful RawNeRF, eps inside the square) | "log_l1"
+    # N.B. checkpoints saved with one activation are NOT compatible with the other.
     nerf_rgb_activation: str   = "exp"
     nerf_loss_type:      str   = "rel_mse_raw"
 
-    # Fattore di decay del learning rate: new_lr = lr * (nerf_lr_decay ** min(i/decay_steps, 1.0)).
-    # 0.2 → lr decade al 20 % del valore iniziale all'orizzonte nerf_lr_decay_steps;
-    # oltre la soglia il LR resta a plateau (lr*factor, non scende più).
-    # Sweepabile per confrontare regimi di decadimento: valori < 0.2 più aggressivi,
-    # valori > 0.2 più gentili. Propagato a NerfConfig.lr_decay_factor.
+    # Learning-rate decay factor: new_lr = lr * (nerf_lr_decay ** min(i/decay_steps, 1.0)).
+    # 0.2 → the lr decays to 20 % of its initial value at the nerf_lr_decay_steps horizon;
+    # past that point the LR plateaus (lr*factor, it does not fall further).
+    # Sweepable to compare decay regimes: values < 0.2 are more aggressive, values
+    # > 0.2 gentler. Propagated to NerfConfig.lr_decay_factor.
     nerf_lr_decay: float = 0.2
 
-    # Orizzonte FISSO (iter assolute) su cui si spalma il decay del LR. 0 = auto → usa
-    # nerf_num_iters (run fresh identico a prima). Impostarlo a un valore fisso (es.
-    # uguale alla lunghezza pianificata totale) per far sì che riprendere il training
-    # continui il decay senza salti. Propagato a NerfConfig.lr_decay_steps.
+    # FIXED horizon (absolute iterations) the LR decay is spread over. 0 = auto → use
+    # nerf_num_iters (a fresh run behaves exactly as before). Setting it to a fixed
+    # value (e.g. the total planned length) makes a resumed training continue the
+    # decay without a jump. Propagated to NerfConfig.lr_decay_steps.
     nerf_lr_decay_steps: int = 0
 
-    # Render dei frame di training col NeRF allenato (post-Step 2)
+    # Render the training frames with the trained NeRF (post-Step 2)
     enable_nerf_render_train_images: bool = False
     nerf_render_train_images_dir:    str  = ""  # default: <output_dir>/nerf_render_images
 
-    # Se True, chiede all'utente di continuare il training al termine di ogni round
+    # When True, ask the user whether to continue training at the end of each round
     nerf_interactive_loop: bool = True
 
 
 
 @dataclass
 class SceneConfig:
-    """Campi che variano per scena, usati da run_pipeline_multi."""
-    name: str                               # nome della sottocartella di output (es. "SwordShield")
+    """Per-scene fields, used by run_pipeline_multi."""
+    name: str                               # name of the output subfolder (e.g. "SwordShield")
     transforms_path: str
     model_path: str
-    external_normal_path: str | None = None  # sovrascrive RenderConfig solo se non None
-    skybox_path: str | None = None           # usato solo se skybox_source == "file"
-    note: str = ""                           # nota opzionale specifica della scena
+    external_normal_path: str | None = None  # overrides RenderConfig only when not None
+    skybox_path: str | None = None           # used only when skybox_source == "file"
+    note: str = ""                           # optional scene-specific note
 
 
 def _resolve_nerf_ckpt_path(cfg: RenderConfig) -> str:
-    """Path del checkpoint NeRF usato dai pass di Step 3 (indirect, skybox bake)."""
+    """Path of the NeRF checkpoint used by the Step 3 passes (indirect, skybox bake)."""
     path = cfg.indirect_nerf_cache_path
     if not path:
         path = os.path.join(cfg.output_dir, "model", "nerf_model_cache.pt")
     if not os.path.exists(path):
         raise FileNotFoundError(
-            f"NeRF model cache non trovato: {path}\n"
-            "Imposta indirect_nerf_cache_path oppure eseguire prima Step 2."
+            f"NeRF model cache not found: {path}\n"
+            "Set indirect_nerf_cache_path, or run Step 2 first."
         )
     return path
 
 
 def _bake_skybox_from_nerf(cfg: RenderConfig, sky_w: int, sky_h: int,
                            json_dir: Path) -> np.ndarray:
-    """Bake della bg-sphere del NeRF in envmap equirettangolare (skybox_source="nerf").
+    """Bake the NeRF background sphere into an equirectangular envmap (skybox_source="nerf").
 
-    Salva skybox_nerf_baked.exr in json_dir per ispezione e restituisce (N, 3) float32
-    nello stesso layout flat di _load_image_as_vec3.
+    Saves skybox_nerf_baked.exr in json_dir for inspection and returns (N, 3) float32
+    in the same flat layout as _load_image_as_vec3.
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
@@ -1245,28 +1247,28 @@ def _bake_skybox_from_nerf(cfg: RenderConfig, sky_w: int, sky_h: int,
     ckpt_path = _resolve_nerf_ckpt_path(cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_bundle, nerf_cfg = load_checkpoint(ckpt_path, device)
-    print(f"[Step 3] Bake skybox da NeRF ({sky_w}×{sky_h}, "
+    print(f"[Step 3] Baking the skybox from the NeRF ({sky_w}×{sky_h}, "
           f"yaw={cfg.skybox_yaw_degrees}°) — ckpt: {ckpt_path}")
     baked = bake_envmap(model_bundle, nerf_cfg, sky_w, sky_h,
                         yaw_degrees=cfg.skybox_yaw_degrees)
     out_path = (json_dir / "skybox_nerf_baked.exr").resolve().as_posix()
     get_writer(ImageFormat.OPENEXR).write(baked, out_path)
-    print(f"[Step 3] Skybox bakata salvata: {out_path}")
+    print(f"[Step 3] Baked skybox saved: {out_path}")
     return baked.reshape(-1, 3)
 
 
 def _resolve_skybox_flat(cfg: RenderConfig, output_json: dict, json_dir: Path,
                          sky_w: int, sky_h: int) -> np.ndarray:
-    """Skybox flat (H*W, 3) per i pass Step 3 (irradiance, spec_cone).
+    """Flat skybox (H*W, 3) for the Step 3 passes (irradiance, spec_cone).
 
-    skybox_source="nerf" → bake dalla bg-sphere del NeRF; altrimenti preferisce
-    lo skybox normalizzato dal JSON (stessa scala di color+NeRF) se presente.
+    skybox_source="nerf" → bake from the NeRF background sphere; otherwise prefer
+    the normalised skybox from the JSON (same scale as colour+NeRF) when present.
     """
     if cfg.skybox_source == "nerf":
         baked = json_dir / "skybox_nerf_baked.exr"
         if baked.exists():
-            print(f"[Step 3] Skybox NeRF riusata da disco: {baked} "
-                  "(cancellare il file per forzare il re-bake)")
+            print(f"[Step 3] NeRF skybox reused from disk: {baked} "
+                  "(delete the file to force a re-bake)")
             return _load_image_as_vec3(baked.as_posix(), sky_w, sky_h)
         return _bake_skybox_from_nerf(cfg, sky_w, sky_h, json_dir)
     norm_sky_rel = output_json.get("normalization", {}).get("normalized_skybox_path", "")
@@ -1286,15 +1288,15 @@ def _precompute_indirect_irradiance(
     ium_h: int,
     indirect_path: str,
 ) -> None:
-    """Esegue il pass OptiX tile-by-tile, interroga NeRF per ogni raggio occluso e
-    salva irradiance_indirect.exr su disco.  Chiamato solo se precompute_indirect=True.
+    """Run the OptiX pass tile by tile, query the NeRF for every occluded ray and
+    write irradiance_indirect.exr to disk.  Called only when precompute_indirect=True.
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
     from nerf import load_checkpoint, query_radiance
     import OptixProgrammablePasses as optix
 
-    # ── Carica il modello NeRF dal cache ──────────────────────────────────────
+    # ── Load the NeRF model from the cache ────────────────────────────────────
     cache_path = _resolve_nerf_ckpt_path(cfg)
 
     import torch
@@ -1303,9 +1305,9 @@ def _precompute_indirect_irradiance(
     if cfg.indirect_override_depth_window:
         nerf_cfg.depth_window     = cfg.indirect_depth_window
         nerf_cfg.depth_window_end = cfg.indirect_depth_window_end
-    print(f"✓ NeRF model caricato da: {cache_path}")
+    print(f"✓ NeRF model loaded from: {cache_path}")
 
-    # ── Pass OptiX tile-by-tile ───────────────────────────────────────────────
+    # ── OptiX pass, tile by tile ──────────────────────────────────────────────
     ind_gen = optix.IndirectGenerator()
     ind_gen.set_traversable(model)
     ind_gen.set_inputs(ium_res, cfg.indirect_sample_side, cfg.indirect_tile_size)
@@ -1319,14 +1321,14 @@ def _precompute_indirect_irradiance(
     ium_normals_np   = ium_res.normals_np.astype(np.float32)
     eps              = 1e-4
 
-    # Tile senza un solo texel attivo: il kernel esce su ogni thread e il tile
-    # produrrebbe count=0. Saltare il lancio è quindi equivalente e basta a far
-    # scalare il costo con la ROI invece che con la risoluzione della texture.
-    # Utile anche senza ROI, dove le zone vuote dell'atlante pagano comunque il lancio.
+    # Tiles without a single active texel: the kernel returns early on every thread
+    # and the tile would yield count=0. Skipping the launch is therefore equivalent,
+    # and enough to make the cost scale with the ROI instead of with the texture
+    # resolution. It helps without a ROI too, where empty atlas regions still pay.
     ium_mask_flat = np.asarray(ium_res.masks_np).reshape(-1) > 0
     n_skipped = 0
 
-    print(f"  Indirect precompute: {n_tiles} tile × {cfg.indirect_tile_size} texel, "
+    print(f"  Indirect precompute: {n_tiles} tiles × {cfg.indirect_tile_size} texels, "
           f"N={cfg.indirect_sample_side}")
 
     for tile_idx in range(n_tiles):
@@ -1356,10 +1358,10 @@ def _precompute_indirect_irradiance(
                   colors * cos_np[:, None].astype(np.float64))
 
         if (tile_idx + 1) % max(1, n_tiles // 10) == 0:
-            print(f"    tile {tile_idx+1}/{n_tiles}, raggi occlusi: {count}")
+            print(f"    tile {tile_idx+1}/{n_tiles}, occluded rays: {count}")
 
     if n_skipped:
-        print(f"    {n_skipped}/{n_tiles} tile saltati (nessun texel attivo)")
+        print(f"    {n_skipped}/{n_tiles} tiles skipped (no active texel)")
 
     irr_indirect = (irr_indirect * scale).astype(np.float32)
 
@@ -1367,17 +1369,17 @@ def _precompute_indirect_irradiance(
     irr_indirect_arr = _reshape_flat(irr_indirect, ium_w, ium_h)
     _save_layer(irr_indirect_arr, indirect_path, cfg.indirect_format,
                 DataLayer.IRRADIANCE_INDIRECT)
-    print(f"✓ irradiance_indirect salvato: {indirect_path}")
+    print(f"✓ irradiance_indirect saved: {indirect_path}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Set Fibonacci condiviso — ricostruzione lato host delle direzioni del kernel
+# Shared Fibonacci set — host-side reconstruction of the kernel's directions
 #
-# Queste funzioni replicano BIT PER BIT sharedDirection()/buildONB()/
-# rotationFromIndex() di deviceProgramsHemiVis.cu: il kernel restituisce solo i
-# t_hit, indicizzati per posizione, quindi una divergenza appaierebbe ogni t_hit
-# alla direzione sbagliata senza alcun sintomo visibile se non una L_j errata.
-# La parità è verificata da test_hemivis_shared.py.
+# These functions replicate sharedDirection()/buildONB()/rotationFromIndex() of
+# deviceProgramsHemiVis.cu BIT FOR BIT: the kernel returns only the t_hits, indexed
+# by position, so a divergence would pair every t_hit with the wrong direction with
+# no visible symptom other than a wrong L_j.
+# The parity is verified by scripts/test_hemivis_shared.py.
 # ──────────────────────────────────────────────────────────────────────────────
 
 _HEMIVIS_INV_GOLDEN = 0.6180339887498948482   # 1/φ = (√5 − 1)/2
@@ -1385,12 +1387,12 @@ _HEMIVIS_TWO_PI     = 6.283185307179586477
 
 
 def _hemivis_rotation(global_idx: np.ndarray) -> np.ndarray:
-    """Rotazione azimutale in [0, 1) per texel (hash lowbias32 di global_idx).
+    """Per-texel azimuthal rotation in [0, 1) (lowbias32 hash of global_idx).
 
-    Decorrela il pattern QMC tra texel vicini: senza, tutti i texel userebbero le
-    stesse direzioni a meno della ONB e il rumore si allineerebbe in bande.
+    Decorrelates the QMC pattern between neighbouring texels: without it, every texel
+    would use the same directions up to the ONB and the noise would align into bands.
     """
-    with np.errstate(over="ignore"):          # l'overflow uint32 È la semantica voluta
+    with np.errstate(over="ignore"):          # the uint32 overflow IS the intended semantics
         x = np.asarray(global_idx, dtype=np.uint32)
         x = x ^ (x >> np.uint32(16))
         x = x * np.uint32(0x7feb352d)
@@ -1401,7 +1403,7 @@ def _hemivis_rotation(global_idx: np.ndarray) -> np.ndarray:
 
 
 def _hemivis_onb(n):
-    """ONB branchless di Frisvad 2012 attorno a n (torch, (..., 3) float32)."""
+    """Frisvad 2012 branchless ONB around n (torch, (..., 3) float32)."""
     import torch
     nz  = n[..., 2]
     sgn = torch.copysign(torch.ones_like(nz), nz)
@@ -1413,12 +1415,12 @@ def _hemivis_onb(n):
 
 
 def _hemivis_directions(normals, global_idx: np.ndarray, num_samples: int):
-    """Direzioni condivise (n_texel, S, 3) float32 attorno alle normali date.
+    """Shared directions (n_texel, S, 3) float32 around the given normals.
 
-    Uniformi in angolo solido sull'emisfero sopra n: cosθ_s = 1 − (s + 0.5)/S,
-    azimut sulla sequenza aurea con rotazione per texel. L'aritmetica dell'azimut
-    è in float64 e ridotta in [0, 2π) PRIMA della trigonometria, come nel kernel:
-    in float32 s·goldenAngle arriva a ~4·10⁴ rad, dove un ULP vale già 0.23°.
+    Uniform in solid angle over the hemisphere above n: cosθ_s = 1 − (s + 0.5)/S,
+    azimuth on the golden sequence with a per-texel rotation. The azimuth arithmetic
+    is in float64 and reduced to [0, 2π) BEFORE the trigonometry, as in the kernel:
+    in float32 s·goldenAngle reaches ~4·10⁴ rad, where one ULP is already 0.23°.
     """
     import torch
     device = normals.device
@@ -1443,10 +1445,10 @@ def _hemivis_directions(normals, global_idx: np.ndarray, num_samples: int):
 
 
 def _sample_envmap_torch(dirs, envmap, sky_size, yaw_offset_u: float):
-    """Lookup equirettangolare (torch), identico a sampleEnvmap() dei kernel CUDA.
+    """Equirectangular lookup (torch), identical to sampleEnvmap() in the CUDA kernels.
 
-    Mondo Z-up, Y-forward (Blender): zenith = +Z, u = 0.5 − atan2(dy,dx)/2π.
-    envmap: (H*W, 3) float32 sul device; sky_size = [W, H].
+    World Z-up, Y-forward (Blender): zenith = +Z, u = 0.5 − atan2(dy,dx)/2π.
+    envmap: (H*W, 3) float32 on the device; sky_size = [W, H].
     """
     import torch
     w, h = int(sky_size[0]), int(sky_size[1])
@@ -1456,19 +1458,19 @@ def _sample_envmap_torch(dirs, envmap, sky_size, yaw_offset_u: float):
     u = u - torch.floor(u)
     v = 0.5 - torch.asin(dz) * (1.0 / np.pi)
 
-    px = torch.clamp((u * w).to(torch.int64), 0, w - 1)   # (int) tronca, u ≥ 0 ⇒ floor
+    px = torch.clamp((u * w).to(torch.int64), 0, w - 1)   # (int) truncates, u ≥ 0 ⇒ floor
     py = torch.clamp((v * h).to(torch.int64), 0, h - 1)
     return envmap[py * w + px]
 
 
 def spec_cone_shared_ring_samples(apertures_deg, num_samples: int) -> list[float]:
-    """Conteggi NOMINALI per anello del bake condiviso: N_i = S·Ω_i/(2π).
+    """NOMINAL per-ring counts of the shared bake: N_i = S·Ω_i/(2π).
 
-    Con campionamento uniforme in angolo solido il numero atteso di campioni in un
-    anello è proporzionale al suo angolo solido, quindi i pesi del solver
-    W_i = Ω_i/N_i = 2π/S diventano costanti e `ring_weights_mean` collassa sulla
-    media cumulativa semplice L(k) = Σ_{i≤k} somma_i / Σ_{i≤k} conteggio_i.
-    Scrivere questi valori nel meta è ciò che rende il solver invariato.
+    With uniform sampling in solid angle, the expected number of samples in a ring is
+    proportional to its solid angle, so the solver weights W_i = Ω_i/N_i = 2π/S become
+    constant and `ring_weights_mean` collapses onto the plain cumulative mean
+    L(k) = Σ_{i≤k} sum_i / Σ_{i≤k} count_i.
+    Writing these values into the meta is what leaves the solver unchanged.
     """
     c = np.cos(np.radians(np.asarray(apertures_deg, dtype=np.float64)) * 0.5)
     return [float(num_samples) * float(c[i] - c[i + 1]) for i in range(c.size - 1)]
@@ -1476,30 +1478,30 @@ def spec_cone_shared_ring_samples(apertures_deg, num_samples: int) -> list[float
 
 def ring_weights_mean(cos_edges, k: int,
                       ring_samples: "np.ndarray | None" = None) -> np.ndarray:
-    """Pesi ad angolo solido del cono troncato all'anello k (media pura):
-    W_i = Ω_i/N_i con Ω_i = 2π(c_{i-1} − c_i) per i ≤ k, 0 oltre, con
-    c = clip(cos b, 0, 1) e N_i = raggi lanciati sull'anello i.
-    La normalizzazione per Σ_i W_i·valid_i avviene per-texel al momento
-    dell'accumulo (i raggi sotto l'orizzonte escono da numeratore e denominatore).
+    """Solid-angle weights of the cone truncated at ring k (pure mean):
+    W_i = Ω_i/N_i with Ω_i = 2π(c_{i-1} − c_i) for i ≤ k and 0 beyond, where
+    c = clip(cos b, 0, 1) and N_i = rays launched on ring i.
+    The normalization by Σ_i W_i·valid_i happens per texel at accumulation time
+    (rays below the horizon leave both numerator and denominator).
 
-    ring_samples=None (o uniforme) riproduce ESATTAMENTE il comportamento
-    storico: con N costante il fattore 1/N si semplifica in num/den, e saltare
-    la divisione evita anche il suo errore di arrotondamento.
+    ring_samples=None (or a uniform one) reproduces the historical behaviour EXACTLY:
+    with a constant N the 1/N factor cancels in num/den, and skipping the division
+    also avoids its rounding error.
 
-    Vive qui e non in pbr_solver perché è matematica del bake: da quando
-    spec_cone scrive direttamente i coni, il solver non pesa più nulla. I test
-    del kernel la importano da questo modulo.
+    It lives here and not in pbr_solver because it is bake mathematics: ever since
+    spec_cone writes the cones directly, the solver weights nothing at all. The
+    kernel tests import it from this module.
     """
     c = np.clip(np.asarray(cos_edges, dtype=np.float64), 0.0, 1.0)
     w = 2.0 * np.pi * (c[:-1] - c[1:])
     if ring_samples is not None:
         n = np.asarray(ring_samples, dtype=np.float64)
         if n.shape != w.shape:
-            raise ValueError(f"ring_samples: attesi {w.size} valori "
-                             f"(un anello ciascuno), ricevuti {n.size}")
+            raise ValueError(f"ring_samples: expected {w.size} values "
+                             f"(one per ring), got {n.size}")
         if n.min() <= 0.0:
-            raise ValueError("ring_samples: ogni anello richiede N_i > 0")
-        if n.max() != n.min():      # uniforme → fattore globale, no-op esatto
+            raise ValueError("ring_samples: every ring requires N_i > 0")
+        if n.max() != n.min():      # uniform → global factor, an exact no-op
             w = w / n
     w[k:] = 0.0
     return w
@@ -1507,39 +1509,39 @@ def ring_weights_mean(cos_edges, k: int,
 
 def spec_cone_ring_samples(apertures_deg, samples_per_ring, alloc="uniform",
                            budget=None, floor=32) -> list[int]:
-    """Campioni da LANCIARE sugli anelli 1..K-1 (il livello 0 = raggio specchio
-    è sempre un raggio solo, quindi non compare qui).
+    """Samples to LAUNCH on rings 1..K-1 (level 0, the mirror ray, is always a
+    single ray, so it does not appear here).
 
-    Se samples_per_ring è una sequenza viene usata così com'è e `alloc` è
-    ignorato. Altrimenti l'allocazione è derivata dagli angoli solidi degli
-    anelli, Ω_i = 2π(c_{i-1} − c_i) con c = cos(apertura/2):
-      "uniform"     → N_i = samples_per_ring per ogni anello
-      "solid_angle" → N_i ∝ Ω_i, normalizzato al budget e con clamp al floor,
-                      così ogni raggio copre all'incirca lo stesso angolo solido.
+    When samples_per_ring is a sequence it is used as is and `alloc` is ignored.
+    Otherwise the allocation is derived from the solid angles of the rings,
+    Ω_i = 2π(c_{i-1} − c_i) with c = cos(aperture/2):
+      "uniform"     → N_i = samples_per_ring on every ring
+      "solid_angle" → N_i ∝ Ω_i, normalised to the budget and clamped to the floor,
+                      so every ray covers roughly the same solid angle.
     """
     ap = np.asarray(apertures_deg, dtype=np.float64)
     n_rings = ap.size - 1
     if n_rings < 1:
-        raise ValueError("spec_cone_apertures_deg richiede almeno 2 valori")
+        raise ValueError("spec_cone_apertures_deg requires at least 2 values")
 
     if not isinstance(samples_per_ring, (int, np.integer)):
         n = [int(x) for x in samples_per_ring]
         if len(n) != n_rings:
-            raise ValueError(f"spec_cone_samples_per_ring: {len(n)} valori, "
-                             f"attesi {n_rings} (aperture - 1)")
+            raise ValueError(f"spec_cone_samples_per_ring: {len(n)} values, "
+                             f"expected {n_rings} (apertures - 1)")
         if min(n) < 1:
-            raise ValueError("spec_cone_samples_per_ring: ogni anello richiede "
-                             "almeno 1 campione")
+            raise ValueError("spec_cone_samples_per_ring: every ring requires "
+                             "at least 1 sample")
         return n
 
     m = int(samples_per_ring)
     if m < 1:
-        raise ValueError("spec_cone_samples_per_ring deve essere >= 1")
+        raise ValueError("spec_cone_samples_per_ring must be >= 1")
     if alloc == "uniform":
         return [m] * n_rings
     if alloc != "solid_angle":
-        raise ValueError(f"spec_cone_sample_alloc sconosciuto: {alloc!r} "
-                         "(attesi 'uniform' o 'solid_angle')")
+        raise ValueError(f"unknown spec_cone_sample_alloc: {alloc!r} "
+                         "(expected 'uniform' or 'solid_angle')")
 
     c = np.cos(np.radians(ap) * 0.5)
     omega = 2.0 * np.pi * (c[:-1] - c[1:])
@@ -1549,20 +1551,20 @@ def spec_cone_ring_samples(apertures_deg, samples_per_ring, alloc="uniform",
 
 
 def spec_cone_level_name(apertures_deg, k: int) -> str:
-    """Nome del livello k: l'APERTURA, non l'indice.
+    """Name of level k: the APERTURE, not the index.
 
-    È il nome che si legge nel viewer (tev raggruppa i canali per prefisso e
-    mostra un layer per livello), quindi ci va il dato che serve: `cone_045deg`
-    e non `cone06`. Vincoli che spiegano la forma esatta:
+    This is the name read in the viewer (tev groups channels by prefix and shows one
+    layer per level), so it should carry the useful datum: `cone_045deg` and not
+    `cone06`. The constraints that explain the exact form:
 
-    - niente punti: nei nomi dei canali EXR il punto separa layer e canale, e
-      `cone_007.5deg.R` verrebbe letto come layer `cone_007`, sublayer `5deg`.
-      I gradi frazionari usano quindi `p` come separatore decimale;
-    - parte intera a 3 cifre con zero-padding, così l'ordine alfabetico dei
-      layer coincide con quello angolare (senza padding `cone_5deg` finirebbe
-      dopo `cone_180deg`);
-    - il livello 0 è il raggio specchio, una direzione delta e non
-      un'integrazione su un cono: si chiama per quello che è.
+    - no dots: in EXR channel names the dot separates layer from channel, so
+      `cone_007.5deg.R` would be read as layer `cone_007`, sublayer `5deg`.
+      Fractional degrees therefore use `p` as the decimal separator;
+    - a zero-padded 3-digit integer part, so the alphabetical order of the layers
+      matches the angular one (without padding, `cone_5deg` would land after
+      `cone_180deg`);
+    - level 0 is the mirror ray, a delta direction and not an integral over a cone:
+      it is named for what it is.
     """
     if k == 0:
         return "cone_000_mirror"
@@ -1574,54 +1576,54 @@ def spec_cone_level_name(apertures_deg, k: int) -> str:
 
 
 def spec_cone_channels(apertures_deg) -> "dict[str, type]":
-    """Canali dell'EXR dei coni di una camera: L_j(r) per candidato + validità.
+    """Channels of a camera's cone EXR: L_j(r) per candidate, plus validity.
 
-    Un solo file per camera e non uno per apertura: nel bake condiviso il loop
-    esterno è sul tile, quindi i writer di tutte le camere restano aperti
-    contemporaneamente e K+1 file per camera farebbero 840 handle, oltre il
-    limite stdio di MSVC (512). I nomi dei livelli vengono da
-    spec_cone_level_name, così scrittura e lettura non possono divergere.
+    One file per camera rather than one per aperture: in the shared bake the outer
+    loop is over tiles, so the writers of every camera stay open simultaneously and
+    K+1 files per camera would make 840 handles, past the MSVC stdio limit (512).
+    Level names come from spec_cone_level_name, so writing and reading cannot
+    diverge.
 
-    `valid` è il numero totale di raggi validi del texel (quelli sopra
-    l'orizzonte, su tutti i livelli): >0 è la stessa maschera per-camera che il
-    bake per anelli scriveva in valid.png.
+    `valid` is the total number of valid rays of the texel (those above the
+    horizon, across all levels): >0 is the same per-camera mask the ring bake used
+    to write into valid.png.
 
-    Tutti i canali sono float32. I coni sono stati half fino al 2026-08-10, ma
-    half satura a 65504 e il livello specchio porta il valore dell'envmap non
-    mediato: vedi il commento nel corpo. Il formato su disco è comunque
-    trasparente al lettore, perché read_cones legge con PixelType.FLOAT.
+    Every channel is float32. The cones were half until 2026-08-10, but half
+    saturates at 65504 and the mirror level carries an unaveraged envmap value:
+    see the comment in the body. The on-disk format is transparent to the reader
+    anyway, because read_cones reads with PixelType.FLOAT.
     """
     ch: "dict[str, type]" = {}
     for k in range(len(apertures_deg)):
         name = spec_cone_level_name(apertures_deg, k)
         for c in "RGB":
-            # float32 e non half: il livello 0 è un CAMPIONE SINGOLO dell'envmap
-            # (raggio specchio, mai mediato), e su una scena notturna le sorgenti
-            # luminose sfondano il range di half. Sullo skybox NeRF di
-            # SwordShieldNight il canale R del nucleo della lampada più forte vale
-            # 80609 contro un limite di 65504: il cast scriveva inf, e un inf in un
-            # canale dei coni fa uscire il texel dal fit PBR per intero, perché
-            # np.argmin propaga il nan che ne deriva. Gli altri livelli sono medie
-            # su ≥9 raggi e avevano margine, ma non vale la pena avere due formati.
+            # float32 and not half: level 0 is a SINGLE envmap SAMPLE (the mirror
+            # ray, never averaged), and on a night scene the light sources overflow
+            # the half range. On the NeRF skybox of SwordShieldNight the R channel
+            # of the strongest lamp core is 80609 against a limit of 65504: the cast
+            # wrote inf, and one inf in a cone channel drops the texel out of the PBR
+            # fit entirely, because np.argmin propagates the resulting nan. The other
+            # levels are means over ≥9 rays and had margin, but two formats are not
+            # worth the trouble.
             ch[f"{name}.{c}"] = np.float32
     ch["valid"] = np.float32
     return ch
 
 
-# L_j(r) per ogni candidato, dalle somme e dai conteggi grezzi per anello:
-#     candidato 0 = raggio specchio (livello 0 puro)
-#     candidato k = media pura ad angolo solido sul cono troncato all'anello k,
-#                   L_k = Σ_{i≤k} W_i·somma_i / Σ_{i≤k} W_i·conteggio_i
-# Numeratore e denominatore sono cumulativi negli anelli, quindi tutti i
-# candidati escono da una sola cumsum. `weights` sono i W_i = Ω_i/N_i NON
-# troncati (ring_weights_mean con k = K-1): il troncamento lo fa la cumsum.
-# Si parte dalle somme e non dalle medie per anello perché il vecchio percorso
-# (bake → medie in half su disco → solver che ri-mediava) quantizzava un
-# passaggio intermedio che qui non esiste.
+# L_j(r) for every candidate, from the raw per-ring sums and counts:
+#     candidate 0 = mirror ray (pure level 0)
+#     candidate k = pure solid-angle mean over the cone truncated at ring k,
+#                   L_k = Σ_{i≤k} W_i·sum_i / Σ_{i≤k} W_i·count_i
+# Numerator and denominator are cumulative over the rings, so every candidate comes
+# out of a single cumsum. `weights` are the UNTRUNCATED W_i = Ω_i/N_i
+# (ring_weights_mean with k = K-1): the truncation is done by the cumsum.
+# It starts from the sums and not from the per-ring means because the old path
+# (bake → half means on disk → solver re-averaging) quantized an intermediate step
+# that does not exist here.
 
 def _cones_from_rings_np(ring_sum: np.ndarray, ring_valid: np.ndarray,
                          weights: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    """(N, K, 3), (N, K), (K-1,) → (N, K, 3). Vedi il commento sopra."""
+    """(N, K, 3), (N, K), (K-1,) → (N, K, 3). See the comment above."""
     num = np.cumsum(ring_sum[:, 1:] * weights[None, :, None], axis=1)
     den = np.cumsum(ring_valid[:, 1:] * weights[None, :], axis=1)
     mirror = ring_sum[:, :1] / np.maximum(ring_valid[:, :1, None], 1.0)
@@ -1629,7 +1631,7 @@ def _cones_from_rings_np(ring_sum: np.ndarray, ring_valid: np.ndarray,
 
 
 def _cones_from_rings_torch(ring_sum, ring_valid, weights, eps: float = 1e-12):
-    """(…, K, 3), (…, K), (K-1,) → (…, K, 3), tutto su device. Vedi sopra."""
+    """(…, K, 3), (…, K), (K-1,) → (…, K, 3), all on device. See above."""
     import torch
     num = torch.cumsum(ring_sum[..., 1:, :] * weights[:, None], dim=-2)
     den = torch.cumsum(ring_valid[..., 1:] * weights, dim=-1)
@@ -1638,12 +1640,12 @@ def _cones_from_rings_torch(ring_sum, ring_valid, weights, eps: float = 1e-12):
 
 
 def _tile_bar(total: int, desc: str):
-    """Barra di avanzamento per i loop sui tile dei bake spec_cone.
+    """Progress bar for the tile loops of the spec_cone bakes.
 
-    Un bake dura ore e i print periodici non dicono né quanto è passato né
-    quanto manca; tqdm dà ETA e percentuale in un solo posto. L'output passa dal
-    _Tee di _console_to_file, quindi console.log raccoglie anche i frame
-    intermedi: mininterval li tiene a uno ogni due secondi.
+    A bake takes hours, and periodic prints say neither how much has elapsed nor how
+    much is left; tqdm gives the ETA and the percentage in one place. The output goes
+    through the _Tee of _console_to_file, so console.log collects the intermediate
+    frames too: mininterval keeps them to one every two seconds.
     """
     from tqdm import tqdm
     return tqdm(total=total, unit="tile", desc=desc, mininterval=2.0,
@@ -1651,16 +1653,16 @@ def _tile_bar(total: int, desc: str):
 
 
 def _tile_bar_step(bar, rays_per_tile: int, n: int = 1) -> None:
-    """Avanza la barra di n tile aggiornando il throughput.
+    """Advance the bar by n tiles, updating the throughput.
 
-    Il throughput è in raggi/s e non in tile/s: un tile vale tile_size × S raggi
-    nello schema condiviso e tile_size × (1 + Σ N_i) in quello per-camera, quindi
-    i tile/s non sono confrontabili tra configurazioni mentre i raggi/s sì.
+    The throughput is in rays/s and not tiles/s: a tile is tile_size × S rays in the
+    shared scheme and tile_size × (1 + Σ N_i) in the per-camera one, so tiles/s are
+    not comparable across configurations while rays/s are.
     """
     bar.update(n)
     elapsed = bar.format_dict["elapsed"]
     if elapsed > 0:
-        bar.set_postfix_str(f"{rays_per_tile * bar.n / elapsed / 1e6:.1f} Mraggi/s",
+        bar.set_postfix_str(f"{rays_per_tile * bar.n / elapsed / 1e6:.1f} Mrays/s",
                             refresh=False)
 
 
@@ -1670,25 +1672,25 @@ def _precompute_spec_cone(
     model,              # OptixProgrammablePasses.TriangleMesh
     ium_w: int,
     ium_h: int,
-    frames,             # tf.frames (per le posizioni camera)
+    frames,             # tf.frames (for the camera positions)
     visibility_map: np.ndarray,   # flat (num_pix * n_cams) uint8
     n_cams: int,
     skybox_flat: "np.ndarray | None",
     sky_size: list[int],
     out_dir: Path,
 ) -> None:
-    """Precompute per-anello per il fit PBR  C_j = (a·x/π)·E + (1-x)·L_j  (pbr_solver.py).
+    """Per-ring precompute for the PBR fit  C_j = (a·x/π)·E + (1-x)·L_j  (pbr_solver.py).
 
-    Campionamento ad anelli concentrici attorno al raggio riflesso
-    R_j = reflect(v_j, n) (deviceProgramsSpecCone.cu): ogni raggio è tracciato e
-    interrogato sul NeRF una volta sola. Gli anelli restano il modo in cui si
-    accumula, ma il bake CHIUDE i coni prima di scrivere: su disco va la media
-    pura ad angolo solido L_j(r) di ogni candidato (livello 0 = raggio specchio),
-    cioè esattamente la grandezza che il solver mette in regressione.
-    Miss → envmap (su GPU), hit → NeRF.
+    Sampling on concentric rings around the reflected ray R_j = reflect(v_j, n)
+    (deviceProgramsSpecCone.cu): every ray is traced and queried on the NeRF exactly
+    once. The rings remain how the accumulation happens, but the bake CLOSES the
+    cones before writing: what goes to disk is the pure solid-angle mean L_j(r) of
+    every candidate (level 0 = mirror ray), which is exactly the quantity the solver
+    puts into the regression.
+    Miss → envmap (on the GPU), hit → NeRF.
 
-    Output in out_dir: cam_{j:03d}.exr con un canale RGB per livello, chiamato
-    con la sua apertura (cone_000_mirror, cone_005deg, …), più valid, e
+    Output in out_dir: cam_{j:03d}.exr with one RGB channel group per level, named
+    after its aperture (cone_000_mirror, cone_005deg, …), plus valid, and
     spec_cone_meta.json (format "cones", scheme "per_camera").
     """
     import sys
@@ -1703,10 +1705,10 @@ def _precompute_spec_cone(
     if cfg.indirect_override_depth_window:
         nerf_cfg.depth_window     = cfg.indirect_depth_window
         nerf_cfg.depth_window_end = cfg.indirect_depth_window_end
-    print(f"✓ NeRF model caricato da: {cache_path}")
+    print(f"✓ NeRF model loaded from: {cache_path}")
 
     apertures = [float(a) for a in cfg.spec_cone_apertures_deg]
-    K = len(apertures)                  # livelli: 0 = specchio, 1..K-1 = coni
+    K = len(apertures)                  # levels: 0 = mirror, 1..K-1 = cones
 
     ring_samples = spec_cone_ring_samples(
         apertures, cfg.spec_cone_samples_per_ring,
@@ -1715,13 +1717,13 @@ def _precompute_spec_cone(
         floor=cfg.spec_cone_samples_floor)
     rays_per_texel = 1 + sum(ring_samples)
     rays_per_tile  = rays_per_texel * cfg.spec_cone_tile_size
-    print(f"    campioni/anello {ring_samples} → {rays_per_texel} raggi/texel, "
-          f"{rays_per_tile:,} raggi/tile "
+    print(f"    samples/ring {ring_samples} → {rays_per_texel} rays/texel, "
+          f"{rays_per_tile:,} rays/tile "
           f"(~{rays_per_tile * 24 / 2**20:.0f} MB device, "
           f"~{rays_per_tile * 84 / 2**20:.0f} MB RAM)")
     if rays_per_tile > 4_000_000:
         suggested = max(256, (4_000_000 // rays_per_texel) // 256 * 256)
-        print(f"    ⚠  raggi/tile elevato: valutare spec_cone_tile_size={suggested}")
+        print(f"    ⚠  high rays/tile: consider spec_cone_tile_size={suggested}")
 
     gen = optix.SpecConeGenerator()
     gen.set_traversable(model)
@@ -1730,13 +1732,13 @@ def _precompute_spec_cone(
         gen.set_envmap(skybox_flat.astype(np.float32), sky_size,
                        cfg.skybox_yaw_degrees)
     else:
-        print("    ⚠  spec_cone senza skybox: i raggi miss contribuiscono 0")
+        print("    ⚠  spec_cone without a skybox: missed rays contribute 0")
 
     num_pix = gen.num_pixels()
     n_tiles = gen.num_tiles()
     tile_sz = cfg.spec_cone_tile_size
 
-    # Bordi degli anelli: coseni delle semi-aperture (nel meta, per il solver)
+    # Ring edges: cosines of the half-apertures (stored in the meta, for the solver)
     cos_b = np.cos(np.radians(np.asarray(apertures)) * 0.5)
 
     ium_positions_np = ium_res.positions_np.astype(np.float32)
@@ -1749,14 +1751,14 @@ def _precompute_spec_cone(
                    else list(range(len(frames))))
 
     os.makedirs(out_dir, exist_ok=True)
-    # I coni sono HDR multicanale e vengono scritti con IncrementalExrWriter:
-    # spec_cone_format resta solo come estensione dichiarata nel meta.
+    # The cones are multi-channel HDR and are written with IncrementalExrWriter:
+    # spec_cone_format survives only as the extension declared in the meta.
     fmt = ImageFormat.OPENEXR
 
-    # Le camere già su disco vengono saltate, ma il meta è riscritto sempre:
-    # con un campionamento diverso si otterrebbero EXR vecchi descritti da
-    # ring_samples nuovi, cioè coni normalizzati per N diversi da quelli con cui
-    # sono stati chiusi, senza alcun segnale. Meglio fermarsi.
+    # Cameras already on disk are skipped, but the meta is always rewritten: with a
+    # different sampling one would get old EXRs described by new ring_samples, i.e.
+    # cones normalised by different N from the ones they were closed with, with no
+    # signal at all. Better to stop.
     meta_path = out_dir / "spec_cone_meta.json"
     if meta_path.exists():
         with open(meta_path, encoding="utf-8") as fh:
@@ -1766,36 +1768,36 @@ def _precompute_spec_cone(
         if (old_meta.get("format") != "cones" or old_ap != apertures
                 or (old_rs is not None and list(old_rs) != ring_samples)):
             raise RuntimeError(
-                f"spec_cone: {out_dir} contiene un bake incompatibile\n"
-                f"    su disco:  format={old_meta.get('format')}, "
-                f"aperture={old_ap}, ring_samples={old_rs}\n"
-                f"    richiesto: format=cones, aperture={apertures}, "
+                f"spec_cone: {out_dir} holds an incompatible bake\n"
+                f"    on disk:   format={old_meta.get('format')}, "
+                f"apertures={old_ap}, ring_samples={old_rs}\n"
+                f"    requested: format=cones, apertures={apertures}, "
                 f"ring_samples={ring_samples}\n"
-                f"  Cancellare la cartella spec_cone/ oppure ripristinare la "
-                f"configurazione precedente. I bake in formato 'rings'/"
-                f"'rings_shared' (medie per anello) non sono più leggibili: da "
-                f"quando il bake scrive direttamente i coni il solver non li "
-                f"ricostruisce più, vanno rifatti.")
+                f"  Delete the spec_cone/ folder, or restore the previous "
+                f"configuration. Bakes in the 'rings'/'rings_shared' formats "
+                f"(per-ring means) are no longer readable: ever since the bake "
+                f"writes the cones directly, the solver no longer reconstructs "
+                f"them, so they have to be redone.")
 
     def _cam_path(j: int) -> Path:
         return out_dir / f"cam_{j:03d}{fmt.extension}"
 
-    # Pesi Ω_i/N_i non troncati: il troncamento a ogni candidato lo fa la cumsum
-    # dentro _cones_from_rings_np. Qui gli N_i sono quelli davvero lanciati e in
-    # generale non uniformi, quindi il fattore 1/N_i conta.
+    # Untruncated Ω_i/N_i weights: the truncation at each candidate is done by the
+    # cumsum inside _cones_from_rings_np. Here the N_i are the ones actually launched
+    # and generally non-uniform, so the 1/N_i factor matters.
     cone_w = ring_weights_mean(cos_b, K - 1, np.asarray(ring_samples, dtype=np.float64))
 
-    # Una sola barra su camere × tile: una barra per camera si riaprirebbe 60
-    # volte senza mai dare un ETA sull'intero bake. Le camere già su disco
-    # restano fuori dal totale, altrimenti l'ETA iniziale conterebbe lavoro che
-    # non verrà mai fatto.
+    # A single bar over cameras × tiles: one bar per camera would reopen 60 times
+    # without ever giving an ETA for the whole bake. Cameras already on disk stay
+    # out of the total, otherwise the initial ETA would count work that will never
+    # be done.
     pending = [j for j in cam_indices if not _cam_path(j).exists()]
     bar = _tile_bar(len(pending) * n_tiles, "spec_cone")
 
     for j in cam_indices:
         cam_path = _cam_path(j)
         if j not in pending:
-            print(f"    cam {j}: già su disco, skip")
+            print(f"    cam {j}: already on disk, skipped")
             continue
         bar.set_description(f"spec_cone cam {j}", refresh=False)
 
@@ -1806,16 +1808,16 @@ def _precompute_spec_cone(
         ring_sum = np.zeros((num_pix, K, 3), dtype=np.float64)
         valid    = np.zeros((num_pix, K),    dtype=np.int64)
 
-        # Texel su cui questa camera produce qualcosa: il kernel esce sia sulla
-        # maschera IUM sia sulla visibility (deviceProgramsSpecCone.cu:107-109).
+        # Texels this camera produces anything for: the kernel returns early on both
+        # the IUM mask and the visibility (deviceProgramsSpecCone.cu:107-109).
         active = ium_mask_flat & (vis2d[:, j] > 0)
 
         for tile_idx in range(n_tiles):
             off = tile_idx * tile_sz
-            # Tile senza texel attivi: il kernel esce su ogni thread e
-            # renderTile azzera sky_sum/valid_count a ogni lancio
-            # (SpecCone_Generator.cpp:336), quindi lasciare ring_sum/valid a
-            # zero è identico a lanciarlo.
+            # Tiles with no active texel: the kernel returns early on every thread and
+            # renderTile zeroes sky_sum/valid_count at every launch
+            # (SpecCone_Generator.cpp:336), so leaving ring_sum/valid at zero is
+            # identical to launching it.
             if not active[off:off + tile_sz].any():
                 _tile_bar_step(bar, rays_per_tile)
                 continue
@@ -1823,10 +1825,10 @@ def _precompute_spec_cone(
             tile_res = gen.render_tile(tile_idx)
             if tile_res.overflow:
                 raise RuntimeError(
-                    f"spec_cone cam {j} tile {tile_idx}: overflow del buffer "
-                    f"compatto ({tile_res.requested} raggi richiesti). La "
-                    f"capacità è il worst case esatto, quindi il bake sarebbe "
-                    f"incompleto: interrotto invece di salvare medie parziali.")
+                    f"spec_cone cam {j} tile {tile_idx}: compact buffer overflow "
+                    f"({tile_res.requested} rays requested). The capacity is the "
+                    f"exact worst case, so the bake would be incomplete: aborted "
+                    f"instead of saving partial means.")
             tt  = tile_res.tile_texels
             ring_sum[off:off + tt] += tile_res.sky_sum_np.astype(np.float64)
             valid[off:off + tt]    += tile_res.valid_count_np
@@ -1843,8 +1845,8 @@ def _precompute_spec_cone(
                 colors = query_radiance(model_bundle, origins_np, dirs_np,
                                         nerf_cfg, t_hits_np=t_hit_np)
                 colors = np.asarray(colors, dtype=np.float64)
-                # accumulo via bincount locale al tile (np.add.at è unbuffered
-                # e molto più lento su milioni di indici)
+                # accumulate via a tile-local bincount (np.add.at is unbuffered and
+                # far slower on millions of indices)
                 flat_idx = local_idx.astype(np.int64) * K + ring_idx
                 n_bins   = tt * K
                 tile_acc = ring_sum[off:off + tt].reshape(n_bins, 3)
@@ -1854,7 +1856,7 @@ def _precompute_spec_cone(
 
             _tile_bar_step(bar, rays_per_tile)
 
-        # Chiusura dei coni: L_j(r) per candidato, 0 dove nessun campione
+        # Close the cones: L_j(r) per candidate, 0 where there was no sample
         valid_f = valid.astype(np.float64)
         cones = _cones_from_rings_np(ring_sum, valid_f, cone_w).astype(np.float32)
         n_valid = valid_f.sum(axis=1)
@@ -1870,7 +1872,7 @@ def _precompute_spec_cone(
                                                          ium_w, ium_h)
             block["valid"] = _reshape_flat(n_valid.astype(np.float32), ium_w, ium_h)
             wr.write_block(block)
-        print(f"    ✓ cam {j}: {K} coni salvati in {cam_path.name}")
+        print(f"    ✓ cam {j}: {K} cones saved to {cam_path.name}")
 
     bar.close()
 
@@ -1879,9 +1881,9 @@ def _precompute_spec_cone(
         "scheme": "per_camera",
         "apertures_deg": apertures,
         "ring_edges_cos": [float(c) for c in cos_b],
-        # samples_per_ring resta uno scalare informativo per i lettori storici;
-        # ring_samples sono gli N_i con cui il bake ha pesato gli anelli (Ω_i/N_i)
-        # nel chiudere i coni: documentazione del bake, non un input del solver.
+        # samples_per_ring stays an informational scalar for historical readers;
+        # ring_samples are the N_i the bake weighted the rings with (Ω_i/N_i) when
+        # closing the cones: documentation of the bake, not an input of the solver.
         "samples_per_ring": int(ring_samples[0]) if len(set(ring_samples)) == 1
                             else int(max(ring_samples)),
         "ring_samples": [int(x) for x in ring_samples],
@@ -1894,11 +1896,11 @@ def _precompute_spec_cone(
     }
     with open(out_dir / "spec_cone_meta.json", "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2)
-    print(f"✓ spec_cone meta salvato: {out_dir / 'spec_cone_meta.json'}")
+    print(f"✓ spec_cone meta saved: {out_dir / 'spec_cone_meta.json'}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Bake spec_cone a campionamento CONDIVISO tra camere
+# spec_cone bake with sampling SHARED between cameras
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _precompute_spec_cone_shared(
@@ -1907,30 +1909,30 @@ def _precompute_spec_cone_shared(
     model,              # OptixProgrammablePasses.TriangleMesh
     ium_w: int,
     ium_h: int,
-    frames,             # tf.frames (per le posizioni camera)
+    frames,             # tf.frames (for the camera positions)
     visibility_map: np.ndarray,   # flat (num_pix * n_cams) uint8
     n_cams: int,
     skybox_flat: "np.ndarray | None",
     sky_size: list[int],
     out_dir: Path,
 ) -> None:
-    """Variante di _precompute_spec_cone con i raggi condivisi tra tutte le camere.
+    """Variant of _precompute_spec_cone with the rays shared between all cameras.
 
-    La radianza incidente lungo una direzione non dipende dalla camera, quindi un
-    unico set Fibonacci per texel (uniforme in angolo solido sull'emisfero sopra n)
-    serve tutte le camere che vedono quel texel: ogni raggio è tracciato e
-    interrogato sul NeRF UNA volta, e ogni camera lo classifica nel proprio anello
-    in base all'angolo con il suo R_j. Costo per texel `S + m` invece di `m · Σ N_i`
-    (m = camere che vedono il texel).
+    The incident radiance along a direction does not depend on the camera, so a
+    single Fibonacci set per texel (uniform in solid angle over the hemisphere above
+    n) serves every camera that sees that texel: each ray is traced and queried on
+    the NeRF ONCE, and every camera bins it into its own ring by the angle to its
+    R_j. Cost per texel is `S + m` instead of `m · Σ N_i` (m = cameras that see the
+    texel).
 
-    Il livello 0 (specchio) resta per-camera: è una direzione delta, non
-    condivisibile, e si ottiene dalla seconda passata del kernel.
+    Level 0 (the mirror) stays per camera: it is a delta direction, not shareable,
+    and comes from the kernel's second pass.
 
-    Uscite in out_dir: cam_{j:03d}.exr con un canale RGB per livello, chiamato
-    con la sua apertura (cone_000_mirror, cone_005deg, …), che contiene la
-    radianza media sul cono, cioè direttamente la L_j(r) che il solver mette in
-    regressione, più valid (raggi validi totali del texel); scritti in streaming
-    per blocchi di scanline, e spec_cone_meta.json con format "cones".
+    Outputs in out_dir: cam_{j:03d}.exr with one RGB channel group per level, named
+    after its aperture (cone_000_mirror, cone_005deg, …), holding the mean radiance
+    over the cone, i.e. directly the L_j(r) the solver puts into the regression, plus
+    valid (total valid rays of the texel); written streaming, in scanline blocks,
+    plus spec_cone_meta.json with format "cones".
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
@@ -1946,10 +1948,10 @@ def _precompute_spec_cone_shared(
         nerf_cfg.depth_window_end = cfg.indirect_depth_window_end
     if cfg.spec_cone_nerf_chunk:
         nerf_cfg.chunk = int(cfg.spec_cone_nerf_chunk)
-    print(f"✓ NeRF model caricato da: {cache_path} (query chunk {nerf_cfg.chunk})")
+    print(f"✓ NeRF model loaded from: {cache_path} (query chunk {nerf_cfg.chunk})")
 
     apertures = [float(a) for a in cfg.spec_cone_apertures_deg]
-    K = len(apertures)                       # livelli: 0 = specchio, 1..K-1 = anelli
+    K = len(apertures)                       # levels: 0 = mirror, 1..K-1 = rings
     S = int(cfg.spec_cone_shared_samples)
     cos_b = np.cos(np.radians(np.asarray(apertures)) * 0.5)
     ring_nominal = spec_cone_shared_ring_samples(apertures, S)
@@ -1958,9 +1960,9 @@ def _precompute_spec_cone_shared(
     tile_sz  = int(cfg.spec_cone_tile_size)
     if tile_sz % ium_w != 0:
         raise ValueError(
-            f"spec_cone_tile_size={tile_sz} deve essere multiplo della larghezza IUM "
-            f"({ium_w}): il bake condiviso scrive gli EXR in streaming e ogni tile "
-            f"deve coprire un numero intero di scanline.")
+            f"spec_cone_tile_size={tile_sz} must be a multiple of the IUM width "
+            f"({ium_w}): the shared bake streams the EXRs, so every tile has to "
+            f"cover a whole number of scanlines.")
     chunk_texels = max(1, int(cfg.spec_cone_chunk_texels))
 
     vis2d = np.asarray(visibility_map, dtype=np.uint8).reshape(num_pix, n_cams)
@@ -1968,39 +1970,39 @@ def _precompute_spec_cone_shared(
                    else list(range(len(frames))))
     n_sel = len(cam_indices)
 
-    # ── Diagnostica m: quante camere vedono in media un texel ────────────────
-    # È il numero che decide il costo relativo al bake per-camera: quello spende
-    # m·Σ N_i raggi per texel, questo S + m.
+    # ── Diagnostic m: how many cameras see a texel on average ────────────────
+    # This is the number that decides the cost relative to the per-camera bake: that
+    # one spends m·Σ N_i rays per texel, this one S + m.
     ium_mask = np.asarray(ium_res.masks_np).reshape(num_pix) > 0
     if ium_mask.any():
         m_per_texel = vis2d[np.ix_(ium_mask, cam_indices)].sum(axis=1)
         m_mean = float(m_per_texel.mean())
-        print(f"    m (camere per texel): media {m_mean:.1f}, mediana "
+        print(f"    m (cameras per texel): mean {m_mean:.1f}, median "
               f"{np.median(m_per_texel):.0f}, p10 {np.percentile(m_per_texel, 10):.0f}, "
               f"p90 {np.percentile(m_per_texel, 90):.0f}")
         try:
-            # confronto informativo col bake per-camera; i suoi parametri possono
-            # essere incoerenti con questa griglia (non sono usati da questo schema),
-            # e una diagnostica non deve far fallire il bake
+            # informational comparison with the per-camera bake; its parameters may be
+            # inconsistent with this grid (this scheme does not use them), and a
+            # diagnostic must not make the bake fail
             per_cam_rays = 1 + sum(spec_cone_ring_samples(
                 apertures, cfg.spec_cone_samples_per_ring,
                 alloc=cfg.spec_cone_sample_alloc,
                 budget=cfg.spec_cone_samples_budget,
                 floor=cfg.spec_cone_samples_floor))
-            print(f"    costo atteso vs per-camera: {m_mean * per_cam_rays:.0f} → "
-                  f"{S + m_mean:.0f} raggi/texel "
+            print(f"    expected cost vs per-camera: {m_mean * per_cam_rays:.0f} → "
+                  f"{S + m_mean:.0f} rays/texel "
                   f"({m_mean * per_cam_rays / max(S + m_mean, 1.0):.2f}×)")
         except ValueError:
-            print(f"    costo atteso: {S + m_mean:.0f} raggi/texel")
+            print(f"    expected cost: {S + m_mean:.0f} rays/texel")
 
-    # Campioni attesi per candidato: dice quali aperture sono al limite del rumore
+    # Expected samples per candidate: tells which apertures are at the noise limit
     cum = [f"{apertures[k]:g}°:{S * (1.0 - cos_b[k]):.0f}" for k in range(1, K)]
-    print(f"    S={S} raggi/texel condivisi, campioni per candidato → {', '.join(cum)}")
+    print(f"    S={S} shared rays/texel, samples per candidate → {', '.join(cum)}")
 
-    # ── Guardia sul ri-bake incoerente ───────────────────────────────────────
-    # Come nel bake per-camera: il meta viene riscritto sempre, quindi un bake su
-    # disco con parametri diversi risulterebbe descritto da un meta nuovo e il
-    # solver normalizzerebbe per N sbagliati senza alcun segnale.
+    # ── Guard against an inconsistent re-bake ────────────────────────────────
+    # As in the per-camera bake: the meta is always rewritten, so a bake on disk with
+    # different parameters would end up described by a new meta and the solver would
+    # normalise by the wrong N with no signal at all.
     meta_path = out_dir / "spec_cone_meta.json"
     cam_paths = {j: out_dir / f"cam_{j:03d}{ImageFormat.OPENEXR.extension}"
                  for j in cam_indices}
@@ -2013,20 +2015,20 @@ def _precompute_spec_cone_shared(
                 and old_meta.get("shared_samples") == S)
         if not same:
             raise RuntimeError(
-                f"spec_cone: {out_dir} contiene un bake incompatibile\n"
-                f"    su disco:  format={old_meta.get('format')}, "
+                f"spec_cone: {out_dir} holds an incompatible bake\n"
+                f"    on disk:   format={old_meta.get('format')}, "
                 f"scheme={old_meta.get('scheme')}, "
-                f"aperture={old_meta.get('apertures_deg')}, "
+                f"apertures={old_meta.get('apertures_deg')}, "
                 f"S={old_meta.get('shared_samples')}\n"
-                f"    richiesto: format=cones, scheme=shared, "
-                f"aperture={apertures}, S={S}\n"
-                f"  Cancellare la cartella spec_cone/ oppure ripristinare la "
-                f"configurazione precedente. I bake in formato 'rings'/"
-                f"'rings_shared' (medie per anello) non sono più leggibili: da "
-                f"quando il bake scrive direttamente i coni il solver non li "
-                f"ricostruisce più, vanno rifatti.")
+                f"    requested: format=cones, scheme=shared, "
+                f"apertures={apertures}, S={S}\n"
+                f"  Delete the spec_cone/ folder, or restore the previous "
+                f"configuration. Bakes in the 'rings'/'rings_shared' formats "
+                f"(per-ring means) are no longer readable: ever since the bake "
+                f"writes the cones directly, the solver no longer reconstructs "
+                f"them, so they have to be redone.")
         if all(p.exists() for p in cam_paths.values()):
-            print(f"    tutte le {n_sel} camere già su disco, skip")
+            print(f"    all {n_sel} cameras already on disk, skipped")
             return
 
     # ── Setup OptiX ──────────────────────────────────────────────────────────
@@ -2041,18 +2043,18 @@ def _precompute_spec_cone_shared(
     gen.set_cameras(cam_pos_list)
 
     if gen.num_pixels() != num_pix:
-        raise RuntimeError(f"spec_cone: IUM ha {gen.num_pixels()} texel, attesi "
-                           f"{num_pix} da ium_texture_size {ium_w}×{ium_h}")
+        raise RuntimeError(f"spec_cone: the IUM has {gen.num_pixels()} texels, "
+                           f"expected {num_pix} from ium_texture_size {ium_w}×{ium_h}")
 
     n_tiles = gen.num_tiles()
     rays_per_tile = tile_sz * S
-    print(f"    tile={tile_sz} texel ({tile_sz // ium_w} scanline), {n_tiles} tile, "
-          f"{rays_per_tile:,} raggi/tile (~{rays_per_tile * 4 / 2**20:.0f} MB t_hit), "
-          f"chunk torch={chunk_texels} texel "
-          f"(~{chunk_texels * S * 24 / 2**20:.0f} MB VRAM per dirs+radianze)")
+    print(f"    tile={tile_sz} texels ({tile_sz // ium_w} scanlines), {n_tiles} tiles, "
+          f"{rays_per_tile:,} rays/tile (~{rays_per_tile * 4 / 2**20:.0f} MB t_hit), "
+          f"torch chunk={chunk_texels} texels "
+          f"(~{chunk_texels * S * 24 / 2**20:.0f} MB VRAM for dirs+radiances)")
 
     if skybox_flat is None:
-        print("    ⚠  spec_cone senza skybox: i raggi miss contribuiscono 0")
+        print("    ⚠  spec_cone without a skybox: missed rays contribute 0")
         envmap_t = None
     else:
         envmap_t = torch.as_tensor(np.ascontiguousarray(skybox_flat, dtype=np.float32),
@@ -2064,18 +2066,18 @@ def _precompute_spec_cone_shared(
     eps = 1e-4
 
     cos_edges_t = torch.as_tensor(cos_b, device=device, dtype=torch.float32)
-    asc_edges   = -cos_edges_t                       # crescente, per searchsorted
+    asc_edges   = -cos_edges_t                       # increasing, for searchsorted
     cam_pos_t   = torch.as_tensor(np.asarray(cam_pos_list, dtype=np.float32), device=device)
     vis_sel     = np.ascontiguousarray(vis2d[:, cam_indices])       # (num_pix, n_sel)
 
-    # Pesi Ω_i/N_i non troncati: il troncamento a ogni candidato lo fa la cumsum
-    # dentro _cones_from_rings_torch. Nel bake condiviso gli N_i nominali rendono
-    # W_i costante, quindi la formula collassa sulla media cumulativa semplice.
+    # Untruncated Ω_i/N_i weights: the truncation at each candidate is done by the
+    # cumsum inside _cones_from_rings_torch. In the shared bake the nominal N_i make
+    # W_i constant, so the formula collapses onto the plain cumulative mean.
     cone_w_t = torch.as_tensor(
         ring_weights_mean(cos_b, K - 1, np.asarray(ring_nominal)),
         device=device, dtype=torch.float32)
 
-    # ── Writer in streaming, uno per camera ──────────────────────────────────
+    # ── Streaming writers, one per camera ────────────────────────────────────
     os.makedirs(out_dir, exist_ok=True)
     channels = spec_cone_channels(apertures)
     level_names = [spec_cone_level_name(apertures, k) for k in range(K)]
@@ -2089,12 +2091,12 @@ def _precompute_spec_cone_shared(
         for tile_idx in range(n_tiles):
             off = tile_idx * tile_sz
 
-            # Tile senza texel attivi: niente raggi da tracciare né da interrogare
-            # sul NeRF, ma il blocco di scanline va comunque scritto perché
-            # IncrementalExrWriter è in streaming e le righe devono restare in
-            # ordine. Gli zeri sono esattamente ciò che produce il percorso
-            # completo: texel_ok falso → sums/counts a zero → _cones_from_rings_torch
-            # restituisce 0, e valid è la somma dei counts.
+            # Tiles with no active texel: no rays to trace or query on the NeRF, but
+            # the scanline block still has to be written, because IncrementalExrWriter
+            # streams and the rows must stay in order. The zeros are exactly what the
+            # full path produces: texel_ok false → sums/counts at zero →
+            # _cones_from_rings_torch returns 0, and valid is the sum of the counts.
+            #
             if not ium_mask[off:off + tile_sz].any():
                 rows_out = min(tile_sz, num_pix - off) // ium_w
                 zeros = np.zeros((rows_out, ium_w), dtype=np.float32)
@@ -2134,7 +2136,7 @@ def _precompute_spec_cone_shared(
                                             yaw_u, model_bundle, nerf_cfg,
                                             query_radiance)               # (M, S, 3)
 
-                # Raggi specchio: R_j per camera, radianza con la stessa logica
+                # Mirror rays: R_j per camera, radiance through the same logic
                 v = cam_pos_t[None, :, :] - pos[:, None, :]               # (M, n_sel, 3)
                 v = v / torch.clamp(torch.linalg.norm(v, dim=-1, keepdim=True), min=1e-8)
                 nv = (n_unit[:, None, :] * v).sum(-1, keepdim=True)
@@ -2152,14 +2154,14 @@ def _precompute_spec_cone_shared(
                     if sel.numel() == 0:
                         continue
 
-                    # Anelli 1..K-1 dai raggi condivisi. I campioni oltre il cono
-                    # più largo finiscono nel bin K, che viene poi scartato: così
-                    # si evita una gather booleana su M·S elementi.
+                    # Rings 1..K-1 from the shared rays. Samples beyond the widest cone
+                    # land in bin K, which is discarded afterwards: that avoids a
+                    # boolean gather over M·S elements.
                     m_sel  = sel.numel()
                     cosang = (dirs[sel] * R[sel, jj][:, None, :]).sum(-1)      # (m, S)
-                    # clamp a [1, K]: 0 è il livello specchio (mai raggiungibile
-                    # dai condivisi, ma cosang può sforare 1 per arrotondamento),
-                    # K è il bin di scarto per i campioni fuori dal cono più largo.
+                    # clamp to [1, K]: 0 is the mirror level (never reachable from the
+                    # shared set, though cosang can exceed 1 by rounding), and K is the
+                    # discard bin for samples outside the widest cone.
                     ring = torch.searchsorted(asc_edges, -cosang.contiguous(),
                                               right=True).clamp_(min=1, max=K)
                     flat = (torch.arange(m_sel, device=device)[:, None] * (K + 1)
@@ -2174,7 +2176,7 @@ def _precompute_spec_cone_shared(
                     sums[jj].index_add_(0, tgt, acc_s.view(m_sel, K + 1, 3)[:, :K])
                     counts[jj].index_add_(0, tgt, acc_c.view(m_sel, K + 1)[:, :K])
 
-                    # Livello 0: raggio specchio (t_hit < 0 = camera dietro la superficie)
+                    # Level 0: mirror ray (t_hit < 0 = camera behind the surface)
                     mir_ok = sel[thm[sel, jj] >= 0.0]
                     if mir_ok.numel() > 0:
                         lvl0 = torch.zeros((mir_ok.numel(), K, 3), device=device)
@@ -2184,9 +2186,9 @@ def _precompute_spec_cone_shared(
                         sums[jj].index_add_(0, mir_ok + c0, lvl0)
                         counts[jj].index_add_(0, mir_ok + c0, cnt0)
 
-            # ── Scrittura del blocco di scanline, una camera alla volta ──────
-            # I coni si chiudono qui, sulla GPU e dalle somme grezze: su disco va
-            # già L_j(r), la grandezza che il solver mette in regressione.
+            # ── Write the scanline block, one camera at a time ───────────────
+            # The cones are closed here, on the GPU and from the raw sums: what goes
+            # to disk is already L_j(r), the quantity the solver regresses on.
             rows_out = tt // ium_w
             for jj, j in enumerate(cam_indices):
                 cnt = counts[jj]
@@ -2204,15 +2206,15 @@ def _precompute_spec_cone_shared(
 
         bar.close()
         if n_skipped:
-            print(f"    {n_skipped}/{n_tiles} tile saltati (nessun texel attivo), "
-                  f"scritti come zeri")
+            print(f"    {n_skipped}/{n_tiles} tiles skipped (no active texel), "
+                  f"written as zeros")
         for wr in writers.values():
             wr.close()
     except BaseException:
         bar.close()
-        # Un EXR troncato ha comunque un header valido: se restasse su disco, un
-        # rerun con lo stesso meta lo scambierebbe per un bake completo e lo
-        # salterebbe. Meglio cancellarlo.
+        # A truncated EXR still has a valid header: were it left on disk, a rerun with
+        # the same meta would mistake it for a finished bake and skip it. Better to
+        # delete it.
         for wr in writers.values():
             wr._file = None
         for p in cam_paths.values():
@@ -2225,9 +2227,9 @@ def _precompute_spec_cone_shared(
         "apertures_deg": apertures,
         "ring_edges_cos": [float(c) for c in cos_b],
         "shared_samples": S,
-        # Conteggi NOMINALI N_i = S·Ω_i/2π usati per i pesi W_i = Ω_i/N_i del
-        # bake: qui sono costanti, quindi il cono è la media cumulativa semplice.
-        # Ormai è documentazione del bake, non un input del solver.
+        # NOMINAL counts N_i = S·Ω_i/2π used for the bake's W_i = Ω_i/N_i weights:
+        # here they are constant, so the cone is the plain cumulative mean.
+        # By now this is documentation of the bake, not an input of the solver.
         "ring_samples": ring_nominal,
         "samples_total_per_texel": int(S + 1),
         "sample_alloc": "shared_fibonacci",
@@ -2238,16 +2240,16 @@ def _precompute_spec_cone_shared(
     }
     with open(meta_path, "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2)
-    print(f"✓ spec_cone meta salvato: {meta_path}")
+    print(f"✓ spec_cone meta saved: {meta_path}")
 
 
 def _shared_ray_radiance(dirs, t_hit, origin, envmap_t, sky_size, yaw_u,
                          model_bundle, nerf_cfg, query_radiance):
-    """Radianza incidente per raggio: envmap sui miss, NeRF sugli hit.
+    """Incident radiance per ray: envmap on misses, NeRF on hits.
 
-    dirs (M, R, 3), t_hit (M, R) con >0 hit, =0 miss, <0 raggio non lanciato;
-    origin (M, 3) è l'origine comune ai raggi dello stesso texel.
-    Restituisce (M, R, 3) sul device (zero dove il raggio non è stato lanciato).
+    dirs (M, R, 3), t_hit (M, R) with >0 hit, =0 miss, <0 ray not launched;
+    origin (M, 3) is the origin shared by the rays of the same texel.
+    Returns (M, R, 3) on the device (zero where the ray was not launched).
     """
     import torch
     rad = torch.zeros(dirs.shape, device=dirs.device, dtype=torch.float32)
@@ -2265,7 +2267,7 @@ def _shared_ray_radiance(dirs, t_hit, origin, envmap_t, sky_size, yaw_u,
 
 
 def _find_nerf_pred_dir(base_root: Path, iter_sel: int) -> "Path | None":
-    """Restituisce la sottocartella iter_* con l'iterazione richiesta (o la massima)."""
+    """Return the iter_* subfolder for the requested iteration (or the highest one)."""
     if not base_root.is_dir():
         return None
     candidates = {}
@@ -2296,17 +2298,17 @@ def _build_optix_frames_for_source(
     json_dir: Path,
     optix_mod,
 ) -> list:
-    """Costruisce la lista di optix_mod.Frame usando le immagini della sorgente indicata.
+    """Build the list of optix_mod.Frame using the images of the given source.
 
     Args:
-        source: "gt" (immagini originali) | "nerf" (pred EXR dallo Step 2b).
-        tf: oggetto transforms caricato (tf.frames).
-        all_cameras: lista di optix_mod.Camera, una per frame.
-        intr: intrinseche (intr.w, intr.h).
-        rc: RenderConfig corrente.
-        cfg: PipelineConfig corrente (per nerf_render_train_images_dir).
-        json_dir: cartella base del run (Path).
-        optix_mod: modulo OptixProgrammablePasses importato.
+        source: "gt" (original images) | "nerf" (predicted EXRs from Step 2b).
+        tf: the loaded transforms object (tf.frames).
+        all_cameras: list of optix_mod.Camera, one per frame.
+        intr: intrinsics (intr.w, intr.h).
+        rc: the current RenderConfig.
+        cfg: the current PipelineConfig (for nerf_render_train_images_dir).
+        json_dir: base folder of the run (Path).
+        optix_mod: the imported OptixProgrammablePasses module.
     """
     nerf_pred_dir = None
     if source == "nerf":
@@ -2314,9 +2316,9 @@ def _build_optix_frames_for_source(
                          json_dir / "nerf_render_images")
         nerf_pred_dir = _find_nerf_pred_dir(base_root, rc.color_texture_nerf_iter)
         if nerf_pred_dir is None:
-            print(f"    ⚠  Nessuna cartella pred NeRF trovata (sorgente '{source}') → uso immagini GT")
+            print(f"    ⚠  No NeRF prediction folder found (source '{source}') → falling back to GT images")
         else:
-            print(f"[Step 3] Color texture da pred NeRF ({source}): {nerf_pred_dir}")
+            print(f"[Step 3] Colour texture from NeRF predictions ({source}): {nerf_pred_dir}")
 
     optix_frames = []
     for i, frame in enumerate(tf.frames):
@@ -2327,7 +2329,7 @@ def _build_optix_frames_for_source(
             if pred_path.exists():
                 img_path = pred_path.as_posix()
             else:
-                print(f"    ⚠  pred NeRF mancante per frame {i} ({pred_path.name}), uso GT")
+                print(f"    ⚠  NeRF prediction missing for frame {i} ({pred_path.name}), using GT")
         img_flat = _load_image_as_vec3(img_path, intr.w, intr.h)
         peak = _compute_peak(img_flat.reshape(intr.h, intr.w, 3),
                              rc.color_texture_peak_percentile)
@@ -2336,13 +2338,13 @@ def _build_optix_frames_for_source(
 
 
 def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
-    """Renderizza depth + mask per ogni frame, copia le immagini RGB e scrive
-    transforms_extended.json con i campi minimi richiesti da NerfDataset.
+    """Render depth + mask for every frame, copy the RGB images and write
+    transforms_extended.json with the minimum fields NerfDataset requires.
     """
     rc = cfg.render
     tf = load_transforms(rc.transforms_path)
     intr = tf.intrinsics
-    print(f"[Step 1] Trasformazioni caricate: {len(tf.frames)} frame  [{intr.w}×{intr.h}]")
+    print(f"[Step 1] Transforms loaded: {len(tf.frames)} frames  [{intr.w}×{intr.h}]")
 
     json_dir = Path(rc.output_dir).resolve()
     json_dir_str = json_dir.as_posix()
@@ -2350,7 +2352,7 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
 
     model = optix_mod.TriangleMesh()
     model.add_from_obj_file(rc.model_path)
-    print(f"[Step 1] Modello caricato: {rc.model_path}")
+    print(f"[Step 1] Model loaded: {rc.model_path}")
 
     depth_gen = optix_mod.DepthGenerator()
     depth_gen.set_traversable(model)
@@ -2365,25 +2367,25 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
     scale = tf.scale if rc.apply_scale else 1.0
     W, H = intr.w, intr.h
 
-    # ── Calcolo divisore di normalizzazione HDR ───────────────────────────────
+    # ── Compute the HDR normalization divisor ─────────────────────────────────
     norm_divisor: float | None = None
     norm_source: str | None = None
-    sky_norm_path: str | None = None  # path allo skybox normalizzato salvato
+    sky_norm_path: str | None = None  # path of the saved normalised skybox
     if rc.normalize_images:
         if rc.skybox_path:
             sky_raw = _load_image_hw3_native(rc.skybox_path)
             norm_divisor = float(sky_raw.max())
             norm_source = "skybox"
-            print(f"[Step 1] Normalizzazione: skybox → max={norm_divisor:.6f}")
-            # Salva skybox normalizzato — usato da Step 3 per coerenza radiometrica
+            print(f"[Step 1] Normalization: skybox → max={norm_divisor:.6f}")
+            # Save the normalised skybox — Step 3 uses it for radiometric consistency
             sky_normalized = (sky_raw / norm_divisor).astype(np.float32)
             sky_norm_path = (json_dir / "skybox_normalized.exr").as_posix()
             get_writer(ImageFormat.OPENEXR).write(sky_normalized, sky_norm_path)
             sky_norm_path = _as_relative_to(sky_norm_path, json_dir_str)
-            print(f"[Step 1] Skybox normalizzata salvata: {(json_dir / sky_norm_path).resolve()}")
+            print(f"[Step 1] Normalised skybox saved: {(json_dir / sky_norm_path).resolve()}")
         else:
             running_max = 0.0
-            print("[Step 1] Normalizzazione: scansione immagini per trovare il max globale…")
+            print("[Step 1] Normalization: scanning the images for the global max…")
             for frame in tf.frames:
                 src = Path(frame.file_path)
                 if not src.exists():
@@ -2392,9 +2394,9 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
                 running_max = max(running_max, float(arr.max()))
             norm_divisor = running_max
             norm_source = "images"
-            print(f"[Step 1] Normalizzazione: immagini → max={norm_divisor:.6f}")
+            print(f"[Step 1] Normalization: images → max={norm_divisor:.6f}")
         if norm_divisor <= 0:
-            print("[Step 1] ⚠  max = 0, normalizzazione disabilitata per questa run.")
+            print("[Step 1] ⚠  max = 0, normalization disabled for this run.")
             norm_divisor = None
 
     hist_dir = images_out_dir / "histograms"
@@ -2412,14 +2414,14 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
                 arr = (_load_image_hw3_native(str(src_image)) / norm_divisor).astype(np.float32)
                 get_writer(ImageFormat.OPENEXR).write(arr, str(dst_image))
             else:
-                print(f"    ⚠  Immagine non trovata, skip: {src_image}")
+                print(f"    ⚠  Image not found, skipped: {src_image}")
         else:
             dst_image = images_out_dir / src_image.name
             if src_image.exists():
                 shutil.copy2(src_image, dst_image)
                 arr = _load_image_hw3_native(str(dst_image)).astype(np.float32)
             else:
-                print(f"    ⚠  Immagine non trovata, skip copia: {src_image}")
+                print(f"    ⚠  Image not found, copy skipped: {src_image}")
 
         if arr is not None:
             _write_rgb_histogram(arr, str(hist_dir / f"{src_image.stem}_hist.png"),
@@ -2497,7 +2499,7 @@ def _step1_pretrain_data(cfg: PipelineConfig, optix_mod) -> Path:
     out_json_path = json_dir / "transforms_extended.json"
     with open(out_json_path, "w", encoding="utf-8") as fh:
         json.dump(output_json, fh, indent=4)
-    print(f"\n[Step 1] JSON minimo salvato in: {out_json_path}")
+    print(f"\n[Step 1] Minimal JSON saved to: {out_json_path}")
     return out_json_path
 
 
@@ -2506,11 +2508,11 @@ def _step2_train_nerf(
     transforms_extended_path: Path,
     tb_logger=None,
 ) -> tuple[Path, float]:
-    """Allena il NeRF e restituisce (ckpt_path, final_psnr_dB).
+    """Train the NeRF and return (ckpt_path, final_psnr_dB).
 
-    ``tb_logger`` è un monitoring.RunLogger (o None per disabilitare il log TB).
-    Il PSNR è quello dell'ultimo blocco di display; float('nan') se il training è
-    troppo breve per raggiungere il primo blocco.
+    ``tb_logger`` is a monitoring.RunLogger (or None to disable TB logging).
+    The PSNR is the one from the last display block; float('nan') when the training
+    is too short to reach the first block.
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
@@ -2540,10 +2542,10 @@ def _step2_train_nerf(
     )
 
     print(f"[Step 2] Training NeRF (depth-guided) — {cfg.nerf_num_iters} iter, ckpt → {ckpt}")
-    print(f"[Step 2] campionamento depth-guided, mesh_window=[t-{cfg.nerf_depth_window}, t+{cfg.nerf_depth_window_end}], "
+    print(f"[Step 2] depth-guided sampling, mesh_window=[t-{cfg.nerf_depth_window}, t+{cfg.nerf_depth_window_end}], "
           f"bg_radius_mult={cfg.nerf_bg_radius_mult}, lr_decay={cfg.nerf_lr_decay}, "
           f"lr_decay_steps={cfg.nerf_lr_decay_steps or cfg.nerf_num_iters} "
-          f"({'auto' if cfg.nerf_lr_decay_steps == 0 else 'fisso'})")
+          f"({'auto' if cfg.nerf_lr_decay_steps == 0 else 'fixed'})")
     final_psnr = nerf_train(
         str(transforms_extended_path), nerf_cfg,
         ckpt_path     = str(ckpt),
@@ -2555,12 +2557,12 @@ def _step2_train_nerf(
         display_every = cfg.nerf_display_every,
         tb_logger     = tb_logger,
     )
-    print(f"[Step 2] Training completato. Checkpoint: {ckpt}")
+    print(f"[Step 2] Training complete. Checkpoint: {ckpt}")
     return ckpt, (final_psnr if final_psnr is not None else float("nan"))
 
 
 def _write_png_float(arr: np.ndarray, path: str) -> None:
-    """Salva array float32 [0,1] come PNG uint8."""
+    """Save a float32 [0,1] array as a uint8 PNG."""
     from PIL import Image
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8)).save(path)
@@ -2568,7 +2570,7 @@ def _write_png_float(arr: np.ndarray, path: str) -> None:
 
 def _write_sxs_comparison(gt_np: np.ndarray, pred_np: np.ndarray,
                            psnr: float, path: str, label: str = "") -> None:
-    """Salva side-by-side GT | Pred con PSNR in testa come PNG."""
+    """Save a side-by-side GT | Pred PNG with the PSNR in the header."""
     from PIL import Image, ImageDraw
     H, W   = gt_np.shape[:2]
     title_h = 24
@@ -2593,7 +2595,7 @@ def _write_rgb_histogram(arr_hw3: np.ndarray, path: str, title: str) -> None:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
-        print("    ⚠  matplotlib non disponibile: istogramma saltato")
+        print("    ⚠  matplotlib not available: histogram skipped")
         return
     flat = arr_hw3.reshape(-1, 3).astype(np.float32)
     xmax = max(float(np.percentile(flat, 99.5)), 1e-6)
@@ -2644,7 +2646,7 @@ def _write_rgb_hist_comparison(pred_hw3: np.ndarray, gt_hw3: np.ndarray,
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
-        print("    ⚠  matplotlib non disponibile: istogramma saltato")
+        print("    ⚠  matplotlib not available: histogram skipped")
         return
     pred_flat = pred_hw3.reshape(-1, 3).astype(np.float32)
     gt_flat   = gt_hw3.reshape(-1, 3).astype(np.float32)
@@ -2680,7 +2682,7 @@ def _write_rgb_hist_comparison(pred_hw3: np.ndarray, gt_hw3: np.ndarray,
 
 
 def _load_depth_np(path: str) -> np.ndarray | None:
-    """Carica depth EXR come (H, W) float32; ritorna None in caso di errore."""
+    """Load a depth EXR as (H, W) float32; returns None on failure."""
     try:
         import OpenEXR, Imath
         exr = OpenEXR.InputFile(path)
@@ -2692,39 +2694,39 @@ def _load_depth_np(path: str) -> np.ndarray | None:
         ch  = np.frombuffer(exr.channel(key, pt), dtype=np.float32).reshape(h, w)
         return np.where(ch >= 1e10, 0.0, ch).astype(np.float32)
     except Exception as e:
-        print(f"    ⚠  Impossibile caricare depth {path}: {e}")
+        print(f"    ⚠  Cannot load depth {path}: {e}")
         return None
 
 
 def _load_mask_bool(path: str) -> np.ndarray | None:
-    """Carica una maschera PNG come (H, W) bool (True = figura). None se fallisce."""
+    """Load a PNG mask as (H, W) bool (True = foreground). None on failure."""
     try:
         from PIL import Image
         arr = np.array(Image.open(path).convert("L"), dtype=np.float32) / 255.0
         return arr > 0.5
     except Exception as e:
-        print(f"    ⚠  Impossibile caricare mask {path}: {e}")
+        print(f"    ⚠  Cannot load mask {path}: {e}")
         return None
 
 
-# Fasce di luminanza GT (lineare HDR) usate per i grafici errore-per-luminanza.
+# GT luminance bands (linear HDR) used by the error-per-luminance plots.
 _LUMA_BINS = [(0.0, 0.02), (0.02, 0.05), (0.05, 0.2), (0.2, 1.0), (1.0, 5.0), (5.0, np.inf)]
 
 
 def _write_error_luminance_plot(gt_np: np.ndarray, pred_np: np.ndarray,
                                  sel: np.ndarray | None, path: str, title: str) -> None:
-    """Grafico a barre dell'errore raggruppato per fascia di luminanza GT.
+    """Bar chart of the error grouped by GT luminance band.
 
-    sel: maschera booleana (H, W) dei pixel da includere; None = tutta l'immagine.
-    Mostra, per ogni fascia: |pred-gt| medio assoluto (asse sinistro) ed errore
-    relativo medio (asse destro), col numero di pixel per fascia.
+    sel: boolean (H, W) mask of the pixels to include; None = the whole image.
+    Shows, per band: the mean absolute |pred-gt| (left axis) and the mean relative
+    error (right axis), with the pixel count of each band.
     """
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
-        print("    ⚠  matplotlib non disponibile: grafico errore saltato")
+        print("    ⚠  matplotlib not available: error plot skipped")
         return
 
     gl   = gt_np.mean(-1)
@@ -2772,18 +2774,18 @@ def _write_error_luminance_plot(gt_np: np.ndarray, pred_np: np.ndarray,
 def _step2b_render_train_images(cfg: PipelineConfig,
                                 transforms_extended_path: Path,
                                 ckpt_path: Path) -> None:
-    """Per ogni frame renderizza col NeRF e salva GT, Pred e diff come EXR + PNG.
+    """Render every frame with the NeRF and save GT, Pred and diff as EXR + PNG.
 
-    Gli output vengono scritti in una sottocartella denominata iter_<NNNNNN> all'interno
-    di nerf_render_images, così ogni stop del training interattivo produce una directory
-    separata senza sovrascrivere gli stop precedenti.
+    The outputs go into a subfolder named iter_<NNNNNN> inside nerf_render_images, so
+    each stop of the interactive training produces a separate directory instead of
+    overwriting the previous ones.
 
-    Metriche di bias colore prodotte al termine:
-      frame_NNN_bias.png   — scatter densità pred-vs-gt (4 pannelli R/G/B/Luma, log-log)
-      bias_scatter_all.png — scatter aggregato su tutti i frame
-      metrics_per_frame.csv — PSNR, PSNR-tonemap, errore percentili, residui per frame
-      bias_bins.csv         — ratio mediana pred/gt per fascia di luminanza e canale
-      metrics_summary.txt   — riepilogo testuale (numeri per la tesi)
+    Colour-bias metrics produced at the end:
+      frame_NNN_bias.png   — pred-vs-gt density scatter (4 panels R/G/B/Luma, log-log)
+      bias_scatter_all.png — scatter aggregated over all frames
+      metrics_per_frame.csv — PSNR, tonemapped PSNR, percentile error, per-frame residuals
+      bias_bins.csv         — median pred/gt ratio per luminance band and channel
+      metrics_summary.txt   — textual summary (the numbers quoted in the thesis)
     """
     import csv
     import sys
@@ -2814,16 +2816,16 @@ def _step2b_render_train_images(cfg: PipelineConfig,
 
     exr_writer = get_writer(ImageFormat.OPENEXR)
 
-    # ── Accumulatori per scatter aggregato (subsample per contenere la memoria) ──
-    _MAX_AGG_PX = 20_000   # pixel massimi prelevati da ogni frame per l'aggregato
-    agg_pred_rgb: list[np.ndarray] = []   # (N_i, 3) per frame i
+    # ── Accumulators for the aggregate scatter (subsampled to bound memory) ─────
+    _MAX_AGG_PX = 20_000   # maximum pixels taken from each frame for the aggregate
+    agg_pred_rgb: list[np.ndarray] = []   # (N_i, 3) for frame i
     agg_gt_rgb:   list[np.ndarray] = []
 
-    # ── Metriche per-frame ────────────────────────────────────────────────────
+    # ── Per-frame metrics ─────────────────────────────────────────────────────
     psnrs: list[float] = []
     metrics_rows: list[dict] = []
 
-    print(f"\n[Step 2b] Rendering {len(tf.frames)} frame con NeRF (iter={iter_done})...")
+    print(f"\n[Step 2b] Rendering {len(tf.frames)} frames with the NeRF (iter={iter_done})...")
     for i, (frame, raw_frame) in enumerate(zip(tf.frames, raw_frames)):
         gt_np  = _load_image_hw3_native(frame.file_path)
         pose   = np.array(frame.transform_matrix, dtype=np.float32)
@@ -2851,11 +2853,11 @@ def _step2b_render_train_images(cfg: PipelineConfig,
         psnrs.append(psnr)
 
         stem = f"frame_{i:03d}"
-        # EXR: HDR float32, no clamp — preserva valori >1 e segno della differenza
+        # EXR: HDR float32, no clamp — preserves values >1 and the sign of the difference
         exr_writer.write(gt_np,             (base / f"{stem}_gt.exr").as_posix())
         exr_writer.write(pred_np,           (base / f"{stem}_pred.exr").as_posix())
         exr_writer.write(pred_np - gt_np,   (base / f"{stem}_diff.exr").as_posix())
-        # PNG: anteprima visiva clampata a [0,1]
+        # PNG: visual preview, clamped to [0,1]
         _write_png_float(gt_np,   (base / f"{stem}_gt.png").as_posix())
         _write_png_float(pred_np, (base / f"{stem}_pred.png").as_posix())
         _write_sxs_comparison(gt_np, pred_np, psnr,
@@ -2865,7 +2867,7 @@ def _step2b_render_train_images(cfg: PipelineConfig,
         _write_rgb_hist_comparison(pred_np, gt_np,
                                    (base / f"{stem}_rgb_hist.png").as_posix(), stem)
 
-        # ── Metriche di bias colore ───────────────────────────────────────────
+        # ── Colour-bias metrics ───────────────────────────────────────────────
         psnr_tm_clip     = tonemapped_psnr(pred_np, gt_np, mask_bool, mode="clip")
         psnr_tm_reinhard = tonemapped_psnr(pred_np, gt_np, mask_bool, mode="reinhard")
         hl_err           = highlight_percentile_error(pred_np, gt_np, mask_bool)
@@ -2884,19 +2886,19 @@ def _step2b_render_train_images(cfg: PipelineConfig,
             "residual_median_hl":  round(res_stats["median_highlight"], 6),
         })
 
-        # Scatter bias per-frame (R/G/B/Luma log-log con bisettrice + curva mediana)
+        # Per-frame bias scatter (R/G/B/Luma log-log, with bisector + median curve)
         bias_title = (f"{stem}  PSNR={psnr:.2f} dB  "
                       f"tonemap-clip={psnr_tm_clip:.2f} dB  "
                       f"tonemap-Reinhard={psnr_tm_reinhard:.2f} dB")
         plot_bias_scatter(pred_np, gt_np, mask_bool,
                           str(base / f"{stem}_bias.png"), title=bias_title)
 
-        # Heatmap diagnostica per-frame: GT, Pred (clip [0,1]) + ΔR ΔG ΔB + |Δ| luma
-        # Nessuna maschera: l'intero frame entra (modello + skybox/background).
+        # Per-frame diagnostic heatmap: GT, Pred (clip [0,1]) + ΔR ΔG ΔB + |Δ| luma
+        # No mask: the whole frame goes in (model + skybox/background).
         plot_error_heatmap(pred_np, gt_np,
                            str(base / f"{stem}_heatmap.png"), title=bias_title)
 
-        # Accumulo subsample per scatter aggregato (già mascherato)
+        # Accumulate a subsample for the aggregate scatter (already masked)
         p3 = pred_np.astype(np.float32)
         g3 = gt_np.astype(np.float32)
         if mask_bool is not None:
@@ -2934,15 +2936,15 @@ def _step2b_render_train_images(cfg: PipelineConfig,
     all_gt   = np.concatenate(agg_gt_rgb,   axis=0)
     n_agg    = all_pred.shape[0]
 
-    # Scatter aggregato — reshaping virtuale (1, N, 3) senza maschera (già filtrato)
+    # Aggregate scatter — virtual reshape to (1, N, 3), no mask (already filtered)
     agg_pred_hw3 = all_pred.reshape(1, n_agg, 3)
     agg_gt_hw3   = all_gt.reshape(1, n_agg, 3)
-    agg_title = (f"Tutti i frame aggregati ({n_agg} pixel campionati, "
-                 f"{len(psnrs)} frame, PSNR medio={float(np.mean(psnrs)):.2f} dB)")
+    agg_title = (f"All frames aggregated ({n_agg} sampled pixels, "
+                 f"{len(psnrs)} frames, mean PSNR={float(np.mean(psnrs)):.2f} dB)")
     plot_bias_scatter(agg_pred_hw3, agg_gt_hw3, None,
                       str(base / "bias_scatter_all.png"), title=agg_title)
 
-    # Canali per bias_bins.csv (luma ricalcolata dall'RGB aggregato)
+    # Channels for bias_bins.csv (luma recomputed from the aggregated RGB)
     luma_pred_agg = (all_pred * _LUMA_COEFF).sum(-1)
     luma_gt_agg   = (all_gt   * _LUMA_COEFF).sum(-1)
     _channels = [
@@ -2989,28 +2991,28 @@ def _step2b_render_train_images(cfg: PipelineConfig,
     res_hl_means      = [r["residual_mean_hl"]       for r in metrics_rows]
 
     lines = [
-        f"=== Analisi bias colore NeRF — iter {iter_done} ===",
-        f"Frame valutati          : {len(metrics_rows)}",
-        f"Pixel aggregati scatter : {n_agg}",
+        f"=== NeRF colour-bias analysis — iter {iter_done} ===",
+        f"Frames evaluated        : {len(metrics_rows)}",
+        f"Pixels in the scatter   : {n_agg}",
         "",
         "── PSNR ──────────────────────────────────────────",
-        f"  PSNR lineare (HDR)    : {float(np.mean(psnrs)):.3f} dB",
+        f"  PSNR linear (HDR)     : {float(np.mean(psnrs)):.3f} dB",
         f"  PSNR tonemap clip     : {_nanmean(psnr_tm_clips):.3f} dB",
         f"  PSNR tonemap Reinhard : {_nanmean(psnr_tm_reinhards):.3f} dB",
-        "  (tonemap clip ≈ qualità range diffuso senza coda HDR)",
+        "  (tonemap clip ≈ diffuse-range quality without the HDR tail)",
         "",
-        "── Highlight (percentili di luminanza GT) ────────",
-        f"  Errore relativo medio p99   : {_nanmean(rel_p99s):.4f}",
-        f"  Errore relativo medio p99.9 : {_nanmean(rel_p999s):.4f}",
+        "── Highlights (GT luminance percentiles) ─────────",
+        f"  Mean relative error p99     : {_nanmean(rel_p99s):.4f}",
+        f"  Mean relative error p99.9   : {_nanmean(rel_p999s):.4f}",
         "",
-        "── Residui con segno (pred − gt) ─────────────────",
-        f"  Media globale   : {_nanmean(res_means):.5f}  (>0 sovrastima, <0 sottostima)",
-        f"  Mediana globale : {_nanmean(res_medians):.5f}",
-        f"  Media highlight (gt>1) : {_nanmean(res_hl_means):.5f}",
+        "── Signed residuals (pred − gt) ──────────────────",
+        f"  Global mean     : {_nanmean(res_means):.5f}  (>0 overestimate, <0 underestimate)",
+        f"  Global median   : {_nanmean(res_medians):.5f}",
+        f"  Highlight mean (gt>1) : {_nanmean(res_hl_means):.5f}",
         "",
-        "── Ratio mediana pred/gt per fascia (canali aggregati) ───",
-        "   ratio < 1 = sottostima, ratio > 1 = sovrastima",
-        "   (vedi bias_bins.csv per il dettaglio completo)",
+        "── Median pred/gt ratio per band (aggregated channels) ───",
+        "   ratio < 1 = underestimate, ratio > 1 = overestimate",
+        "   (see bias_bins.csv for the full detail)",
     ]
     for ch_name, _cp, _cg in _channels:
         ch_bins = [r for r in bins_rows if r["channel"] == ch_name and r["ratio"] != "nan"]
@@ -3018,18 +3020,18 @@ def _step2b_render_train_images(cfg: PipelineConfig,
         diff_bins = [r for r in ch_bins if float(r["center_gt"]) <= 1.0]
         ratio_diff = float(np.mean([float(r["ratio"]) for r in diff_bins])) if diff_bins else float("nan")
         ratio_hl   = float(np.mean([float(r["ratio"]) for r in hl_bins]))   if hl_bins else float("nan")
-        lines.append(f"  {ch_name:<5}  range diffuso (gt≤1): {ratio_diff:.3f}  "
-                     f"highlight (gt>1): {ratio_hl:.3f}" if not np.isnan(ratio_hl)
-                     else f"  {ch_name:<5}  range diffuso (gt≤1): {ratio_diff:.3f}  "
-                          f"highlight (gt>1): n/a (nessun campione)")
+        lines.append(f"  {ch_name:<5}  diffuse range (gt≤1): {ratio_diff:.3f}  "
+                     f"highlights (gt>1): {ratio_hl:.3f}" if not np.isnan(ratio_hl)
+                     else f"  {ch_name:<5}  diffuse range (gt≤1): {ratio_diff:.3f}  "
+                          f"highlights (gt>1): n/a (no samples)")
 
     summary_path = base / "metrics_summary.txt"
     with open(summary_path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
 
-    print(f"[Step 2b] Completato — PSNR medio={float(np.mean(psnrs)):.2f} dB  "
+    print(f"[Step 2b] Done — mean PSNR={float(np.mean(psnrs)):.2f} dB  "
           f"tonemap-clip={_nanmean(psnr_tm_clips):.2f} dB → {base}")
-    print(f"  Scritti: metrics_per_frame.csv, bias_bins.csv, "
+    print(f"  Written: metrics_per_frame.csv, bias_bins.csv, "
           f"metrics_summary.txt, bias_scatter_all.png")
 
 
@@ -3040,34 +3042,34 @@ def _step3_posttrain_assets(
     tb_logger=None,
     timer=None,
 ) -> dict:
-    """Esegue IUM/visibility/color_texture/irradiance/indirect/spec_cone (bake) e
-    aggiorna transforms_extended.json in-place con le nuove chiavi.
+    """Run IUM/visibility/color_texture/irradiance/indirect/spec_cone (the bake) and
+    update transforms_extended.json in place with the new keys.
 
-    Il fit PBR e l'albedo sono stati spostati nello Step 4 (_step4_reconstruction),
-    che legge solo la cache su disco prodotta qui.
+    The PBR fit and the albedo moved to Step 4 (_step4_reconstruction), which reads
+    only the on-disk cache produced here.
     """
     rc = cfg.render
     tf = load_transforms(str(transforms_extended_path))
     intr = tf.intrinsics
-    print(f"[Step 3] {len(tf.frames)} frame  [{intr.w}×{intr.h}]")
+    print(f"[Step 3] {len(tf.frames)} frames  [{intr.w}×{intr.h}]")
 
     json_dir = Path(rc.output_dir).resolve()
     os.makedirs(json_dir, exist_ok=True)
 
-    # Con una ROI attiva TUTTI gli output di questo step vanno nella sandbox
-    # roi/<tag>/, che replica il layout della radice. json_dir resta la sorgente
-    # degli input condivisi (images/, nerf_render_images/) e di skybox_nerf_baked.exr,
-    # che la run ROI riusa invece di ri-bakarlo.
+    # With a ROI active, ALL the outputs of this step go into the roi/<tag>/ sandbox,
+    # which mirrors the root layout. json_dir remains the source of the shared inputs
+    # (images/, nerf_render_images/) and of skybox_nerf_baked.exr, which the ROI run
+    # reuses instead of re-baking.
     assets_dir, roi_tag = _roi_assets_dir(rc, json_dir)
     assets_dir_str = assets_dir.as_posix()
     os.makedirs(assets_dir, exist_ok=True)
-    roi_fp: dict = {}   # fingerprint della ROI, risolto insieme alla IUM
+    roi_fp: dict = {}   # ROI fingerprint, resolved together with the IUM
 
     model = optix_mod.TriangleMesh()
     model.add_from_obj_file(rc.model_path)
-    print(f"[Step 3] Modello caricato: {rc.model_path}")
+    print(f"[Step 3] Model loaded: {rc.model_path}")
 
-    # Leggi il JSON esistente — lo arricchiremo alla fine
+    # Read the existing JSON — it gets enriched at the end
     with open(transforms_extended_path, encoding="utf-8") as fh:
         output_json = json.load(fh)
 
@@ -3075,8 +3077,8 @@ def _step3_posttrain_assets(
 
     if rc.render_ium:
         _t3_ium = time.perf_counter()
-        # Dimensione IUM: potrebbe essere adattata alla risoluzione della normale esterna
-        # se external_normal_resolution_mode == "adapt" (o se l'utente lo sceglie a runtime).
+        # IUM size: it may be adapted to the external normal map's resolution when
+        # external_normal_resolution_mode == "adapt" (or the user picks it at runtime).
         default_ium_w, default_ium_h = rc.ium_texture_size[0], rc.ium_texture_size[1]
         ium_w, ium_h, _ext_norm_mode = _resolve_external_normal_size(
             rc, default_ium_w, default_ium_h
@@ -3087,36 +3089,36 @@ def _step3_posttrain_assets(
         ium_gen.set_texture_size([ium_w, ium_h])
         ium_gen.render()
         ium_res = ium_gen.get_result()
-        print("[Step 3] IUM rendering completato")
+        print("[Step 3] IUM rendering complete")
         if timer is not None:
             timer.record("step3/ium", time.perf_counter() - _t3_ium)
 
-        # Se è stata fornita una normale esterna, decodificala e iniettala nel buffer
-        # C++ di IUM_Generator::Result prima di qualsiasi uso a valle.
+        # When an external normal map was supplied, decode it and inject it into the
+        # C++ buffer of IUM_Generator::Result before any downstream use.
         if rc.external_normal_path:
             _apply_external_normal(rc, ium_res, ium_w, ium_h)
 
-        # ── ROI: unico punto in cui viene applicata ──────────────────────────
-        # masks_np è una view scrivibile sul vettore C++ e ogni generatore a valle
-        # ricarica la maschera dall'host al proprio set_inputs, quindi da qui in poi
-        # visibility, color texture, irradiance, indirect e spec cone lavorano solo
-        # sui texel della ROI. Dopo _apply_external_normal e non prima, così
-        # ium_normals resta la normale piena e solo la maschera porta la ROI.
+        # ── ROI: the one place it is applied ─────────────────────────────────
+        # masks_np is a writable view on the C++ vector, and every downstream generator
+        # re-uploads the mask from the host at its own set_inputs, so from here on
+        # visibility, colour texture, irradiance, indirect and spec cone work only on
+        # the ROI texels. After _apply_external_normal and not before, so that
+        # ium_normals stays the full normal map and only the mask carries the ROI.
         roi_flat, roi_fp = _load_roi(rc, ium_w, ium_h)
         if roi_flat is not None:
             if not ium_res.has_masks():
                 raise RuntimeError(
-                    "ROI richiesta ma l'IUM non ha prodotto maschere: la ROI si "
-                    "applica proprio come fattore su ium_masks, senza non c'è nulla "
-                    "da restringere.")
+                    "A ROI was requested but the IUM produced no masks: the ROI is "
+                    "applied precisely as a factor on ium_masks, and without them "
+                    "there is nothing to narrow.")
             _check_roi_guard(assets_dir, roi_fp)
             m = ium_res.masks_np
             n_before = int(np.count_nonzero(m))
             m[~roi_flat] = 0
             n_after = int(np.count_nonzero(m))
-            print(f"[ROI] tag '{roi_tag}': {n_after} texel attivi su {ium_w * ium_h} "
+            print(f"[ROI] tag '{roi_tag}': {n_after} active texels out of {ium_w * ium_h} "
                   f"({100.0 * n_after / (ium_w * ium_h):.2f} %), "
-                  f"{n_before} sulla mesh senza ROI → {assets_dir}")
+                  f"{n_before} on the mesh without the ROI → {assets_dir}")
 
         ium_out_dir = assets_dir / "ium"
         os.makedirs(ium_out_dir, exist_ok=True)
@@ -3129,8 +3131,8 @@ def _step3_posttrain_assets(
 
         if ium_res.has_normals():
             norm_arr = _reshape_flat(ium_res.normals_np.astype(np.float32), ium_w, ium_h)
-            # Quando si usa la normale esterna forziamo EXR per garantire il salvataggio
-            # dei valori raw in [-1, 1] indipendentemente da rc.ium_format.
+            # With an external normal map we force EXR, to guarantee the raw values in
+            # [-1, 1] are stored regardless of rc.ium_format.
             norm_save_fmt = (
                 ImageFormat.OPENEXR if rc.external_normal_path else rc.ium_format
             )
@@ -3150,17 +3152,17 @@ def _step3_posttrain_assets(
             all_cameras.append(cam)
 
         # ── Visibility ───────────────────────────────────────────────────────
-        # Il pass calcola l'OCCLUSIONE (shadow ray camera→texel). L'artefatto
-        # autoritativo su disco è però la visibility raffinata dalle maschere di
-        # color_texture (occlusione∧frustum∧grazing): visibility.exr viene quindi
-        # scritto nel blocco color_texture (o come fallback solo-occlusione più
-        # sotto, se color_texture non gira). Qui NON si salva.
+        # The pass computes OCCLUSION (a shadow ray camera→texel). The authoritative
+        # artefact on disk is however the visibility refined by the colour-texture
+        # masks (occlusion∧frustum∧grazing): visibility.exr is therefore written in
+        # the colour-texture block (or as the occlusion-only fallback further down,
+        # when colour texture does not run). Nothing is saved here.
         visibility_map = None
-        visibility_refined = False   # True quando visibility.exr = maschere (frustum+grazing)
+        visibility_refined = False   # True once visibility.exr = the masks (frustum+grazing)
         vis_path = None
         if rc.render_visibility and ium_res.has_positions() and ium_res.has_masks():
             _t3_vis = time.perf_counter()
-            print("[Step 3] Calcolo Visibilità telecamere…")
+            print("[Step 3] Computing camera visibility…")
             vis_gen = optix_mod.VisibilityGenerator()
             vis_gen.set_traversable(model)
             visibility_map = vis_gen.check_visibility(ium_res, ium_w, ium_h, all_cameras)
@@ -3173,24 +3175,24 @@ def _step3_posttrain_assets(
                 timer.record("step3/visibility", time.perf_counter() - _t3_vis)
 
         # ── Color Texture ────────────────────────────────────────────────────
-        # color_by_source: sorgente → colors_np float32 (copia esplicita: result,
-        # generatore e frames vengono rilasciati a fine iterazione, prima di caricare
-        # la sorgente successiva). Le texture per-camera vengono scaricate dalla GPU
-        # una camera alla volta: il blocco frames×texel non esiste mai in RAM host.
+        # color_by_source: source → colors_np float32 (an explicit copy: the result,
+        # the generator and the frames are released at the end of the iteration, before
+        # the next source is loaded). The per-camera textures are downloaded from the
+        # GPU one camera at a time: the frames×texel block never exists in host RAM.
         color_by_source: dict[str, np.ndarray] = {}
-        # Le maschere per-camera di color_texture (occlusione∧frustum∧grazing, pre-peak)
-        # sono source-indipendenti: le salviamo una sola volta come <out>/camera_mask/
-        # {stem}.exr e le riusiamo come visibility condivisa raffinata.
+        # The per-camera colour-texture masks (occlusion∧frustum∧grazing, pre-peak) are
+        # source-independent: they are saved once as <out>/camera_mask/{stem}.exr and
+        # reused as the shared refined visibility.
         cam_mask_dir = assets_dir / "camera_mask"
         stems = [f.stem for f in tf.frames]
         if (rc.render_color_texture and rc.render_ium and rc.render_visibility
                 and visibility_map is not None):
             _t3_ct = time.perf_counter()
 
-            # Ogni source viene processata per intero e in modo identico, sotto sources/{src}/
+            # Every source is processed in full and identically, under sources/{src}/
             ct_sources = rc.color_texture_image_sources
             if not ct_sources:
-                raise ValueError("color_texture_image_sources non può essere vuota")
+                raise ValueError("color_texture_image_sources cannot be empty")
 
             for src in ct_sources:
                 src_dir = assets_dir / "sources" / src
@@ -3200,14 +3202,14 @@ def _step3_posttrain_assets(
                 cam_tex_dir = src_dir / "camera_texture"
 
                 if os.path.exists(ct_path) and cam_tex_dir.is_dir():
-                    # Cache-hit: per non far regredire la visibility servono le maschere
-                    # per-camera. Se ci sono su disco le ricarichiamo e raffiniamo; se
-                    # mancano NON usiamo la cache (ricalcoliamo per rigenerarle).
+                    # Cache hit: to avoid regressing the visibility we need the per-camera
+                    # masks. If they are on disk we reload them and refine; if they are
+                    # missing we do NOT use the cache (we recompute to regenerate them).
                     masks_disk = _load_camera_masks(cam_mask_dir, stems, ium_w * ium_h)
                     if masks_disk is not None:
                         loaded = _load_exr_as_flat(ct_path)
                         if loaded is not None:
-                            print(f"[Step 3] Color texture trovata su disco ({src}): {ct_path}")
+                            print(f"[Step 3] Colour texture found on disk ({src}): {ct_path}")
                             color_by_source[src] = loaded
                             ium_result_data[f"color_texture_path_{src}"] = _as_relative_to(ct_path, assets_dir_str)
                             if not visibility_refined and vis_path is not None:
@@ -3215,13 +3217,13 @@ def _step3_posttrain_assets(
                                 _save_visibility_map(visibility_map, vis_path, ium_h, ium_w,
                                                      len(all_cameras), rc.visibility_format)
                                 visibility_refined = True
-                                print("[Step 3] Visibility raffinata dalle maschere per-camera su disco")
+                                print("[Step 3] Visibility refined from the per-camera masks on disk")
                             continue
                     else:
-                        print(f"[Step 3] Color texture in cache ({src}) ma maschere per-camera "
-                              f"mancanti → ricalcolo per rigenerarle")
+                        print(f"[Step 3] Colour texture cached ({src}) but per-camera masks "
+                              f"missing → recomputing to regenerate them")
 
-                print(f"[Step 3] Calcolo Color Texture (sorgente: {src})…")
+                print(f"[Step 3] Computing the colour texture (source: {src})…")
                 optix_frames = _build_optix_frames_for_source(
                     src, tf, all_cameras, intr, rc, cfg, json_dir, optix_mod)
 
@@ -3231,19 +3233,19 @@ def _step3_posttrain_assets(
                 ct_gen.render()
                 _ct_res = ct_gen.get_result()
 
-                # Salva color_texture per questa sorgente
+                # Save color_texture for this source
                 ct_arr = _reshape_flat(_ct_res.colors_np.astype(np.float32), ium_w, ium_h)
                 _save_layer(ct_arr, ct_path, rc.color_texture_format, DataLayer.POSITION)
                 ium_result_data[f"color_texture_path_{src}"] = _as_relative_to(ct_path, assets_dir_str)
 
-                # Copia leggera di colors_np per il calcolo albedo a valle
+                # Lightweight copy of colors_np, for the downstream albedo computation
                 color_by_source[src] = np.array(_ct_res.colors_np, dtype=np.float32)
 
-                # Texture per-camera per questa sorgente: sources/{src}/camera_texture/
-                # Scarico anche la maschera per-camera (uint8) per raffinare la visibility.
+                # Per-camera textures for this source: sources/{src}/camera_texture/
+                # The per-camera mask (uint8) is downloaded too, to refine the visibility.
                 os.makedirs(cam_tex_dir, exist_ok=True)
-                # Le maschere sono source-indipendenti: le salviamo una sola volta,
-                # sul primo source che le produce (prima che visibility_refined diventi True).
+                # The masks are source-independent: they are saved once, on the first
+                # source that produces them (before visibility_refined becomes True).
                 save_masks = not visibility_refined
                 if save_masks:
                     os.makedirs(cam_mask_dir, exist_ok=True)
@@ -3263,19 +3265,19 @@ def _step3_posttrain_assets(
                         _save_debug_comparison(src_img_path, cam_arr, frame.stem,
                                                src_dir / "debug_camera_texture")
 
-                # Raffina la visibility condivisa con la maschera per-camera (una volta):
-                # occlusione∧frustum∧grazing, così spec_cone (usa visibility_map in memoria)
-                # e pbr_solver (rilegge visibility.exr) non pesano camere che non vedono
-                # davvero il texel. Nessuna modifica al solver.
+                # Refine the shared visibility with the per-camera mask (once):
+                # occlusion∧frustum∧grazing, so that spec_cone (which uses visibility_map
+                # in memory) and pbr_solver (which re-reads visibility.exr) do not weight
+                # cameras that do not really see the texel. No change to the solver.
                 if not visibility_refined and vis_path is not None:
                     visibility_map = cam_masks
                     _save_visibility_map(visibility_map, vis_path, ium_h, ium_w,
                                          len(all_cameras), rc.visibility_format)
                     visibility_refined = True
-                    print("[Step 3] Visibility raffinata con la maschera per-camera di "
-                          "color_texture (frustum+grazing) e ri-salvata")
+                    print("[Step 3] Visibility refined with the per-camera colour-texture "
+                          "mask (frustum+grazing) and re-saved")
 
-                # pixel_change per ogni sorgente: sources/{src}/pixel_change/
+                # pixel_change for each source: sources/{src}/pixel_change/
                 if rc.render_pixel_change:
                     pc_dir = src_dir / "pixel_change"
                     pc_dir.mkdir(parents=True, exist_ok=True)
@@ -3291,23 +3293,23 @@ def _step3_posttrain_assets(
                     if rc.debug_pixel_change:
                         _save_debug_pixel_change(min_arr, max_arr, range_arr, src_dir / "debug_pixel_change")
 
-                # TensorBoard per questa sorgente
+                # TensorBoard for this source
                 if tb_logger is not None:
                     tb_logger.log_image(f"texture/color_texture_{src}", ct_arr, step=0, tonemap=True)
                     tb_logger.flush()
 
-                # Rilascio esplicito prima della sorgente successiva: result host
-                # (~4 layer da num_pix), generatore (che possiede il buffer VRAM
-                # camera_colors ~num_pix×frames e le immagini caricate) e frames.
+                # Explicit release before the next source: the host result (~4 layers of
+                # num_pix), the generator (which owns the camera_colors VRAM buffer,
+                # ~num_pix×frames, and the loaded images) and the frames.
                 del _ct_res, ct_gen, optix_frames
 
             if timer is not None:
                 timer.record("step3/color_texture", time.perf_counter() - _t3_ct)
 
-        # ── Raffinamento visibility da maschere persistite (2-bis) e fallback ─
-        # Se color_texture non ha raffinato la visibility (es. render_color_texture
-        # disattivo) ma le maschere per-camera esistono su disco, raffina da lì così
-        # spec_cone e pbr_solver usano comunque la versione frustum+grazing.
+        # ── Visibility refinement from persisted masks (2-bis), and fallback ──
+        # If colour texture did not refine the visibility (e.g. render_color_texture
+        # off) but the per-camera masks exist on disk, refine from those so spec_cone
+        # and pbr_solver still use the frustum+grazing version.
         if not visibility_refined and visibility_map is not None and vis_path is not None:
             masks_disk = _load_camera_masks(cam_mask_dir, stems, ium_w * ium_h)
             if masks_disk is not None:
@@ -3315,24 +3317,24 @@ def _step3_posttrain_assets(
                 _save_visibility_map(visibility_map, vis_path, ium_h, ium_w,
                                      len(all_cameras), rc.visibility_format)
                 visibility_refined = True
-                print("[Step 3] Visibility raffinata dalle maschere per-camera su disco (2-bis)")
+                print("[Step 3] Visibility refined from the per-camera masks on disk (2-bis)")
             else:
-                # Fallback: nessuna maschera disponibile → salva la visibility
-                # solo-occlusione (frustum/grazing NON applicati).
+                # Fallback: no mask available → save the occlusion-only visibility
+                # (frustum/grazing NOT applied).
                 _save_visibility_map(visibility_map, vis_path, ium_h, ium_w,
                                      len(all_cameras), rc.visibility_format)
-                print("    ⚠  visibility.exr salvata SOLO-OCCLUSIONE (nessuna maschera "
-                      "per-camera su disco): frustum/grazing NON applicati. Esegui "
-                      "color_texture per raffinarla.")
+                print("    ⚠  visibility.exr saved as OCCLUSION-ONLY (no per-camera mask "
+                      "on disk): frustum/grazing NOT applied. Run colour texture to "
+                      "refine it.")
 
-        # ── Irradiance (skybox, quadratura deterministica) ───────────────────
+        # ── Irradiance (skybox, deterministic quadrature) ────────────────────
         irr_res = None
-        skybox_flat_step3 = None   # condivisa tra irradiance e spec_cone
+        skybox_flat_step3 = None   # shared between irradiance and spec_cone
         if (rc.render_irradiance
                 and (rc.skybox_path or rc.skybox_source == "nerf")
                 and ium_res.has_positions() and ium_res.has_normals()):
             _t3_irr = time.perf_counter()
-            print(f"[Step 3] Calcolo Irradiance "
+            print(f"[Step 3] Computing the irradiance "
                   f"({rc.irradiance_sample_side}×{rc.irradiance_sample_side} samples)…")
             sky_w, sky_h = rc.skybox_size[0], rc.skybox_size[1]
             skybox_flat = _resolve_skybox_flat(rc, output_json, json_dir, sky_w, sky_h)
@@ -3352,9 +3354,9 @@ def _step3_posttrain_assets(
             if timer is not None:
                 timer.record("step3/irradiance", time.perf_counter() - _t3_irr)
 
-        # ── Confronto skybox GT vs NeRF-baked ────────────────────────────────
-        # Richiede: compare_skybox_to_gt=True + skybox_path non-vuoto (GT HDR) +
-        # skybox_nerf_baked.exr già scritto da _bake_skybox_from_nerf.
+        # ── GT skybox vs NeRF-baked comparison ───────────────────────────────
+        # Requires: compare_skybox_to_gt=True + a non-empty skybox_path (GT HDR) +
+        # skybox_nerf_baked.exr already written by _bake_skybox_from_nerf.
         if rc.compare_skybox_to_gt and rc.skybox_path:
             baked_exr = json_dir / "skybox_nerf_baked.exr"
             if baked_exr.exists():
@@ -3370,10 +3372,10 @@ def _step3_posttrain_assets(
                     str(sky_cmp_dir / "skybox_heatmap.png"),
                     title=sky_title,
                 )
-                print(f"[Step 3] Skybox compare salvata: {sky_cmp_dir / 'skybox_heatmap.png'}")
+                print(f"[Step 3] Skybox comparison saved: {sky_cmp_dir / 'skybox_heatmap.png'}")
             else:
-                print("[Step 3] skybox_compare: skybox_nerf_baked.exr non trovato "
-                      "(atteso dopo skybox_source='nerf') — skip")
+                print("[Step 3] skybox_compare: skybox_nerf_baked.exr not found "
+                      "(expected after skybox_source='nerf') — skipped")
 
         # ── Indirect Irradiance via NeRF ─────────────────────────────────────
         irr_indirect_flat = None
@@ -3387,7 +3389,7 @@ def _step3_posttrain_assets(
                       f"(N={rc.indirect_sample_side}, tile={rc.indirect_tile_size})…")
                 _precompute_indirect_irradiance(rc, ium_res, model, ium_w, ium_h, ind_path)
             else:
-                print(f"[Step 3] Indirect irradiance trovata su disco: {ind_path}")
+                print(f"[Step 3] Indirect irradiance found on disk: {ind_path}")
             ind_arr = _load_exr_as_flat(ind_path)
             if ind_arr is not None:
                 irr_indirect_flat = ind_arr
@@ -3404,16 +3406,16 @@ def _step3_posttrain_assets(
                 skybox_flat_step3 = _resolve_skybox_flat(rc, output_json, json_dir, sky_w, sky_h)
             spec_dir = assets_dir / "spec_cone"
             if rc.spec_cone_scheme == "shared":
-                print(f"[Step 3] Precompute Specular Cone L_j(r), raggi condivisi "
-                      f"(aperture={rc.spec_cone_apertures_deg}°, "
+                print(f"[Step 3] Precomputing the specular cones L_j(r), shared rays "
+                      f"(apertures={rc.spec_cone_apertures_deg}°, "
                       f"S={rc.spec_cone_shared_samples})…")
                 _precompute_spec_cone_shared(
                     rc, ium_res, model, ium_w, ium_h, tf.frames,
                     visibility_map, len(all_cameras),
                     skybox_flat_step3, [sky_w, sky_h], spec_dir)
             elif rc.spec_cone_scheme == "per_camera":
-                print(f"[Step 3] Precompute Specular Cone L_j(r) "
-                      f"(aperture={rc.spec_cone_apertures_deg}°, "
+                print(f"[Step 3] Precomputing the specular cones L_j(r) "
+                      f"(apertures={rc.spec_cone_apertures_deg}°, "
                       f"alloc={rc.spec_cone_sample_alloc}, "
                       f"budget={rc.spec_cone_samples_budget})…")
                 _precompute_spec_cone(rc, ium_res, model, ium_w, ium_h, tf.frames,
@@ -3421,18 +3423,18 @@ def _step3_posttrain_assets(
                                       skybox_flat_step3, [sky_w, sky_h], spec_dir)
             else:
                 raise ValueError(
-                    f"spec_cone_scheme sconosciuto: {rc.spec_cone_scheme!r} "
-                    "(attesi 'per_camera' o 'shared')")
+                    f"unknown spec_cone_scheme: {rc.spec_cone_scheme!r} "
+                    "(expected 'per_camera' or 'shared')")
             ium_result_data["spec_cone_dir"] = _as_relative_to(
                 spec_dir.resolve().as_posix(), assets_dir_str)
             if timer is not None:
                 timer.record("step3/spec_cone", time.perf_counter() - _t3_spec)
 
-    # Aggiorna il JSON e riscrivi. Con una ROI attiva il JSON di radice resta
-    # intatto e quello arricchito va nella sandbox, con i file_path riscritti in
-    # assoluto: nella radice sono relativi a output_dir e load_transforms li
-    # risolverebbe rispetto alla sandbox. solve_pbr ne usa solo gli stem, ma così
-    # anche `python pbr_solver.py <sandbox>` continua a funzionare.
+    # Update the JSON and rewrite it. With a ROI active the root JSON stays intact and
+    # the enriched one goes into the sandbox, with the file_paths rewritten as absolute:
+    # in the root they are relative to output_dir, and load_transforms would resolve
+    # them against the sandbox. solve_pbr only uses their stems, but this way
+    # `python pbr_solver.py <sandbox>` keeps working too.
     if ium_result_data:
         output_json["ium"] = ium_result_data
     out_json_path = transforms_extended_path
@@ -3443,7 +3445,7 @@ def _step3_posttrain_assets(
             entry["file_path"] = frame.file_path
     with open(out_json_path, "w", encoding="utf-8") as fh:
         json.dump(output_json, fh, indent=4)
-    print(f"\n[Step 3] JSON aggiornato: {out_json_path}")
+    print(f"\n[Step 3] JSON updated: {out_json_path}")
     return output_json
 
 
@@ -3453,17 +3455,17 @@ def _step4_reconstruction(
     tb_logger=None,
     timer=None,
 ) -> dict:
-    """Step 4 — ricostruzione (fit PBR + albedo) dalla sola cache su disco dello Step 3.
+    """Step 4 — reconstruction (PBR fit + albedo) from the Step 3 on-disk cache alone.
 
-    Non usa OptiX né il checkpoint NeRF: legge spec_cone/, sources/{src}/color_texture/,
-    irradiance/ e ium/ già prodotti dallo Step 3, quindi si può rieseguire da solo
-    (run_step1/2/3=False, run_step4=True) per iterare sulla ricostruzione senza ri-bake
-    dei coni. Aggiorna transforms_extended.json in-place con le chiavi
-    metallic/roughness/albedo_pbr/albedo.
+    It uses neither OptiX nor the NeRF checkpoint: it reads spec_cone/,
+    sources/{src}/color_texture/, irradiance/ and ium/ already produced by Step 3, so
+    it can be re-run on its own (run_step1/2/3=False, run_step4=True) to iterate on the
+    reconstruction without re-baking the cones. It updates transforms_extended.json in
+    place with the metallic/roughness/albedo_pbr/albedo keys.
 
-    Con una ROI attiva legge e scrive nella sandbox roi/<tag>/, dove lo Step 3 ha
-    lasciato ium/, spec_cone/ e sources/ già ristretti: qui non serve nessuna
-    logica ROI, il fit e l'albedo si limitano da soli rileggendo ium_masks.
+    With a ROI active it reads and writes inside the roi/<tag>/ sandbox, where Step 3
+    left ium/, spec_cone/ and sources/ already restricted: no ROI logic is needed here,
+    the fit and the albedo restrict themselves by re-reading ium_masks.
     """
     rc = cfg.render
     json_dir = Path(rc.output_dir).resolve()
@@ -3474,25 +3476,25 @@ def _step4_reconstruction(
         roi_json = assets_dir / "transforms_extended.json"
         if not roi_json.exists():
             raise FileNotFoundError(
-                f"Step 4 con ROI '{roi_tag}': la sandbox {assets_dir} non contiene "
-                f"gli output dello Step 3. Eseguire prima run_step3=True con la "
-                f"stessa ROI.")
+                f"Step 4 with ROI '{roi_tag}': the sandbox {assets_dir} does not hold "
+                f"the Step 3 outputs. Run run_step3=True with the same ROI "
+                f"first.")
         transforms_extended_path = roi_json
 
     with open(transforms_extended_path, encoding="utf-8") as fh:
         output_json = json.load(fh)
     ium_result_data: dict = output_json.get("ium", {})
 
-    # ── PBR maps (metallic / roughness dal fit spec-cone) ────────────────────
-    # Eseguito per OGNI sorgente in color_texture_image_sources, sotto sources/{src}/.
-    # solve_pbr legge tutto da disco (spec_cone/, camera_texture/, pixel_change/).
+    # ── PBR maps (metallic / roughness from the spec-cone fit) ───────────────
+    # Run for EVERY source in color_texture_image_sources, under sources/{src}/.
+    # solve_pbr reads everything from disk (spec_cone/, camera_texture/, pixel_change/).
     if rc.render_pbr_maps:
         _t4_pbr = time.perf_counter()
-        spec_meta = assets_dir / "spec_cone" / "spec_cone_meta.json"   # source-indipendente
+        spec_meta = assets_dir / "spec_cone" / "spec_cone_meta.json"   # source-independent
         if spec_meta.exists():
             from pbr_solver import solve_pbr
             for src in rc.color_texture_image_sources:
-                print(f"[Step 4] Fit PBR ({src}) → metallic/roughness "
+                print(f"[Step 4] PBR fit ({src}) → metallic/roughness "
                       f"(spec_threshold={rc.pbr_spec_threshold})…")
                 pbr_out = solve_pbr(assets_dir_str, source=src,
                                     spec_threshold=rc.pbr_spec_threshold,
@@ -3507,35 +3509,35 @@ def _step4_reconstruction(
                 if pbr_out.get("albedo_pbr_path"):
                     ium_result_data[f"albedo_pbr_path_{src}"] = _as_relative_to(
                         pbr_out["albedo_pbr_path"], assets_dir_str)
-                # Il dict di ritorno porta anche le mappe a piena risoluzione
-                # (~900 MiB): qui servono solo i path, e senza il del resterebbero
-                # vive per tutta la sorgente successiva.
+                # The returned dict also carries the full-resolution maps (~900 MiB):
+                # only the paths are needed here, and without the del they would stay
+                # alive throughout the next source.
                 del pbr_out
             if timer is not None:
                 timer.record("step4/pbr", time.perf_counter() - _t4_pbr)
         else:
-            print("    ⚠  render_pbr_maps: manca spec_cone_meta.json → skip "
-                  "(serve precompute_spec_cone nello Step 3)")
+            print("    ⚠  render_pbr_maps: spec_cone_meta.json missing → skipped "
+                  "(precompute_spec_cone is needed in Step 3)")
 
-    # ── Albedo = π · color / max(irradiance + indiretta, eps) ────────────────
-    # Riletta interamente da disco: color_texture per sorgente, irradiance condivisa.
+    # ── Albedo = π · color / max(irradiance + indirect, eps) ─────────────────
+    # Read entirely from disk: colour texture per source, shared irradiance.
     if rc.render_albedo:
         _t4_alb = time.perf_counter()
         irr_path = assets_dir / "irradiance" / f"irradiance{rc.irradiance_format.extension}"
         if not irr_path.exists():
-            print(f"    ⚠  render_albedo: manca {irr_path} → skip "
-                  "(serve render_irradiance nello Step 3)")
+            print(f"    ⚠  render_albedo: {irr_path} missing → skipped "
+                  "(render_irradiance is needed in Step 3)")
         else:
-            print(f"[Step 4] Calcolo Albedo = π · color / max(irradiance, {rc.albedo_eps})…")
+            print(f"[Step 4] Computing albedo = π · color / max(irradiance, {rc.albedo_eps})…")
 
-            # Denominatore condiviso: irradiance diretta (+ indiretta se presente)
+            # Shared denominator: direct irradiance (+ indirect when present)
             irr = _load_image_hw3_native(irr_path.as_posix())
             ind_path = assets_dir / "irradiance" / f"irradiance_indirect{rc.indirect_format.extension}"
             if ind_path.exists():
                 irr = irr + _load_image_hw3_native(ind_path.as_posix())
             denom = np.maximum(irr, rc.albedo_eps)
 
-            # Maschera IUM (canale 0 > 0.5 = texel valido); salvata con rc.ium_format
+            # IUM mask (channel 0 > 0.5 = valid texel); saved with rc.ium_format
             mask_path = assets_dir / "ium" / f"ium_masks{rc.ium_format.extension}"
             mask = None
             if mask_path.exists():
@@ -3545,8 +3547,8 @@ def _step4_reconstruction(
                 color_path = (assets_dir / "sources" / src / "color_texture"
                               / f"color_texture{rc.color_texture_format.extension}")
                 if not color_path.exists():
-                    print(f"    ⚠  albedo ({src}): manca {color_path} → skip "
-                          "(serve render_color_texture nello Step 3)")
+                    print(f"    ⚠  albedo ({src}): {color_path} missing → skipped "
+                          "(render_color_texture is needed in Step 3)")
                     continue
                 color = _load_image_hw3_native(color_path.as_posix())
                 albedo = (np.float32(np.pi) * color) / denom
@@ -3560,7 +3562,7 @@ def _step4_reconstruction(
                 _save_layer(albedo, alb_path, rc.albedo_format, DataLayer.ALBEDO)
                 ium_result_data[f"albedo_path_{src}"] = _as_relative_to(alb_path, assets_dir_str)
 
-                # — TensorBoard: albedo è già in [0,1] → no tonemap —
+                # — TensorBoard: the albedo is already in [0,1] → no tonemap —
                 if tb_logger is not None:
                     tb_logger.log_image(f"texture/albedo_{src}", albedo, step=0, tonemap=False)
                     tb_logger.flush()
@@ -3568,12 +3570,12 @@ def _step4_reconstruction(
             if timer is not None:
                 timer.record("step4/albedo", time.perf_counter() - _t4_alb)
 
-    # Aggiorna il JSON in-place e riscrivi
+    # Update the JSON in place and rewrite it
     if ium_result_data:
         output_json["ium"] = ium_result_data
     with open(transforms_extended_path, "w", encoding="utf-8") as fh:
         json.dump(output_json, fh, indent=4)
-    print(f"\n[Step 4] JSON aggiornato: {transforms_extended_path}")
+    print(f"\n[Step 4] JSON updated: {transforms_extended_path}")
     return output_json
 
 
@@ -3583,18 +3585,18 @@ def run_pipeline(
     tb_run_dir: str | None = None,
     tb_enabled: bool = True,
 ) -> dict:
-    """Orchestratore a quattro step. Ogni step può essere abilitato/disabilitato.
+    """Four-step orchestrator. Each step can be enabled or disabled independently.
 
-    Step 1 (run_step1): depth+mask per frame + copia immagini + transforms_extended.json minimo.
-    Step 2 (run_step2): training NeRF via nerf/train.py, salva checkpoint.
+    Step 1 (run_step1): per-frame depth+mask, image copies, minimal transforms_extended.json.
+    Step 2 (run_step2): NeRF training via nerf/train.py, saves the checkpoint.
     Step 3 (run_step3): IUM/visibility/color_texture/irradiance/indirect/spec_cone (bake).
-    Step 4 (run_step4): ricostruzione (fit PBR + albedo) dalla sola cache su disco dello
-                        Step 3 — indipendente da OptiX/NeRF, rieseguibile per iterare
-                        sulla ricostruzione senza ri-bake dei coni.
+    Step 4 (run_step4): reconstruction (PBR fit + albedo) from the Step 3 on-disk cache
+                        alone — independent of OptiX/NeRF, re-runnable to iterate on the
+                        reconstruction without re-baking the cones.
 
-    ``tb_run_dir`` è la cartella in cui scrivere gli event file TensorBoard.
-    Se None, viene usata <output_dir>/tensorboard.
-    ``tb_enabled=False`` disabilita completamente il logging TB (no-op).
+    ``tb_run_dir`` is the folder the TensorBoard event files are written to.
+    When None, <output_dir>/tensorboard is used.
+    ``tb_enabled=False`` disables TB logging entirely (a no-op).
     """
     sys.path.insert(0, str(Path(__file__).parent))
     from monitoring import RunLogger, StageTimer, log_timing_breakdown
@@ -3607,7 +3609,7 @@ def run_pipeline(
     logger = RunLogger(_tb_dir, enabled=tb_enabled)
     timer  = StageTimer()
 
-    # Log della config all'inizio del run
+    # Log the config at the start of the run
     logger.log_text("run/config", json.dumps(asdict(cfg), indent=2, default=str), step=0)
 
     transforms_extended = Path(cfg.render.output_dir) / "transforms_extended.json"
@@ -3619,18 +3621,18 @@ def run_pipeline(
                 transforms_extended = _step1_pretrain_data(cfg, optix)
         elif not transforms_extended.exists():
             raise FileNotFoundError(
-                f"Step 1 disabilitato ma {transforms_extended} non esiste.\n"
-                "Attivare run_step1=True oppure eseguire Step 1 manualmente."
+                f"Step 1 is disabled but {transforms_extended} does not exist.\n"
+                "Set run_step1=True, or run Step 1 manually."
             )
         else:
-            # Validazione minima del JSON esistente
+            # Minimal validation of the existing JSON
             with open(transforms_extended, encoding="utf-8") as fh:
                 _probe = json.load(fh)
             frames = _probe.get("frames", [])
             if frames and ("depth_path" not in frames[0] or "mask_path" not in frames[0]):
                 raise ValueError(
-                    f"{transforms_extended} non contiene depth_path/mask_path per frame.\n"
-                    "Attivare run_step1=True per rigenerarlo."
+                    f"{transforms_extended} has no depth_path/mask_path per frame.\n"
+                    "Set run_step1=True to regenerate it."
                 )
 
         ckpt_path = Path(cfg.nerf_ckpt_path or
@@ -3650,12 +3652,12 @@ def run_pipeline(
                         _step2b_render_train_images(cfg, transforms_extended, ckpt_path)
                     render_dir = cfg.nerf_render_train_images_dir or \
                                  str(Path(cfg.render.output_dir) / "nerf_render_images")
-                    print(f"  EXR/PNG salvati in: {render_dir}")
+                    print(f"  EXR/PNG saved to: {render_dir}")
 
                 if not cfg.nerf_interactive_loop:
                     break
                 try:
-                    ans = input("\nContinuare il training? [y/N]: ").strip().lower()
+                    ans = input("\nContinue training? [y/N]: ").strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     break
                 if ans != "y":
@@ -3665,11 +3667,11 @@ def run_pipeline(
               and (cfg.render.precompute_indirect or cfg.render.precompute_spec_cone)
               and not ckpt_path.exists()):
             raise FileNotFoundError(
-                f"Step 2 disabilitato ma il checkpoint NeRF non esiste: {ckpt_path}\n"
-                "Attivare run_step2=True oppure fornire nerf_ckpt_path valido."
+                f"Step 2 is disabled but the NeRF checkpoint does not exist: {ckpt_path}\n"
+                "Set run_step2=True, or provide a valid nerf_ckpt_path."
             )
 
-        # Libera la VRAM del training NeRF prima che OptiX allochi i buffer Step 3
+        # Free the NeRF training VRAM before OptiX allocates the Step 3 buffers
         import gc
         gc.collect()
         try:
@@ -3692,9 +3694,9 @@ def run_pipeline(
             with open(transforms_extended, encoding="utf-8") as fh:
                 result = json.load(fh)
 
-        # Step 4 — ricostruzione (fit PBR + albedo) dalla cache su disco dello Step 3.
-        # Indipendente da run_step3: con run_step1/2/3=False si itera sulla
-        # ricostruzione senza ri-bake dei coni (non richiede OptiX né il checkpoint).
+        # Step 4 — reconstruction (PBR fit + albedo) from the Step 3 on-disk cache.
+        # Independent of run_step3: with run_step1/2/3=False the reconstruction can be
+        # iterated on without re-baking the cones (no OptiX, no checkpoint needed).
         if cfg.run_step4:
             with timer("step4"):
                 result = _step4_reconstruction(
@@ -3736,11 +3738,11 @@ def run_pipeline(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Manifest per-run e runner multi-scena
+# Per-run manifest and multi-scene runner
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _write_run_manifest(cfg: PipelineConfig, scene: SceneConfig, run_note: str) -> None:
-    """Salva run_manifest.json in output_dir con config completa + timestamp + nota."""
+    """Write run_manifest.json in output_dir: full config + timestamp + note."""
     def _enc(o: object) -> str:
         if isinstance(o, Enum):
             return o.name
@@ -3752,13 +3754,13 @@ def _write_run_manifest(cfg: PipelineConfig, scene: SceneConfig, run_note: str) 
         "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
         "run_note": run_note,
         "scene": asdict(scene),
-        "config": asdict(cfg),   # include output_dir e tutti i path già risolti per la scena
+        "config": asdict(cfg),   # includes output_dir and every path already resolved for the scene
     }
     out = Path(cfg.render.output_dir) / "run_manifest.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2, ensure_ascii=False, default=_enc)
-    print(f"  manifest salvato → {out}")
+    print(f"  manifest saved → {out}")
 
 
 def run_pipeline_multi(
@@ -3771,36 +3773,36 @@ def run_pipeline_multi(
     tb_log_root: str | None = None,
     tb_enabled: bool = True,
 ) -> dict:
-    """Esegue run_pipeline su ogni scena in sequenza, in sottocartelle distinte.
+    """Run run_pipeline on each scene in sequence, in separate subfolders.
 
-    Per ogni SceneConfig:
-    - clona ``template`` (deep-copy, sicuro con i default_factory mutabili)
-    - sovrascrive i path per-scena e ``output_dir = <output_root>/<scene.name>``
-    - scrive ``run_manifest.json`` nella sottocartella
-    - chiama ``run_pipeline`` con un log_dir TensorBoard isolato
+    For every SceneConfig it:
+    - clones ``template`` (a deep copy, safe with the mutable default_factory fields)
+    - overrides the per-scene paths and ``output_dir = <output_root>/<scene.name>``
+    - writes ``run_manifest.json`` into the subfolder
+    - calls ``run_pipeline`` with an isolated TensorBoard log_dir
 
-    ``experiment_tag`` raggruppa i run correlati in TensorBoard sotto un unico prefisso.
-    Se vuoto, viene derivato dal nome base di ``output_root``.
+    ``experiment_tag`` groups related runs in TensorBoard under a single prefix.
+    When empty it is derived from the base name of ``output_root``.
 
-    ``tb_log_root`` è la radice dei log TensorBoard (deve corrispondere al volume
-    montato in docker/tensorboard/docker-compose.yml). Se None, viene letta dalla
-    variabile d'ambiente ``TB_LOG_ROOT``; se anche questa manca, il default è
+    ``tb_log_root`` is the root of the TensorBoard logs (it must match the volume
+    mounted in docker/tensorboard/docker-compose.yml). When None it is read from the
+    ``TB_LOG_ROOT`` environment variable; if that is missing too, the default is
     ``D:/tesi_output/tb_logs``.
 
-    Ogni esecuzione di questa funzione crea sotto:
+    Every invocation of this function creates:
       ``<tb_log_root>/<experiment_tag>/<scene.name>/<YYYYMMDD-HHMMSS>/``
-    in modo da isolare i re-run (niente curve fuse/zig-zag in TensorBoard).
+    so that re-runs stay isolated (no merged, zig-zagging curves in TensorBoard).
 
-    Se un run fallisce, l'errore viene loggato e si prosegue con il successivo.
-    Al termine viene stampato un riepilogo con lo stato di ogni scena.
+    If a run fails, the error is logged and the next one proceeds. A summary with the
+    status of every scene is printed at the end.
 
-    ``nerf_ckpt_path`` / ``nerf_train_output_dir`` restano ``""`` nel template e vengono
-    derivati automaticamente da ``output_dir`` per scena (un checkpoint per scena).
+    ``nerf_ckpt_path`` / ``nerf_train_output_dir`` stay ``""`` in the template and are
+    derived automatically from the per-scene ``output_dir`` (one checkpoint per scene).
 
     Returns:
-        dict scena → risultato di run_pipeline (o None se il run è fallito)
+        dict scene → the run_pipeline result (or None when the run failed)
     """
-    # ── Risolvi tb_log_root ────────────────────────────────────────────────────
+    # ── Resolve tb_log_root ────────────────────────────────────────────────────
     _tb_root = (
         tb_log_root
         or os.environ.get("TB_LOG_ROOT")
@@ -3826,20 +3828,20 @@ def run_pipeline_multi(
         full_note = scene.note if scene.note else run_note
         _write_run_manifest(cfg, scene, full_note)
 
-        # Resume: salta il training NeRF se il checkpoint è già presente
+        # Resume: skip the NeRF training when the checkpoint is already there
         if cfg.resume_skip_step2_if_ckpt and cfg.run_step2:
             _ckpt_resume = Path(cfg.render.output_dir) / "model" / "nerf_model_cache.pt"
             if _ckpt_resume.exists():
-                print(f"  ↻ Checkpoint NeRF già presente; salto Step 2 (run_step2=False): {_ckpt_resume}")
+                print(f"  ↻ NeRF checkpoint already present; skipping Step 2 (run_step2=False): {_ckpt_resume}")
                 cfg.run_step2 = False
 
-        # Log dir TensorBoard per questa scena e questo run (isolato per run-id)
+        # TensorBoard log dir for this scene and this run (isolated by run id)
         tb_run_dir = os.path.join(_tb_root, _tag, scene.name, _run_id)
 
         _log_path = os.path.join(cfg.render.output_dir, "console.log")
         with _console_to_file(_log_path):
             print(f"\n{'='*70}")
-            print(f"  Scena       : {scene.name}")
+            print(f"  Scene       : {scene.name}")
             print(f"  Output      : {cfg.render.output_dir}")
             print(f"  TB log dir  : {tb_run_dir}")
             print(f"  Console log : {_log_path}")
@@ -3851,15 +3853,15 @@ def run_pipeline_multi(
                 )
                 statuses[scene.name] = "ok"
             except Exception as exc:
-                print(f"\n  ✗ [{scene.name}] errore: {exc}")
+                print(f"\n  ✗ [{scene.name}] error: {exc}")
                 import traceback
                 traceback.print_exc()
                 results[scene.name] = None
                 statuses[scene.name] = f"error: {exc}"
 
-    # ── Riepilogo ──────────────────────────────────────────────────────────────
+    # ── Summary ────────────────────────────────────────────────────────────────
     print(f"\n{'='*70}")
-    print("  Riepilogo run_pipeline_multi:")
+    print("  run_pipeline_multi summary:")
     for name, status in statuses.items():
         icon = "✓" if status == "ok" else "✗"
         print(f"    {icon} {name}: {status}")
@@ -3875,24 +3877,24 @@ def run_pipeline_multi(
 if __name__ == "__main__":
     REPO = "C:/Users/adria/Documents/GitHub/Tesi/OptixProjectCMake"
 
-    # ── Template condiviso ────────────────────────────────────────────────────
-    # I path specifici della scena (transforms_path, model_path, external_normal_path,
-    # skybox_path) sono vuoti qui e vengono sovrascritti per ogni SceneConfig.
-    # Tutti gli altri parametri di rendering/NeRF sono condivisi tra le scene.
+    # ── Shared template ───────────────────────────────────────────────────────
+    # The scene-specific paths (transforms_path, model_path, external_normal_path,
+    # skybox_path) are empty here and get overridden for every SceneConfig.
+    # Every other rendering/NeRF parameter is shared across the scenes.
     template = PipelineConfig(
-        run_step1 = False,  # output Step 1 già su disco (exp_l1_d02)
-        run_step2 = False,  # checkpoint NeRF e render Step 2b già su disco
-        run_step3 = True,   # pass texture-space fino al bake dello spec-cone
-        run_step4 = True,   # ricostruzione PBR+albedo (metti run_step3=False per iterare solo qui)
+        run_step1 = False,  # Step 1 outputs already on disk (exp_l1_d02)
+        run_step2 = False,  # NeRF checkpoint and Step 2b renders already on disk
+        run_step3 = True,   # texture-space passes up to the spec-cone bake
+        run_step4 = True,   # PBR+albedo reconstruction (set run_step3=False to iterate here alone)
 
-        resume_skip_step2_if_ckpt = True,   # salta il training NeRF se il checkpoint esiste già
+        resume_skip_step2_if_ckpt = True,   # skip the NeRF training when the checkpoint already exists
 
         render = RenderConfig(
-            # path per-scena (sovrascritta da SceneConfig — non modificare qui)
+            # per-scene paths (overridden by SceneConfig — do not edit them here)
             transforms_path      = "",
             model_path           = "",
             external_normal_path = None,
-            output_dir           = "",  # impostato come <output_root>/<scene.name>
+            output_dir           = "",  # set to <output_root>/<scene.name>
 
             external_normal_resolution_mode = "resample",  # "adapt" | "resample" | "none"
 
@@ -3931,44 +3933,44 @@ if __name__ == "__main__":
             ium_texture_size = [4096, 4096],
             apply_scale      = False,
 
-            color_texture_image_sources = ["gt"], # entrambe processate per intero sotto sources/
+            color_texture_image_sources = ["gt"], # each source processed in full under sources/
 
             precompute_spec_cone = True,
             render_pbr_maps      = True,
-            pbr_spec_threshold   = 0.0,        # roughness fittata scritta ovunque
+            pbr_spec_threshold   = 0.0,        # the fitted roughness is written everywhere
             spec_cone_cameras=None,
 
-            # Raggi condivisi tra le camere: la radianza incidente lungo una
-            # direzione non dipende dalla camera, quindi un solo set Fibonacci per
-            # texel (tracciato e interrogato sul NeRF una volta) serve tutte le m
-            # camere che vedono il texel. A S=16384 il costo pareggia il bake
-            # per-camera quando m≈11: il guadagno è reinvestito in risoluzione,
-            # non in tempo. La griglia di aperture è raffinata nella zona stretta
-            # perché con i raggi condivisi un candidato in più non costa raggi.
-            # Il candidato a 5° riceve ~16 campioni, cioè è al limite del rumore:
-            # se lobe_param/residual lo mostrano instabile, toglierlo dalla griglia.
+            # Rays shared between the cameras: the incident radiance along a direction
+            # does not depend on the camera, so a single Fibonacci set per texel (traced
+            # and queried on the NeRF once) serves all m cameras that see the texel. At
+            # S=16384 the cost breaks even with the per-camera bake when m≈11: the gain
+            # is reinvested in resolution, not in time. The aperture grid is refined in
+            # the narrow region because with shared rays one more candidate costs no
+            # extra rays. The 5° candidate receives ~16 samples, i.e. it sits at the
+            # noise limit: if lobe_param/residual show it to be unstable, drop it from
+            # the grid.
             spec_cone_scheme         = "shared",
             spec_cone_shared_samples = 9216, # 96 x 96 Fibonacci samples per texel (shared)
 
             spec_cone_apertures_deg  = [0.0, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0,
                                         60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180.0],
-            # deve essere multiplo della larghezza IUM: ogni tile è un blocco di
-            # scanline intere, scritte in streaming negli EXR per camera
+            # must be a multiple of the IUM width: every tile is a block of whole
+            # scanlines, streamed into the per-camera EXRs
             spec_cone_tile_size      = 4096,
-            # dirs + radianze costano ~0.6 MB per texel a S=16384: 1024 texel sono
-            # ~0.6 GB di picco. Alzare finché la VRAM regge — sotto-blocchi grandi
-            # riducono l'overhead del loop sulle camere.
+            # dirs + radiances cost ~0.6 MB per texel at S=16384: 1024 texels are ~0.6
+            # GB of peak. Raise it as far as the VRAM allows — large sub-blocks reduce
+            # the overhead of the loop over cameras.
             spec_cone_chunk_texels   = 1024,
-            # il batch della rete è il collo di bottiglia dell'occupazione GPU
+            # the network batch is the bottleneck for GPU occupancy
             spec_cone_nerf_chunk     = 4096*24,
 
-            # Usati solo da spec_cone_scheme="per_camera"
+            # Used only by spec_cone_scheme="per_camera"
             spec_cone_sample_alloc   = "solid_angle",
             spec_cone_samples_budget = 1440,
 
             color_texture_grazing_max_deg = 75.0,
 
-            # Heatmap diagnostica skybox GT vs NeRF-baked (richiede skybox_path nella SceneConfig)
+            # Diagnostic GT vs NeRF-baked skybox heatmap (needs skybox_path in the SceneConfig)
             compare_skybox_to_gt = True,
 
             # roi_rect=[3623,2712, 473,473],
@@ -3977,7 +3979,7 @@ if __name__ == "__main__":
         ),
 
         nerf_num_iters       = 50000,
-        nerf_lr_decay_steps  = 100000,  # ancora fissa = lunghezza pianificata; resume corretto
+        nerf_lr_decay_steps  = 100000,  # fixed anchor = planned length; makes resumes correct
         nerf_batch_size      = 4096*24,
         nerf_lr              = 5e-4,
         nerf_display_every = 100,
@@ -3991,12 +3993,12 @@ if __name__ == "__main__":
         nerf_depth_window_end          = 0.05,
         nerf_opacity_weight            = 1.0,
         nerf_raw_noise_std             = 1.0,
-        # Il raggio della sfera bg è ora bg_radius_mult × (distanza max dall'origine),
-        # non più × max_side della bbox: su questa scena la base passa da 3.2 a 2.266,
-        # quindi 3.0 darebbe R=6.8 contro i ~12 di prima. 5.0 → R=11.3, che tiene il
-        # guscio fuori dal rig di camere (le più lontane stanno a 9.0) e conserva la
-        # risoluzione angolare dell'envmap: quanto spazio occupa il guscio rispetto alle
-        # frequenze del positional encoding decide quanto è nitido skybox_nerf_baked.exr.
+        # The bg sphere radius is now bg_radius_mult × (max distance from the origin),
+        # no longer × the max bbox side: on this scene the base goes from 3.2 to 2.266,
+        # so 3.0 would give R=6.8 against the ~12 of before. 5.0 → R=11.3, which keeps
+        # the shell outside the camera rig (the farthest sit at 9.0) and preserves the
+        # angular resolution of the envmap: how much space the shell takes relative to
+        # the positional-encoding frequencies decides how sharp skybox_nerf_baked.exr is.
         nerf_bg_radius_mult            = 5.0,
         nerf_bg_depth_window           = 0.05,
         nerf_bg_depth_window_end       = 0.05,
@@ -4010,16 +4012,16 @@ if __name__ == "__main__":
 
     )
 
-    # ── Scene ─────────────────────────────────────────────────────────────────
-    # Aggiungere/commentare SceneConfig per scegliere quali scene processare.
-    # L'output di ogni scena finisce in <output_root>/<scene.name>/.
+    # ── Scenes ────────────────────────────────────────────────────────────────
+    # Add or comment out SceneConfig entries to choose which scenes to process.
+    # The output of each scene lands in <output_root>/<scene.name>/.
     SCENES = [
         # SceneConfig(
         #     name             = "TableAndOtherInterior",
         #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXR/transforms.json",
         #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/Models/Baked.obj",
         #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBaked/BakedMaterial_normal.exr",
-        #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
+        #     # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
         #     skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # ),
         # SceneConfig(
@@ -4027,7 +4029,7 @@ if __name__ == "__main__":
         #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
         #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
         #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
-        #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
+        #     # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
         #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # ),
         #  SceneConfig(
@@ -4035,7 +4037,7 @@ if __name__ == "__main__":
         #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRHighDetails/transforms.json",
         #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
         #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
-        #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
+        #     # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
         #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # ),
         SceneConfig(
@@ -4043,7 +4045,7 @@ if __name__ == "__main__":
                     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmoothNight/transforms.json",
                     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
                     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmoothNight/BakedMaterial_normal.exr",
-                    # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
+                    # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
                     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
                 ),
         # SceneConfig(
@@ -4051,7 +4053,7 @@ if __name__ == "__main__":
         #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenExrSmoothNoDiffuse/transforms.json",
         #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
         #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmoothNoDiffuse/BakedMaterial_normal.exr",
-        #     # GT HDR usato solo come riferimento per compare_skybox_to_gt (non per il rendering)
+        #     # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
         #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # )
         # SceneConfig(
@@ -4074,15 +4076,15 @@ if __name__ == "__main__":
 
     ]
 
-    # ── Esecuzione ────────────────────────────────────────────────────────────
-    # Sweep fattoriale 2×2×2: attivazione × loss × decay — 8 run in totale.
-    # Ogni run ottiene il proprio output_root (checkpoint isolati: exp/softplus
+    # ── Execution ─────────────────────────────────────────────────────────────
+    # Factorial 2×2×2 sweep: activation × loss × decay — 8 runs in total.
+    # Each run gets its own output_root (isolated checkpoints: exp and softplus are
 
-    # non sono compatibili tra loro e non devono fare resume incrociato).
-    # TB_LOG_ROOT viene letta da docker/tensorboard/.env — non serve cambiarla qui.
-    # Per un sweep pulito da zero, cambiare SWEEP_ROOT o svuotare la cartella.
+    # not compatible with each other and must not resume across configurations).
+    # TB_LOG_ROOT is read from docker/tensorboard/.env — no need to change it here.
+    # For a clean sweep from scratch, change SWEEP_ROOT or empty the folder.
 
-    # (tag_base, rgb_activation, loss_type) — fattoriale 2×2 attivazione × loss
+    # (tag_base, rgb_activation, loss_type) — 2×2 factorial, activation × loss
     EXPERIMENTS = [
         # ("exp_relmseraw",      "exp",      "rel_mse_raw"),
         # ("softplus_relmseraw", "softplus", "rel_mse_raw"),
@@ -4101,12 +4103,12 @@ if __name__ == "__main__":
             
             cfg = copy.deepcopy(template)
             cfg.nerf_num_iters       = 75000
-            cfg.nerf_lr_decay_steps  = 100000  # ancora fissa allineata a num_iters
+            cfg.nerf_lr_decay_steps  = 100000  # fixed anchor, aligned with num_iters
             cfg.nerf_rgb_activation  = act
             cfg.nerf_loss_type       = loss
             cfg.nerf_lr_decay        = decay
-            cfg.render.skybox_source = "nerf"  # il campo vive su RenderConfig, non su PipelineConfig
-            tag = f"{name}_d{str(decay).replace('.', '')}"  # es. exp_l1_d01
+            cfg.render.skybox_source = "nerf"  # the field lives on RenderConfig, not PipelineConfig
+            tag = f"{name}_d{str(decay).replace('.', '')}"  # e.g. exp_l1_d01
             run_pipeline_multi(
                 cfg, SCENES,
                 output_root    = f"{SWEEP_ROOT}/{tag}",
