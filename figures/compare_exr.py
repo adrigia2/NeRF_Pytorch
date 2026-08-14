@@ -1,26 +1,26 @@
-"""Confronto pixel-a-pixel di due set di render EXR.
+"""Pixel-by-pixel comparison of two sets of EXR renders.
 
-Per ogni coppia di immagini con lo stesso nome produce una figura a tre pannelli:
+For every pair of images with the same name it produces a three-panel figure:
 
     Original (NerfOpenEXRSmooth) | Computed (NerfOpenEXRSmoothRerender) | heatmap
 
-La heatmap mostra la norma L2 della differenza RGB, ||A - B||_2, in scala
-logaritmica con normalizzazione GLOBALE su tutte le coppie: lo stesso colore
-significa lo stesso errore in ogni frame.
+The heatmap shows the L2 norm of the RGB difference, ||A - B||_2, on a logarithmic
+scale with a GLOBAL normalization over every pair: the same colour means the same
+error in every frame.
 
-La differenza e' sempre calcolata sui valori lineari originali dell'EXR.
-Il tone mapping (Reinhard + gamma sRGB) e' applicato solo ai due pannelli di
-sinistra, per la sola visualizzazione, e in modo identico a entrambi.
+The difference is always computed on the original linear values of the EXR.
+Tone mapping (Reinhard + sRGB gamma) is applied only to the two left panels, for
+display only, and identically to both.
 
-Richiede un ambiente con opencv, numpy e matplotlib funzionanti; nel base env di
-Anaconda matplotlib e' rotto (ABI NumPy 1.x vs 2.x), usare invece:
+Requires an environment with working opencv, numpy and matplotlib; in Anaconda's base
+env matplotlib is broken (NumPy 1.x vs 2.x ABI), so use instead:
 
     C:\\Users\\adria\\anaconda3\\envs\\nerfpytorch\\python.exe compare_exr.py
 """
 
 from __future__ import annotations
 
-# Va impostato PRIMA di importare cv2, altrimenti imread() ritorna None sugli EXR.
+# Must be set BEFORE importing cv2, otherwise imread() returns None on EXRs.
 import os
 
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
@@ -46,56 +46,56 @@ DIR_ORIGINAL = os.path.join(ROOT, "NerfOpenEXRSmooth", "images")
 DIR_COMPUTED = os.path.join(ROOT, "NerfOpenEXRSmoothRerender", "images")
 DIR_OUTPUT = os.path.join(ROOT, "output")
 
-# Geometria della figura, in pixel. A dpi=100 ogni pannello riceve esattamente
-# i suoi 1920x1080 pixel nativi, senza riscalature.
+# Figure geometry, in pixels. At dpi=100 each panel gets exactly its native
+# 1920x1080 pixels, with no rescaling.
 PANEL_W, PANEL_H = 1920, 1080
 MARGIN = 20
 PANEL_GAP = 20
 CBAR_GAP = 30
 CBAR_W = 30
 CBAR_LABEL_W = 140
-TOP_BAR = 170  # spazio per suptitle + titoli dei pannelli
+TOP_BAR = 170  # room for the suptitle and the panel titles
 
 
 # --------------------------------------------------------------------------- #
-# Tone mapping (solo display)
+# Tone mapping (display only)
 # --------------------------------------------------------------------------- #
 
 
 def srgb_encode(y: np.ndarray) -> np.ndarray:
-    """Encoding sRGB standard su valori gia' in [0, 1]."""
+    """Standard sRGB encoding on values already in [0, 1]."""
     y = np.clip(y, 0.0, 1.0)
     return np.where(y <= 0.0031308, 12.92 * y, 1.055 * np.power(y, 1.0 / 2.4) - 0.055)
 
 
 def tonemap(bgr: np.ndarray) -> np.ndarray:
-    """Reinhard x/(1+x) + gamma sRGB. Ritorna RGB float in [0, 1].
+    """Reinhard x/(1+x) + sRGB gamma. Returns float RGB in [0, 1].
 
-    L'input e' BGR come lo restituisce cv2.imread; l'ordine viene invertito qui.
+    The input is BGR, as cv2.imread returns it; the order is reversed here.
     """
-    x = np.maximum(bgr.astype(np.float32), 0.0)  # gli EXR possono avere negativi minimi
+    x = np.maximum(bgr.astype(np.float32), 0.0)  # EXRs can hold slightly negative values
     y = x / (1.0 + x)
     return srgb_encode(y)[:, :, ::-1]
 
 
 # --------------------------------------------------------------------------- #
-# I/O e differenza
+# I/O and difference
 # --------------------------------------------------------------------------- #
 
 
 def read_exr(path: str) -> np.ndarray:
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
-        raise RuntimeError(f"impossibile leggere l'EXR: {path}")
+        raise RuntimeError(f"cannot read the EXR: {path}")
     if img.ndim != 3 or img.shape[2] < 3:
-        raise RuntimeError(f"attesi 3 canali, trovato shape {img.shape}: {path}")
+        raise RuntimeError(f"expected 3 channels, got shape {img.shape}: {path}")
     return img[:, :, :3].astype(np.float32)
 
 
 def diff_norm(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Norma L2 per pixel sui valori lineari originali.
+    """Per-pixel L2 norm on the original linear values.
 
-    L'ordine dei canali e' irrilevante: la norma L2 ne e' invariante.
+    The channel order is irrelevant: the L2 norm is invariant to it.
     """
     d = a - b
     return np.sqrt(np.einsum("ijk,ijk->ij", d, d, optimize=True))
@@ -115,10 +115,10 @@ def frame_stats(d: np.ndarray, vmin: float) -> dict:
 
 
 def find_pairs(dir_a: str, dir_b: str) -> tuple[list[str], list[str], list[str]]:
-    """Ritorna (comuni, solo_in_a, solo_in_b), ordinati in modo naturale."""
+    """Returns (common, only_in_a, only_in_b), in natural order."""
     for d in (dir_a, dir_b):
         if not os.path.isdir(d):
-            raise SystemExit(f"cartella non trovata: {d}")
+            raise SystemExit(f"folder not found: {d}")
 
     def exrs(d):
         return {f for f in os.listdir(d) if f.lower().endswith(".exr")}
@@ -151,15 +151,15 @@ def render_figure(
     out_path: str,
 ) -> None:
     h, w = d.shape
-    # La geometria e' calcolata sulla risoluzione reale delle immagini, cosi'
-    # lo script regge anche render a risoluzione diversa da 1920x1080.
+    # The geometry is computed on the real image resolution, so the script also
+    # handles renders at a resolution other than 1920x1080.
     total_w = MARGIN + 3 * w + 2 * PANEL_GAP + CBAR_GAP + CBAR_W + CBAR_LABEL_W
     total_h = TOP_BAR + h + MARGIN
 
     fig = plt.figure(figsize=(total_w / dpi, total_h / dpi), dpi=dpi, facecolor="white")
 
     cmap = plt.get_cmap(cmap_name).copy()
-    # Sotto il floor = differenza numericamente irrilevante -> nero pieno.
+    # Below the floor = numerically irrelevant difference -> solid black.
     cmap.set_under("black")
     cmap.set_bad("black")
 
@@ -226,42 +226,42 @@ def render_figure(
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        description="Confronto EXR con heatmap logaritmica della differenza."
+        description="EXR comparison with a logarithmic heatmap of the difference."
     )
-    ap.add_argument("--original", default=DIR_ORIGINAL, help="cartella immagini Original")
-    ap.add_argument("--computed", default=DIR_COMPUTED, help="cartella immagini Computed")
-    ap.add_argument("--output", default=DIR_OUTPUT, help="cartella di output")
+    ap.add_argument("--original", default=DIR_ORIGINAL, help="Original images folder")
+    ap.add_argument("--computed", default=DIR_COMPUTED, help="Computed images folder")
+    ap.add_argument("--output", default=DIR_OUTPUT, help="output folder")
     ap.add_argument(
         "--vmin",
         type=float,
         default=1e-4,
-        help="floor della scala log; sotto questo valore la differenza e' "
+        help="floor of the log scale; below this value the difference is "
         "rumore float (default: 1e-4)",
     )
     ap.add_argument(
         "--vmax-exact",
         action="store_true",
-        help="usa il massimo globale esatto invece di arrotondarlo alla decade",
+        help="use the exact global maximum instead of rounding it to the decade",
     )
     ap.add_argument("--cmap", default="inferno", help="colormap matplotlib (default: inferno)")
-    ap.add_argument("--dpi", type=int, default=100, help="dpi della figura (default: 100)")
-    ap.add_argument("--limit", type=int, default=0, help="processa solo le prime N coppie")
+    ap.add_argument("--dpi", type=int, default=100, help="figure dpi (default: 100)")
+    ap.add_argument("--limit", type=int, default=0, help="process only the first N pairs")
     ap.add_argument(
         "--dry-run",
         action="store_true",
-        help="elenca le coppie trovate e verifica la corrispondenza, senza scrivere nulla",
+        help="list the pairs found and check they match, without writing anything",
     )
     args = ap.parse_args(argv)
 
     names, only_a, only_b = find_pairs(args.original, args.computed)
     if only_a or only_b:
-        print(f"ATTENZIONE: {len(only_a)} file solo in Original, {len(only_b)} solo in Computed")
+        print(f"WARNING: {len(only_a)} files only in Original, {len(only_b)} only in Computed")
         for n in only_a[:10]:
-            print(f"  solo Original: {n}")
+            print(f"  Original only: {n}")
         for n in only_b[:10]:
-            print(f"  solo Computed: {n}")
+            print(f"  Computed only: {n}")
     if not names:
-        print("nessuna coppia trovata.", file=sys.stderr)
+        print("no pair found.", file=sys.stderr)
         return 1
     if args.limit:
         names = names[: args.limit]
@@ -273,7 +273,7 @@ def main(argv=None) -> int:
     if args.dry_run:
         for n in names:
             print(f"  {n}")
-        print("\n--dry-run: nessun file scritto.")
+        print("\n--dry-run: no file written.")
         return 0
 
     os.makedirs(args.output, exist_ok=True)
@@ -287,7 +287,7 @@ def main(argv=None) -> int:
         a = read_exr(os.path.join(args.original, n))
         b = read_exr(os.path.join(args.computed, n))
         if a.shape != b.shape:
-            raise SystemExit(f"dimensioni diverse per {n}: {a.shape} vs {b.shape}")
+            raise SystemExit(f"different sizes for {n}: {a.shape} vs {b.shape}")
         s = frame_stats(diff_norm(a, b), args.vmin)
         stats_all[n] = s
         vmax_global = max(vmax_global, s["max"])
@@ -296,8 +296,8 @@ def main(argv=None) -> int:
 
     if vmax_global <= args.vmin:
         raise SystemExit(
-            f"il massimo globale ({vmax_global:.3g}) non supera --vmin ({args.vmin:g}): "
-            "le immagini sono identiche o il floor e' troppo alto."
+            f"the global maximum ({vmax_global:.3g}) does not exceed --vmin ({args.vmin:g}): "
+            "the images are identical, or the floor is too high."
         )
     vmax = vmax_global if args.vmax_exact else 10.0 ** math.ceil(math.log10(vmax_global))
     print(f"  scala log: vmin={args.vmin:g}  vmax={vmax:g}")
@@ -337,20 +337,20 @@ def main(argv=None) -> int:
         f.write("Confronto EXR: Original vs Computed\n")
         f.write(f"  Original      : {args.original}\n")
         f.write(f"  Computed      : {args.computed}\n")
-        f.write(f"  coppie        : {len(names)}\n\n")
-        f.write("Differenza = ||A - B||_2 per pixel, sui valori lineari originali\n")
-        f.write("(nessun tone mapping, nessun clipping).\n\n")
+        f.write(f"  pairs         : {len(names)}\n\n")
+        f.write("Difference = ||A - B||_2 per pixel, on the original linear values\n")
+        f.write("(no tone mapping, no clipping).\n\n")
         f.write(f"  max globale   : {vmax_global:.8g}\n")
         f.write(f"  scala log vmin: {args.vmin:g}\n")
         f.write(f"  scala log vmax: {vmax:g}\n")
         f.write(f"  colormap      : {args.cmap}\n\n")
         mean_rmse = sum(stats_all[n]["rmse"] for n in names) / len(names)
         f.write(f"  RMSE medio su tutti i frame: {mean_rmse:.8g}\n\n")
-        f.write("Frame ordinati per RMSE decrescente (primi 10):\n")
+        f.write("Frames sorted by decreasing RMSE (first 10):\n")
         for n in worst[:10]:
             s = stats_all[n]
             f.write(f"  {n:34s} rmse={s['rmse']:.6g}  max={s['max']:.6g}  mean={s['mean']:.6g}\n")
-        f.write("\nFrame piu' simili (ultimi 10):\n")
+        f.write("\nMost similar frames (last 10):\n")
         for n in worst[-10:][::-1]:
             s = stats_all[n]
             f.write(f"  {n:34s} rmse={s['rmse']:.6g}  max={s['max']:.6g}  mean={s['mean']:.6g}\n")
@@ -358,8 +358,8 @@ def main(argv=None) -> int:
     print(f"\nScritti {len(names)} PNG")
     print(f"  {csv_path}")
     print(f"  {txt_path}")
-    print(f"\nFrame con RMSE piu' alto : {worst[0]}  (rmse={stats_all[worst[0]]['rmse']:.6g})")
-    print(f"Frame con RMSE piu' basso: {worst[-1]}  (rmse={stats_all[worst[-1]]['rmse']:.6g})")
+    print(f"\nFrame with the highest RMSE: {worst[0]}  (rmse={stats_all[worst[0]]['rmse']:.6g})")
+    print(f"Frame with the lowest RMSE : {worst[-1]}  (rmse={stats_all[worst[-1]]['rmse']:.6g})")
     return 0
 
 

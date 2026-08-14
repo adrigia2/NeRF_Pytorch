@@ -1,21 +1,21 @@
 #!/usr/bin/env python
-"""Rilancia Step 3 + Step 4 di una run già esistente restringendoli a una ROI.
+"""Re-run Step 3 + Step 4 of an existing run, restricted to a ROI.
 
-Serve a verificare la ROI in spazio texture: la run piena su disco fa da
-riferimento, questo script la ri-esegue su una porzione e lascia il risultato in
-`<run_dir>/roi/<tag>/`, dopodiché `compare_roi_run.py` confronta i due alberi.
+It is there to verify the texture-space ROI: the full run on disk is the reference, this
+script re-runs it on a portion and leaves the result in
+`<run_dir>/roi/<tag>/`, after which `compare_roi_run.py` compares the two trees.
 
-La configurazione **non** viene ritrascritta a mano ma ricostruita da
-`run_manifest.json`: una sola differenza (un'apertura, un numero di campioni, la
-finestra di profondità) renderebbe il confronto privo di significato. Lo script
-verifica esplicitamente che la config ricostruita coincida con quella del
-manifest su ogni chiave tranne quelle che deve cambiare, e si ferma se non è così.
+The configuration is **not** transcribed by hand but rebuilt from `run_manifest.json`: a
+single difference (an aperture, a sample count, the
+depth window) would make the comparison meaningless.
+It checks explicitly that the rebuilt config matches the manifest's on every key except
+those it has to change, and stops if it does not.
 
-Uso:
-    python roi_rerun.py <run_dir> --rect X0 Y0 W H [--tag NOME] [--mask FILE]
+Usage:
+    python roi_rerun.py <run_dir> --rect X0 Y0 W H [--tag NAME] [--mask FILE]
 
-Chiama `run_pipeline` direttamente e non `run_pipeline_multi`, che riscriverebbe
-`run_manifest.json` e farebbe append sul `console.log` della run di riferimento.
+It calls `run_pipeline` directly rather than `run_pipeline_multi`, which would rewrite
+`run_manifest.json` and append to the reference run's `console.log`.
 """
 
 from __future__ import annotations
@@ -38,22 +38,22 @@ from images_generator import (  # noqa: E402
     run_pipeline,
 )
 
-# Chiavi che questo script cambia di proposito: sono le uniche differenze
-# ammesse rispetto al manifest della run di riferimento.
+# Keys this script changes on purpose: they are the only differences allowed with
+# respect to the reference run's manifest.
 _EXPECTED_DIFFS = {
     "run_step1", "run_step2", "run_step3", "run_step4",
     "render.output_dir",
     "render.roi_rect", "render.roi_mask_path", "render.roi_mask_threshold",
     "render.roi_tag",
-    # Campo CANCELLATO dalla config, non un override: il gate diffuso del solver
-    # e' stato rimosso, ma i manifest gia' scritti lo contengono ancora e senza
-    # questa voce ogni run precedente verrebbe rifiutata.
+    # A field DELETED from the config, not an override: the solver's diffuse gate was
+    # removed, but the manifests already written still contain it, and without this
+    # entry every earlier run would be rejected.
     "render.pbr_diffuse_cv_gate",
 }
 
 
 def _enc(o: object) -> object:
-    """Stessa codifica di _write_run_manifest, per poter confrontare i dict."""
+    """Same encoding as _write_run_manifest, so the dicts can be compared."""
     if isinstance(o, Enum):
         return o.name
     if isinstance(o, Path):
@@ -66,12 +66,12 @@ def _encode_config(cfg: PipelineConfig) -> dict:
 
 
 def _build(cls, data: dict, path: str) -> tuple[object, list[str]]:
-    """Istanzia la dataclass `cls` dai valori del manifest.
+    """Instantiate the dataclass `cls` from the manifest's values.
 
-    Gli ImageFormat tornano dal nome (il manifest li serializza con Enum.name).
-    Le chiavi del manifest che la dataclass non ha più, e i campi aggiunti dopo
-    quella run (tipicamente i roi_*), vengono segnalati invece che ignorati in
-    silenzio: la prima categoria significa che la config è cambiata sotto i piedi.
+    The ImageFormats come back from their name (the manifest serialises them with Enum.name).
+    Manifest keys the dataclass no longer has, and fields added after that run (typically
+    the roi_* ones), are reported rather than ignored silently: the first category means
+    the config changed underfoot.
     """
     notes: list[str] = []
     known = {f.name: f for f in fields(cls)}
@@ -79,14 +79,14 @@ def _build(cls, data: dict, path: str) -> tuple[object, list[str]]:
     for name, value in data.items():
         f = known.get(name)
         if f is None:
-            notes.append(f"    ⚠  {path}{name}: presente nel manifest ma non in {cls.__name__}")
+            notes.append(f"    ⚠  {path}{name}: present in the manifest but not in {cls.__name__}")
             continue
         if isinstance(f.default, ImageFormat):
             value = ImageFormat[value] if isinstance(value, str) else value
         kwargs[name] = value
     for name in known:
         if name not in data and name != "render":
-            notes.append(f"    ·  {path}{name}: assente dal manifest, uso il default")
+            notes.append(f"    ·  {path}{name}: absent from the manifest, using the default")
     return cls(**kwargs), notes
 
 
@@ -96,8 +96,8 @@ def config_from_manifest(manifest_path: Path) -> tuple[PipelineConfig, dict, lis
     raw = dict(manifest["config"])
     render_raw = raw.pop("render")
     rc, notes_r = _build(RenderConfig, render_raw, "render.")
-    # `render` va passato al costruttore: il suo default_factory è RenderConfig,
-    # che ha tre campi obbligatori e quindi non è istanziabile a vuoto.
+    # `render` has to be passed to the constructor: its default_factory is RenderConfig,
+    # which has three mandatory fields and therefore cannot be instantiated empty.
     raw["render"] = rc
     cfg, notes_c = _build(PipelineConfig, raw, "")
     return cfg, manifest, notes_c + notes_r
@@ -105,11 +105,11 @@ def config_from_manifest(manifest_path: Path) -> tuple[PipelineConfig, dict, lis
 
 def check_against_manifest(cfg: PipelineConfig, manifest: dict,
                            expected_diffs: "set[str] | None" = None) -> list[str]:
-    """Differenze fra la config ricostruita e quella del manifest, esclusi gli override.
+    """Differences between the rebuilt config and the manifest's, overrides excluded.
 
-    `expected_diffs` è l'insieme delle chiavi che il chiamante cambia di proposito;
-    di default quelle della ROI. Lo parametrizza `rerun_irradiance.py`, che riusa
-    questa validazione con un insieme di override diverso.
+    `expected_diffs` is the set of keys the caller changes on purpose; by default the ROI
+    ones. `rerun_irradiance.py` parametrises it, reusing this validation with a different
+    set of overrides."""
     """
     if expected_diffs is None:
         expected_diffs = _EXPECTED_DIFFS
@@ -123,11 +123,11 @@ def check_against_manifest(cfg: PipelineConfig, manifest: dict,
             if isinstance(va, dict) and isinstance(vb, dict):
                 walk(va, vb, f"{key}.")
             elif vb == "<assente>":
-                # Campo aggiunto alla dataclass DOPO quella run: il manifest non
-                # può contenerlo e la ricostruzione usa il default, cosa che
-                # `_build` ha già segnalato fra le notes. Contarlo come divergenza
-                # renderebbe inutilizzabile lo script su ogni run precedente
-                # all'ultimo campo introdotto, cioè proprio il caso d'uso.
+                # A field added to the dataclass AFTER that run: the manifest cannot
+                # contain it and the rebuild uses the default, which `_build` has already
+                # reported among the notes. Counting it as a divergence would make the
+                # script unusable on every run older than the latest field introduced,
+                # i.e. exactly the use case.
                 continue
             elif va != vb and key not in expected_diffs:
                 diffs.append(f"{key}: ricostruita={va!r}  manifest={vb!r}")
@@ -139,23 +139,23 @@ def check_against_manifest(cfg: PipelineConfig, manifest: dict,
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("run_dir", help="cartella della run di riferimento (contiene run_manifest.json)")
+    ap.add_argument("run_dir", help="the reference run folder (holds run_manifest.json)")
     ap.add_argument("--rect", nargs=4, type=int, metavar=("X0", "Y0", "W", "H"),
                     help="ROI rettangolare in texel IUM")
-    ap.add_argument("--mask", default="", help="immagine maschera della ROI (opzionale)")
+    ap.add_argument("--mask", default="", help="ROI mask image (optional)")
     ap.add_argument("--mask-threshold", type=float, default=0.5)
-    ap.add_argument("--tag", default="", help="nome della sandbox (default: derivato)")
+    ap.add_argument("--tag", default="", help="sandbox name (default: derived)")
     ap.add_argument("--dry-run", action="store_true",
-                    help="ricostruisce e verifica la config, poi si ferma")
+                    help="rebuild and check the config, then stop")
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir).resolve()
     manifest_path = run_dir / "run_manifest.json"
     if not manifest_path.exists():
-        print(f"✗ manifest non trovato: {manifest_path}")
+        print(f"✗ manifest not found: {manifest_path}")
         return 2
     if not args.rect and not args.mask:
-        print("✗ serve almeno --rect o --mask")
+        print("✗ at least one of --rect or --mask is required")
         return 2
 
     cfg, manifest, notes = config_from_manifest(manifest_path)
@@ -164,8 +164,8 @@ def main() -> int:
     for n in notes:
         print(n)
 
-    # Override: solo gli step di ricostruzione, la ROI, e la cartella (la run di
-    # riferimento è stata copiata altrove, quindi il path del manifest è stale).
+    # Override: only the reconstruction steps, the ROI, and the folder (the reference run
+    # was copied elsewhere, so the manifest's path is stale).
     cfg.run_step1 = cfg.run_step2 = False
     cfg.run_step3 = cfg.run_step4 = True
     cfg.render.output_dir = str(run_dir)
@@ -176,12 +176,12 @@ def main() -> int:
 
     diffs = check_against_manifest(cfg, manifest)
     if diffs:
-        print("\n✗ la config ricostruita diverge dal manifest su chiavi non previste:")
+        print("\n✗ the rebuilt config diverges from the manifest on unexpected keys:")
         for d in diffs:
             print(f"    {d}")
-        print("  Il confronto con la run piena non sarebbe valido: interrotto.")
+        print("  The comparison with the full run would not be valid: aborted.")
         return 1
-    print("  ✓ config identica al manifest (a meno di step, output_dir e ROI)")
+    print("  ✓ config identical to the manifest (up to steps, output_dir and ROI)")
 
     assets_dir, tag = _roi_assets_dir(cfg.render, run_dir)
     print(f"  sandbox: {assets_dir}")
@@ -194,10 +194,10 @@ def main() -> int:
         print(f"  ROI rerun  : {tag}")
         print(f"  Riferimento: {run_dir}")
         print(f"  Sandbox    : {assets_dir}")
-        print(f"  rect={cfg.render.roi_rect}  maschera={cfg.render.roi_mask_path or '-'}")
+        print(f"  rect={cfg.render.roi_rect}  mask={cfg.render.roi_mask_path or '-'}")
         print(f"{'=' * 70}")
         run_pipeline(cfg, tb_enabled=False)
-    print(f"\n✓ fatto. Confronta con:\n    python compare_roi_run.py {run_dir} --tag {tag}")
+    print(f"\n✓ done. Compare with:\n    python compare_roi_run.py {run_dir} --tag {tag}")
     return 0
 
 
