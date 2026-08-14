@@ -1,41 +1,40 @@
 #!/usr/bin/env python
-"""make_pbr_model_diagram.py -- Figure dell'equazione del modello PBR.
+"""make_pbr_model_diagram.py -- figures for the PBR model equation.
 
     python make_pbr_model_diagram.py --out ../Doc/images/pbr-model
     python make_pbr_model_diagram.py --out ../figure_review/pbr-model --figures kernel
 
-Scrive due PNG:
+Writes two PNGs:
 
-  pbr_model.png       un texel, la sua normale, l'emisfero da cui arriva
-                      l'irradianza diffusa e due camere con il proprio raggio
-                      riflesso e il cono di apertura Theta attorno ad esso.
+  pbr_model.png       one texel, its normal, the hemisphere the diffuse irradiance
+                      arrives from, and two cameras with their own reflected ray
+                      and the cone of aperture Theta around it.
 
-  tophat_vs_ggx.png   gli STESSI raggi visti lungo la direzione riflessa, pesati
-                      nei due modi: piatto dentro il cono (top-hat) e con la NDF
-                      GGX.  Non e' una figura sulla forma del kernel ma sulla sua
-                      MISURABILITA': con il top-hat i pesi valgono 1 e si
-                      conoscono prima di tracciare, quindi la stima e' la media
-                      dei raggi; con il GGX ogni peso dipende da alpha, cioe'
-                      dalla larghezza che il fit deve ancora ricavare.
+  tophat_vs_ggx.png   the SAME rays seen along the reflected direction, weighted in
+                      the two ways: flat inside the cone (top-hat) and with the GGX
+                      NDF.  It is not a figure about the shape of the kernel but
+                      about its MEASURABILITY: with the top-hat the weights are 1
+                      and known before tracing, so the estimate is the mean of the
+                      rays; with the GGX every weight depends on alpha, i.e. on the
+                      width the fit has yet to recover.
 
-La figura e' volutamente muta sui numeri: la scomposizione del colore nei due
-termini la fa il testo della tesi, qui si disegna solo la geometria che rende i
-due termini diversi fra loro.  I conti restano pero' nello script, stampati a
-fine run, perche' sono la verifica che il disegno stia dicendo la verita': il
-sole cade dentro il cono della camera 1 e fuori da quello della camera 2, quindi
-L_1 e L_2 devono venire diversi, ed e' esattamente cio' su cui il fit lavora.
+The figure is deliberately silent on the numbers: the split of the colour into the two
+terms is done by the thesis text, here only the geometry that makes the two terms
+different is drawn.  The numbers do stay in the script, printed at the end of a run,
+because they are the check that the drawing is telling the truth: the sun falls inside
+camera 1's cone and outside camera 2's, so L_1 and L_2 must come out different, and
+that is exactly what the fit works on.
 
-L'ambiente e' un cielo analitico (gradiente piu' un sole caldo), l'irradianza e'
-la sua integrazione pesata sul coseno sull'emisfero e L_j e' la media pura ad
-angolo solido sul cono, chiusa dalle STESSE funzioni del bake
-(`ring_weights_mean` e `_cones_from_rings_np` di images_generator), cosi' i
-numeri stampati non possono divergere dalla matematica della pipeline.  Un
-controllo indipendente per campionamento diretto del cono viene stampato accanto.
+The environment is an analytic sky (a gradient plus a warm sun), the irradiance is its
+cosine-weighted integral over the hemisphere and L_j is the pure solid-angle mean over
+the cone, closed by the SAME functions the bake uses (`ring_weights_mean` and
+`_cones_from_rings_np` of images_generator), so the printed numbers cannot diverge from
+the pipeline's mathematics.  An independent check by direct sampling of the cone is
+printed next to it.
 
-I punti della cupola sono la radianza incidente dopo esposizione condivisa e
-gamma, cioe' come apparirebbe a schermo; l'esposizione e' scelta sulle medie sui
-coni e sull'irradianza, cosi' il sole satura in bianco e il resto del cielo resta
-leggibile.
+The dome's dots are the incident radiance after a shared exposure and gamma, i.e. as it
+would look on screen; the exposure is chosen on the cone means and on the irradiance, so
+that the sun saturates to white and the rest of the sky stays readable.
 """
 from __future__ import annotations
 
@@ -55,71 +54,71 @@ import _paths  # noqa: F401
 from images_generator import (_cones_from_rings_np, ring_weights_mean,
                               spec_cone_shared_ring_samples)
 
-# ── Parametri del caso didattico ──────────────────────────────────────────────
-# Una sola apertura, non la griglia di candidati: quella e' il soggetto di
-# fig:cone-geometry.  Qui Theta e' gia' stata scelta dal fit ed e' la stessa per
-# le due camere, perche' nel modello e' una proprieta' del texel e non della vista.
-THETA = 40.0                      # apertura TOTALE del cono, in gradi
-X_DIFFUSE = 0.6                   # peso del termine diffuso; metallic = 1 - x
-ALBEDO = np.array([0.62, 0.45, 0.31])     # a, riflettanza diffusa in [0,1]
+# ── Parameters of the didactic case ──────────────────────────────────────────
+# One aperture only, not the grid of candidates: that is the subject of
+# fig:cone-geometry.  Here Theta has already been chosen by the fit and is the same for
+# both cameras, because in the model it is a property of the texel and not of the view.
+THETA = 40.0                      # TOTAL cone aperture, in degrees
+X_DIFFUSE = 0.6                   # weight of the diffuse term; metallic = 1 - x
+ALBEDO = np.array([0.62, 0.45, 0.31])     # a, diffuse reflectance in [0,1]
 
-# Le camere stanno basse sull'orizzonte per due ragioni: i loro coni si aprono a
-# ventaglio invece di accavallarsi attorno alla normale, e la calotta in alto
-# resta libera per la normale e per le didascalie dell'emisfero.  Il vincolo da
-# rispettare e' theta + Theta/2 <= 90 gradi, altrimenti il cono taglia l'orizzonte
-# e la media non e' piu' quella di un cono intero (`report` lo verifica).
-# Gli azimut sono separati di piu' di Theta anche fra la camera di uno e il cono
-# dell'altra (R_j sta all'azimut opposto a v_j): con 170 e 20 gradi il glifo della
-# camera 1 finiva dentro il bordo del cono della camera 2.
-CAMS = (                          # (theta dalla normale, azimut) in gradi
-    # Rosso e verde acqua e non rosso e blu: i pallini della cupola sono azzurrini
-    # (e' il colore del cielo), e una camera blu si confondeva con loro proprio
-    # dentro il suo cono, dove le due popolazioni si sovrappongono.
+# The cameras sit low over the horizon for two reasons: their cones open out like a fan
+# instead of overlapping around the normal, and the cap at the top stays free for the
+# normal and the hemisphere labels.  The constraint to respect is
+# theta + Theta/2 <= 90 degrees, otherwise the cone cuts the horizon and the mean is no
+# longer that of a whole cone (`report` checks it).
+# The azimuths are separated by more than Theta even between one camera and the other's
+# cone (R_j sits at the azimuth opposite v_j): at 170 and 20 degrees the camera 1 glyph
+# ended up inside the border of camera 2's cone.
+CAMS = (                          # (theta from the normal, azimuth) in degrees
+    # Red and teal rather than red and blue: the dome dots are pale blue (it is the
+    # colour of the sky), and a blue camera was confused with them exactly inside its
+    # own cone, where the two populations overlap.
     dict(theta=55.0, phi=160.0, name="camera 1", color="#c0392b"),
     dict(theta=45.0, phi=30.0,  name="camera 2", color="#12776b"),
 )
 
-S_INT = 200_000                   # direzioni per gli integrali (E e L_j)
-S_DOME = 520                      # direzioni disegnate come cupola
-DOME_S = 22                       # area del pallino della cupola a theta = 0
-CONE_DOTS = 34                    # direzioni disegnate dentro ciascun cono
-CONE_S = 24                       # area, uguale per tutte: nel cono non c'e' peso
+S_INT = 200_000                   # directions for the integrals (E and L_j)
+S_DOME = 520                      # directions drawn as the dome
+DOME_S = 22                       # area of the dome dot at theta = 0
+CONE_DOTS = 34                    # directions drawn inside each cone
+CONE_S = 24                       # area, the same for all: inside the cone there is no weight
 
-# Cielo analitico: gradiente orizzonte-zenit piu' un sole gaussiano.  Il sole e'
-# messo vicino al raggio riflesso della camera 1 e lontano da quello della
-# camera 2: e' quello che rende L_1 e L_2 diversi, che e' il punto della figura.
-# Il cielo e' tenuto poco saturo perche' il termine diffuso, che e' l'albedo
-# moltiplicata per questa luce, resti riconoscibile come colore del materiale.
+# Analytic sky: horizon-to-zenith gradient plus a Gaussian sun.  The sun is placed near
+# camera 1's reflected ray and far from camera 2's: that is what makes L_1 and L_2
+# different, which is the point of the figure.
+# The sky is kept low in saturation so that the diffuse term, which is the albedo
+# multiplied by this light, stays recognisable as the material's colour.
 SKY_HORIZON = np.array([0.78, 0.80, 0.84])
 SKY_ZENITH = np.array([0.24, 0.36, 0.60])
 SUN_RGB = np.array([1.00, 0.80, 0.52]) * 2.2
-SUN_SIGMA = 16.0                  # gradi
-SUN_OFFSET = 8.0                  # scostamento del sole da R_1, in gradi
+SUN_SIGMA = 16.0                  # degrees
+SUN_OFFSET = 8.0                  # offset of the sun from R_1, in degrees
 
-# ── Parametri della figura sul kernel (top-hat contro lobo GGX) ───────────────
-ALPHA_GGX = 0.30                  # rugosita' GGX del lobo disegnato (alpha = r^2)
-S_KERNEL = 520                    # direzioni tracciate, LE STESSE nei due pannelli
-R_TILT = 40.0                     # inclinazione di R dalla normale, in gradi
-KERNEL_CONTAIN = 0.90             # frazione di peso del lobo che il cono deve tenere
-KERNEL_S = 78.0                   # area del pallino di peso massimo, scala condivisa
+# ── Parameters of the kernel figure (top-hat against GGX lobe) ───────────────
+ALPHA_GGX = 0.30                  # GGX roughness of the drawn lobe (alpha = r^2)
+S_KERNEL = 520                    # directions traced, THE SAME in both panels
+R_TILT = 40.0                     # tilt of R from the normal, in degrees
+KERNEL_CONTAIN = 0.90             # fraction of the lobe's weight the cone must hold
+KERNEL_S = 78.0                   # area of the max-weight dot, shared scale
 
 C_INK = "#222222"
-C_DIFF = "#e8a33d"                # ambra: tutto cio' che appartiene al termine diffuso
-C_KERNEL = "#2171b5"              # blu della rampa dei coni, uguale nei due pannelli
-C_OUT = "#b8b8b8"                 # raggi che il top-hat non traccia nemmeno
+C_DIFF = "#e8a33d"                # amber: everything belonging to the diffuse term
+C_KERNEL = "#2171b5"              # blue of the cone ramp, the same in both panels
+C_OUT = "#b8b8b8"                 # rays the top-hat does not even trace
 
-# Alone bianco per le etichette del 3D.  Serve perche' negli assi 3D lo zorder non
-# decide l'ordine di disegno: matplotlib riordina gli artisti per profondita', e
-# un'etichetta che sta dietro alla campitura di un cono ci finisce sotto comunque.
+# White halo for the 3D labels.  Needed because in 3D axes zorder does not decide the
+# draw order: matplotlib reorders the artists by depth, and a label behind a cone's fill
+# ends up under it regardless.
 HALO = dict(fc="white", ec="none", alpha=0.75, pad=1.0)
 
-# In pagina la figura viene rimpicciolita: le dimensioni sono scelte perche' il
-# testo resti leggibile DOPO la riduzione, non sullo schermo.
+# On the page the figure is shrunk: the sizes are chosen so that the text stays readable
+# AFTER the reduction, not on screen.
 plt.rcParams.update({"font.size": 13})
 
 
 def onb(a: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Base ortonormale attorno ad `a`."""
+    """Orthonormal basis around `a`."""
     t = np.array([0.0, 0.0, 1.0]) if abs(a[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
     u = np.cross(t, a)
     u /= np.linalg.norm(u)
@@ -127,10 +126,10 @@ def onb(a: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def fibonacci_hemisphere(s: int) -> np.ndarray:
-    """(S, 3) direzioni sopra z, uniformi in angolo solido.
+    """(S, 3) directions above z, uniform in solid angle.
 
-    Stessa costruzione del kernel condiviso: cos(theta) equispaziato e azimut
-    sull'angolo aureo.
+    Same construction as the shared kernel: equispaced cos(theta) and azimuth on the
+    golden angle.
     """
     i = np.arange(s)
     cos_t = 1.0 - (i + 0.5) / s
@@ -140,11 +139,11 @@ def fibonacci_hemisphere(s: int) -> np.ndarray:
 
 
 def cone_directions(axis: np.ndarray, half_deg: float, n: int) -> np.ndarray:
-    """(n, 3) direzioni uniformi in angolo solido DENTRO il cono attorno ad `axis`.
+    """(n, 3) directions uniform in solid angle INSIDE the cone around `axis`.
 
-    Uniformi in angolo solido significa cos(angolo dall'asse) equispaziato, non
-    l'angolo: e' la stessa condizione che rende la media sul cono una media
-    semplice dei campioni, senza pesi.
+    Uniform in solid angle means equispaced cos(angle from the axis), not the angle:
+    it is the same condition that makes the mean over the cone a plain mean of the
+    samples, with no weights.
     """
     t, b = onb(axis)
     i = np.arange(n)
@@ -156,7 +155,7 @@ def cone_directions(axis: np.ndarray, half_deg: float, n: int) -> np.ndarray:
 
 
 def circle_on_sphere(axis: np.ndarray, half_deg: float, n: int = 240) -> np.ndarray:
-    """Direzioni a `half_deg` gradi da `axis`: il bordo di un cono."""
+    """Directions at `half_deg` degrees from `axis`: the edge of a cone."""
     t, b = onb(axis)
     a = np.radians(half_deg)
     ang = np.linspace(0, 2 * np.pi, n)
@@ -165,19 +164,17 @@ def circle_on_sphere(axis: np.ndarray, half_deg: float, n: int = 240) -> np.ndar
 
 
 def label3d(ax, p, text: str, **kw) -> None:
-    """Etichetta ancorata al punto 3D `p` ma disegnata come testo 2D.
+    """Label anchored to the 3D point `p` but drawn as 2D text.
 
-    Negli assi 3D lo zorder non decide l'ordine di disegno: matplotlib riordina
-    gli artisti 3D per profondita', quindi un'etichetta finisce sotto la
-    campitura di un cono ogni volta che un pezzo del cono e' piu' vicino
-    dell'ancora, anche se l'ancora sta fuori dal solido.  Proiettando a mano e
-    disegnando un Text 2D si torna a un ordine deterministico.  Va chiamata dopo
-    aver fissato limiti, box_aspect e view_init, che sono quello che
-    `get_proj()` legge.
+    In 3D axes zorder does not decide the draw order: matplotlib reorders the 3D artists
+    by depth, so a label ends up under a cone's fill every time a piece of the cone is
+    closer than the anchor, even when the anchor sits outside the solid.  Projecting by
+    hand and drawing a 2D Text restores a deterministic order.  It has to be called after
+    limits, box_aspect and view_init are fixed, since those are what `get_proj()` reads.
     """
     x, y, _ = proj3d.proj_transform(*p, ax.get_proj())
-    # zorder alto e non 20: gli artisti 3D ricevono uno zorder calcolato dalla
-    # profondita', che con molte collezioni supera i valori piccoli.
+    # A high zorder and not 20: 3D artists get a zorder computed from the depth, which
+    # with many collections exceeds small values.
     ax.text2D(x, y, text, transform=ax.transData, zorder=200, **kw)
 
 
@@ -187,7 +184,7 @@ def sph(theta_deg: float, phi_deg: float) -> np.ndarray:
 
 
 def sky(d: np.ndarray, sun_dir: np.ndarray) -> np.ndarray:
-    """(..., 3) -> (..., 3): radianza dell'ambiente lungo `d`."""
+    """(..., 3) -> (..., 3): radiance of the environment along `d`."""
     t = np.clip(d[..., 2], 0.0, 1.0)[..., None] ** 0.6
     base = SKY_HORIZON * (1.0 - t) + SKY_ZENITH * t
     ang = np.degrees(np.arccos(np.clip(d @ sun_dir, -1.0, 1.0)))
@@ -200,7 +197,7 @@ def luminance(rgb: np.ndarray) -> np.ndarray:
 
 
 def build_case() -> dict:
-    """Geometria, integrali e i tre termini dell'equazione."""
+    """Geometry, integrals and the three terms of the equation."""
     n = np.array([0.0, 0.0, 1.0])
     dirs = fibonacci_hemisphere(S_INT)
     half = THETA / 2.0
@@ -208,23 +205,23 @@ def build_case() -> dict:
     cams = []
     for spec in CAMS:
         v = sph(spec["theta"], spec["phi"])
-        r = 2.0 * np.dot(n, v) * n - v          # Equazione del raggio riflesso
+        r = 2.0 * np.dot(n, v) * n - v          # Reflected ray equation
         cams.append(dict(spec, v=v, r=r))
 
-    # Il sole sta vicino a R_1, scostato di SUN_OFFSET verso la normale.
+    # The sun sits near R_1, offset by SUN_OFFSET towards the normal.
     r1 = cams[0]["r"]
     u = n - np.dot(n, r1) * r1
     u /= np.linalg.norm(u)
     a = np.radians(SUN_OFFSET)
     sun_dir = np.cos(a) * r1 + np.sin(a) * u
 
-    rad = sky(dirs, sun_dir)                    # radianza su tutto l'emisfero
+    rad = sky(dirs, sun_dir)                    # radiance over the whole hemisphere
 
-    # E = integrale pesato sul coseno: ogni direzione del set vale 2*pi/S sr.
+    # E = cosine-weighted integral: every direction of the set is worth 2*pi/S sr.
     e_irr = (rad * dirs[:, 2:3]).sum(axis=0) * (2.0 * np.pi / S_INT)
 
-    # L_j: media pura ad angolo solido sul cono, chiusa dal codice del bake.
-    # Griglia di aperture con un solo anello, [0, Theta]: il livello 1 e' il cono.
+    # L_j: pure solid-angle mean over the cone, closed by the bake's own code.
+    # Aperture grid with a single ring, [0, Theta]: level 1 is the cone.
     apertures = [0.0, THETA]
     cos_b = np.cos(np.radians(np.asarray(apertures)) * 0.5)
     w = ring_weights_mean(cos_b, 1,
@@ -236,16 +233,16 @@ def build_case() -> dict:
         ring_valid = np.zeros((1, 2))
         ring_sum[0, 1] = rad[m].sum(axis=0)
         ring_valid[0, 1] = m.sum()
-        ring_sum[0, 0] = sky(c["r"], sun_dir)   # livello specchio: un raggio solo
+        ring_sum[0, 0] = sky(c["r"], sun_dir)   # mirror level: a single ray
         ring_valid[0, 0] = 1.0
         c["L"] = _cones_from_rings_np(ring_sum, ring_valid, w)[0, 1]
         c["n_rays"] = int(m.sum())
-        # Il cono resta tutto sopra l'orizzonte? Se no la media e' troncata e il
-        # confronto con il campionamento diretto non avrebbe senso.
+        # Does the cone stay entirely above the horizon? If not the mean is truncated and
+        # the comparison with the direct sampling would make no sense.
         c["unclipped"] = np.degrees(np.arccos(c["r"][2])) + half <= 90.0
-        # Controllo indipendente: media uniforme in angolo solido dentro il cono,
-        # campionata direttamente invece che filtrando l'emisfero.  Essendo i
-        # campioni uniformi in angolo solido, la media e' quella semplice.
+        # Independent check: mean uniform in solid angle inside the cone, sampled
+        # directly instead of by filtering the hemisphere.  With the samples uniform in
+        # solid angle, the mean is the plain one.
         c["L_check"] = sky(cone_directions(c["r"], half, 20_000), sun_dir).mean(axis=0)
 
     diffuse = ALBEDO * X_DIFFUSE / np.pi * e_irr
@@ -257,7 +254,7 @@ def build_case() -> dict:
 
 
 def make_tonemap(case: dict):
-    """Esposizione condivisa da tutti gli swatch di radianza, piu' gamma."""
+    """Exposure shared by every radiance swatch, plus gamma."""
     peak = max(float(np.max(case["E"] / np.pi)),
                max(float(np.max(c["C"])) for c in case["cams"]),
                max(float(np.max(c["L"])) for c in case["cams"]))
@@ -269,17 +266,17 @@ def make_tonemap(case: dict):
     return tm
 
 
-# ─────────────────────────────────────────────────────────── pannello (a), 3D
+# ────────────────────────────────────────────────────────── panel (a), in 3D
 def panel_geometry(ax, case: dict, tm) -> None:
     n = case["n"]
 
-    # Inquadratura fissata PRIMA di disegnare, perche' `label3d` proietta a mano e
-    # legge la matrice di proiezione: cambiarla dopo lascerebbe le etichette dove
-    # erano.  Il rapporto della scatola DEVE seguire le estensioni dei dati,
-    # altrimenti la scala verticale differisce da quella orizzontale e gli angoli
-    # non si leggono piu': i cerchi dei coni appaiono ruotati e n sembra piu'
-    # lunga di R benche' siano entrambe unitarie.  In un diagramma di angoli e'
-    # un errore, non una scelta di inquadratura.
+    # The framing is fixed BEFORE drawing, because `label3d` projects by hand and reads
+    # the projection matrix: changing it afterwards would leave the labels where they
+    # were.  The box ratio MUST follow the extent of the data, otherwise the vertical
+    # scale differs from the horizontal one and the angles can no longer be read: the
+    # cone circles look rotated and n looks longer than R even though both are unit
+    # vectors.  In a diagram about angles that is a bug, not a framing choice.
+    #
     ax.set_xlim(-1.05, 1.05)
     ax.set_ylim(-1.05, 1.05)
     ax.set_zlim(0, 1.1)
@@ -287,8 +284,8 @@ def panel_geometry(ax, case: dict, tm) -> None:
     ax.set_axis_off()
     ax.view_init(elev=26, azim=-72)
 
-    # Il quadrato della superficie sta dentro l'equatore: piu' grande, coprirebbe
-    # le direzioni radenti e le farebbe sembrare sotto la superficie.
+    # The surface square sits inside the equator: any larger and it would cover the
+    # grazing directions and make them look as if they were below the surface.
     g = np.linspace(-0.62, 0.62, 2)
     gx, gy = np.meshgrid(g, g)
     ax.plot_surface(gx, gy, np.zeros_like(gx), color="0.82", alpha=0.6,
@@ -296,37 +293,37 @@ def panel_geometry(ax, case: dict, tm) -> None:
     a = np.linspace(0, 2 * np.pi, 200)
     ax.plot(np.cos(a), np.sin(a), np.zeros_like(a), color="0.6", lw=0.9, zorder=1)
 
-    # La cupola: le direzioni dell'emisfero colorate con l'ambiente da cui la
-    # radianza arriva.  E' la stessa costruzione con cui e' integrata E, e rende
-    # visibile perche' i due coni raccolgono colori diversi.
+    # The dome: the hemisphere directions coloured with the environment the radiance
+    # comes from.  It is the same construction E is integrated with, and it makes visible
+    # why the two cones collect different colours.
     #
-    # La DIMENSIONE del pallino e' il peso con cui quella direzione entra
-    # nell'irradianza, cioe' cos(theta): area esattamente proporzionale, senza
-    # minimo.  I pallini che si spengono contro l'orizzonte non sono un difetto di
-    # resa, sono direzioni radenti che non portano quasi nulla; la silhouette
-    # dell'emisfero la tiene comunque il cerchio dell'equatore.
+    # The SIZE of the dot is the weight with which that direction enters the irradiance,
+    # i.e. cos(theta): area exactly proportional, with no minimum.  The dots that fade
+    # out against the horizon are not a rendering defect, they are grazing directions
+    # that carry almost nothing; the hemisphere's silhouette is held by the equator
+    # circle anyway.
     dome = fibonacci_hemisphere(S_DOME)
     ax.scatter(dome[:, 0] * 1.02, dome[:, 1] * 1.02, dome[:, 2] * 1.02,
                s=DOME_S * dome[:, 2], c=tm(sky(dome, case["sun_dir"])),
                depthshade=False, alpha=0.9, linewidths=0, zorder=2)
-    # Il sole disegnato a parte: fra i punti della cupola sarebbe un dettaglio di
-    # pochi campioni, e invece e' la ragione per cui L_1 e L_2 non coincidono.
-    # Raggio maggiore di quello dei campioni del cono, che gli cadono sopra: e'
-    # l'ordinamento per profondita' del 3D a decidere chi copre chi.
+    # The sun drawn separately: among the dome dots it would be a detail of a few
+    # samples, and instead it is the reason L_1 and L_2 do not coincide.  Larger radius
+    # than the cone samples that fall on top of it: it is the 3D depth ordering that
+    # decides who covers whom.
     ax.scatter(*(case["sun_dir"] * 1.07)[:, None], s=300, marker="o",
                color=tm(sky(case["sun_dir"], case["sun_dir"])),
                edgecolor=C_DIFF, linewidth=1.6, depthshade=False, zorder=3)
 
-    # Frecce entranti sparse sulla cupola: l'irradianza raccoglie tutto l'emisfero.
-    # Quelle che cadrebbero dentro un cono sono saltate, la' il disegno e' gia' pieno.
+    # Incoming arrows scattered over the dome: the irradiance collects the whole
+    # hemisphere.  Those that would fall inside a cone are skipped, it is already full there.
     for d in fibonacci_hemisphere(13):
         if d[2] < 0.25 or any(d @ c["r"] > np.cos(np.radians(case["half"] + 14))
                               for c in case["cams"]):
             continue
         ax.quiver(*(d * 0.90), *(-d * 0.26), color=C_DIFF, lw=1.4,
                   arrow_length_ratio=0.40, alpha=0.95, zorder=3)
-    # Le due didascalie stanno in coordinate di assi e non nella scena: dentro la
-    # cupola ogni posizione libera in 3D finisce addosso a n o a una delle R.
+    # The two captions live in axes coordinates and not in the scene: inside the dome
+    # every free 3D position lands on n or on one of the R's.
     ax.text2D(0.12, 0.755, r"$E$:  the whole hemisphere", color=C_DIFF,
               fontsize=12.5, transform=ax.transAxes)
     ax.text2D(0.20, 0.155, "incident radiance", color="0.45", fontsize=11.5,
@@ -340,8 +337,8 @@ def panel_geometry(ax, case: dict, tm) -> None:
 
     for k, c in enumerate(case["cams"], start=1):
         v, r, col = c["v"], c["r"], c["color"]
-        # La vista e' tratteggiata e sottile, il raggio riflesso pieno e spesso:
-        # e' il secondo a portare il cono, e la coppia si legge come una riflessione.
+        # The view is dashed and thin, the reflected ray solid and thick: it is the
+        # second that carries the cone, and the pair reads as a reflection.
         ax.plot([0, v[0]], [0, v[1]], [0, v[2]], color=col, lw=1.5, ls=(0, (4, 2)),
                 zorder=6)
         ax.quiver(0, 0, 0, *r, color=col, lw=2.2, arrow_length_ratio=0.12, zorder=6)
@@ -351,30 +348,30 @@ def panel_geometry(ax, case: dict, tm) -> None:
                 fontsize=12, ha="center", va="bottom", bbox=HALO)
         label3d(ax, v * 0.62 + np.array([0.0, 0.0, -0.13]), rf"$\mathbf{{v}}_{k}$",
                 color=col, fontsize=13, ha="center", bbox=HALO)
-        # Etichetta di R oltre il bordo del cono, sull'asse: piu' vicino finirebbe
-        # sotto il cerchio del bordo, e di lato finirebbe addosso alla zenit.
+        # R's label beyond the cone's edge, on the axis: any closer it would end up under
+        # the edge circle, and to the side it would land on the zenith.
         label3d(ax, r * 1.30, rf"$\mathbf{{R}}_{k}$", color=col, fontsize=15,
                 ha="center", va="center", bbox=HALO)
 
-        # I campioni del cono, tutti della STESSA dimensione, sopra quelli della
-        # cupola che invece rimpiccioliscono: e' la differenza fra i due termini
-        # del modello resa in un solo colpo d'occhio.  L_j e' una media pura ad
-        # angolo solido, senza peso cos(theta), quindi dentro al cono ogni
-        # direzione conta uguale.
+        # The cone samples, all of the SAME size, above the dome ones which instead
+        # shrink: it is the difference between the two terms of the model shown at a
+        # single glance.  L_j is a pure solid-angle mean, with no cos(theta) weight, so
+        # inside the cone every direction counts the same.
         #
-        # Tinta piena nel colore della camera invece che la radianza campionata:
-        # colorati come l'ambiente si confondevano con i pallini della cupola
-        # proprio dove le due popolazioni si sovrappongono, e nel cono che guarda
-        # il sole saturavano in bianco.  Che radianza vedano lo dicono comunque i
-        # pallini della cupola sotto, che restano.
+        #
+        # Solid tint in the camera's colour instead of the sampled radiance: coloured
+        # like the environment they were confused with the dome dots exactly where the
+        # two populations overlap, and in the cone facing the sun they saturated to
+        # white.  What radiance they see is still told by the dome dots underneath,
+        # which remain.
         cd = cone_directions(r, case["half"], CONE_DOTS)
         ax.scatter(cd[:, 0] * 1.03, cd[:, 1] * 1.03, cd[:, 2] * 1.03, s=CONE_S,
                    color=col, edgecolor="white", linewidth=0.5,
                    depthshade=False, zorder=5)
 
-        # Superficie laterale del cono, dal texel al bordo sulla sfera unitaria.
-        # Alpha basso: il sole e i punti della cupola devono restare visibili
-        # attraverso il cono, altrimenti sparisce la ragione dei due colori.
+        # Lateral surface of the cone, from the texel to the edge on the unit sphere.
+        # Low alpha: the sun and the dome dots have to stay visible through the cone,
+        # otherwise the reason for the two colours disappears.
         rim = circle_on_sphere(r, case["half"], 90)
         t = np.linspace(0.0, 1.0, 2)[:, None, None]
         cone = t * rim[None, :, :]
@@ -382,8 +379,8 @@ def panel_geometry(ax, case: dict, tm) -> None:
                         alpha=0.15, linewidth=0, shade=False, zorder=4)
         ax.plot(rim[:, 0], rim[:, 1], rim[:, 2], color=col, lw=1.6, zorder=5)
 
-    # L'arco Theta/2 su una camera sola: raddoppiarlo raddoppierebbe solo le
-    # etichette.  Aperto dalla parte opposta alla normale, dove non c'e' altro.
+    # The Theta/2 arc on one camera only: doubling it would only double the labels.
+    # Opened on the side opposite the normal, where there is nothing else.
     c0 = case["cams"][0]
     u = n - np.dot(n, c0["r"]) * c0["r"]
     u = -u / np.linalg.norm(u)
@@ -394,41 +391,41 @@ def panel_geometry(ax, case: dict, tm) -> None:
             va="center", bbox=HALO)
 
 
-# ───────────────────────────── figura 2: kernel top-hat contro lobo GGX
+# ───────────────────────── figure 2: top-hat kernel against GGX lobe
 def ggx_d(cos_h: np.ndarray, alpha: float) -> np.ndarray:
-    """\\gls{ndf} GGX, la formula di background.tex: D = a^2 / (pi (c^2(a^2-1)+1)^2)."""
+    """GGX \\gls{ndf}, the formula from background.tex: D = a^2 / (pi (c^2(a^2-1)+1)^2)."""
     a2 = alpha * alpha
     return a2 / (np.pi * (cos_h ** 2 * (a2 - 1.0) + 1.0) ** 2)
 
 
 def build_kernel_case() -> dict:
-    """I due kernel sullo STESSO insieme di direzioni, entrambi a integrale 1.
+    """The two kernels on the SAME set of directions, both with integral 1.
 
-    Il kernel del prefiltraggio dipende dal solo angolo dalla direzione riflessa
-    soltanto sotto l'ipotesi n = v = R, quella che rende possibile prefiltrare
-    l'ambiente una volta sola invece che per ogni vista.  Sotto quell'ipotesi il
-    mezzo vettore di un campione a gamma da R sta a gamma/2, e il peso di Karis
-    (D per il coseno, il suo N.L) diventa
+    The prefiltering kernel depends on the angle from the reflected direction alone only
+    under the assumption n = v = R, the one that makes it possible to prefilter the
+    environment once instead of per view.  Under that assumption the half vector of a
+    sample at gamma from R sits at gamma/2, and Karis' weight (D times the cosine, its
+    N.L) becomes
 
         w(gamma) = D(cos(gamma/2); alpha) * cos(gamma)
 
-    che si annulla a 90 gradi: sotto l'ipotesi, oltre i 90 gradi da R si e' sotto
-    la superficie.  Il coseno non e' un dettaglio estetico: senza, la coda pesa
-    tanto da rendere il cono equivalente piu' largo dell'emisfero.
+    which vanishes at 90 degrees: under the assumption, beyond 90 degrees from R one is
+    below the surface.  The cosine is not a cosmetic detail: without it the tail weighs
+    enough to make the equivalent cone wider than the hemisphere.
 
-    L'apertura del top-hat non e' scelta: e' quella che tiene KERNEL_CONTAIN del
-    peso del lobo.  Accostare i due pannelli con una larghezza decisa a mano
-    sarebbe un confronto truccato.
+    The top-hat's aperture is not chosen: it is the one that holds KERNEL_CONTAIN of the
+    lobe's weight.  Putting the two panels side by side with a width decided by hand
+    would be a rigged comparison.
     """
     n = np.array([0.0, 0.0, 1.0])
     r = sph(R_TILT, 0.0)
     dirs = fibonacci_hemisphere(S_KERNEL)
     gamma = np.degrees(np.arccos(np.clip(dirs @ r, -1.0, 1.0)))
-    dw = 2.0 * np.pi / S_KERNEL          # angolo solido per campione, uniforme
+    dw = 2.0 * np.pi / S_KERNEL          # solid angle per sample, uniform
 
     w_ggx = (ggx_d(np.cos(np.radians(gamma * 0.5)), ALPHA_GGX)
              * np.maximum(np.cos(np.radians(gamma)), 0.0))
-    w_ggx /= w_ggx.sum() * dw            # integrale 1 sul dominio campionato
+    w_ggx /= w_ggx.sum() * dw            # integral 1 over the sampled domain
 
     order = np.argsort(gamma)
     cum = np.cumsum(w_ggx[order]) * dw
@@ -446,17 +443,17 @@ def build_kernel_case() -> dict:
 def panel_kernel(ax, case: dict, weights: np.ndarray, *, scale: float,
                  title: str, edge_solid: bool, note: str,
                  note_at: tuple[float, float] = (139.0, 76.0)) -> None:
-    """Vista lungo R: raggio = angolo da R, area del pallino = peso del raggio."""
+    """View along R: radius = angle from R, dot area = the ray's weight."""
     ax.scatter(case["azim"], case["gamma"], s=weights * scale, color=C_KERNEL,
                edgecolor="white", linewidth=0.3, zorder=4)
     if edge_solid:
-        # I raggi a peso nullo il top-hat non li traccia affatto: e' meta' di cio'
-        # che lo rende misurabile, e vanno mostrati come esclusi, non come assenti.
+        # The zero-weight rays the top-hat does not trace at all: it is half of what
+        # makes it measurable, and they must be shown as excluded, not as absent.
         out = ~case["inside"]
         ax.scatter(case["azim"][out], case["gamma"][out], s=7, color=C_OUT,
                    alpha=0.75, zorder=3)
-    # Il bordo del cono resta blu anche nel pannello del lobo, dove e' solo un
-    # riferimento: grigio tratteggiato si confonderebbe con l'orizzonte.
+    # The cone's edge stays blue in the lobe panel too, where it is only a reference:
+    # dashed grey would be confused with the horizon.
     ang = np.linspace(0, 2 * np.pi, 200)
     ax.plot(ang, np.full(200, case["half"]), color=C_KERNEL,
             lw=1.8 if edge_solid else 1.2, ls="-" if edge_solid else (0, (5, 3)),
@@ -464,9 +461,9 @@ def panel_kernel(ax, case: dict, weights: np.ndarray, *, scale: float,
     ax.text(np.radians(note_at[0]), note_at[1], note, color="0.4", fontsize=11,
             ha="center", va="center", zorder=6, bbox=HALO)
 
-    # L'orizzonte visto lungo R, stessa costruzione del pannello polare di
-    # make_cone_diagram: una direzione a gamma da R affonda sotto la superficie
-    # dove la sua componente verticale si annulla, cioe' tan(g) = -R_z / k_z.
+    # The horizon seen along R, the same construction as the polar panel of
+    # make_cone_diagram: a direction at gamma from R sinks below the surface where its
+    # vertical component vanishes, i.e. tan(g) = -R_z / k_z.
     aa = np.linspace(0, 2 * np.pi, 361)
     kz = np.cos(aa) * case["t"][2] + np.sin(aa) * case["b"][2]
     ax.plot(aa, np.degrees(np.arctan2(-case["r"][2], kz)) % 180.0, color="0.45",
@@ -483,8 +480,8 @@ def panel_kernel(ax, case: dict, weights: np.ndarray, *, scale: float,
 
 
 def figure_kernel(case: dict, out: Path) -> None:
-    scale = KERNEL_S / case["w_ggx"].max()      # scala CONDIVISA fra i pannelli:
-    fig = plt.figure(figsize=(9.6, 5.9))        # e' l'unico modo di confrontarli
+    scale = KERNEL_S / case["w_ggx"].max()      # SHARED scale between the panels:
+    fig = plt.figure(figsize=(9.6, 5.9))        # it is the only way to compare them
     gs = fig.add_gridspec(1, 2, wspace=0.06, left=0.01, right=0.99,
                           top=0.90, bottom=0.30)
 
@@ -498,8 +495,8 @@ def figure_kernel(case: dict, out: Path) -> None:
                  note=f"no cut, only fade:\n{tail * 100:.0f}% is past the edge",
                  title=f"GGX lobe, roughness $\\alpha = {ALPHA_GGX:.2f}$")
 
-    # Gli stimatori sotto ai rispettivi pannelli.  La riga grigia e' il punto della
-    # figura: non la forma del kernel, ma cosa bisogna sapere per poterlo valutare.
+    # The estimators under their respective panels.  The grey line is the point of the
+    # figure: not the shape of the kernel, but what one has to know to evaluate it.
     for x, expr, note in (
             (0.25, r"$L(\Theta) = \dfrac{1}{N}\,\sum_s L_s$",
              "every weight is 1, and known\nbefore a single ray is traced"),
@@ -519,28 +516,28 @@ def figure_kernel(case: dict, out: Path) -> None:
 
 
 def report_kernel(case: dict) -> None:
-    """Controlli sui due kernel, piu' i numeri che finiscono in caption."""
+    """Checks on the two kernels, plus the numbers that end up in the caption."""
     i_top = float(case["w_top"].sum() * case["dw"])
     i_ggx = float(case["w_ggx"].sum() * case["dw"])
     tail = float(case["w_ggx"][~case["inside"]].sum() * case["dw"])
     print(f"\n  alpha = {ALPHA_GGX:.2f}   ->   Theta = {2 * case['half']:.1f} deg "
-          f"(mezza apertura {case['half']:.1f}, Omega {case['omega']:.3f} sr)")
-    print(f"  integrale dei kernel: top-hat {i_top:.4f}, GGX {i_ggx:.4f}")
-    print(f"  peso GGX oltre il bordo del cono: {tail * 100:.1f} %")
-    print(f"  picco GGX / livello del top-hat: "
+          f"(half-aperture {case['half']:.1f}, Omega {case['omega']:.3f} sr)")
+    print(f"  kernel integrals: top-hat {i_top:.4f}, GGX {i_ggx:.4f}")
+    print(f"  GGX weight past the cone edge: {tail * 100:.1f} %")
+    print(f"  GGX peak / top-hat level: "
           f"{case['w_ggx'].max() / (1.0 / case['omega']):.2f}x")
-    print("  Theta della stessa regola per altre rugosita': "
+    print("  Theta from the same rule for other roughnesses: "
           + ", ".join(f"alpha {a:.2f} -> {_theta_for_alpha(a):.0f} deg"
                       for a in (0.1, 0.2, 0.5)))
     assert abs(i_top - 1.0) < 0.05 and abs(i_ggx - 1.0) < 1e-6, \
-        "i due kernel non sono normalizzati allo stesso modo: le aree non si confrontano"
-    assert tail > 0.02, "la coda oltre il cono e' invisibile: la figura non dice nulla"
+        "the two kernels are not normalised the same way: the areas do not compare"
+    assert tail > 0.02, "the tail past the cone is invisible: the figure says nothing"
     assert case["w_ggx"].max() * case["omega"] > 1.5, \
-        "il lobo non e' piu' piccato del top-hat: rivedere alpha o la regola di larghezza"
+        "the lobe is not more peaked than the top-hat: revisit alpha or the width rule"
 
 
 def _theta_for_alpha(alpha: float) -> float:
-    """L'apertura che la stessa regola darebbe a un'altra rugosita'."""
+    """The aperture the same rule would give at another roughness."""
     g = np.degrees(np.arccos(np.clip(fibonacci_hemisphere(S_KERNEL)
                                      @ sph(R_TILT, 0.0), -1.0, 1.0)))
     w = (ggx_d(np.cos(np.radians(g * 0.5)), alpha)
@@ -551,20 +548,20 @@ def _theta_for_alpha(alpha: float) -> float:
 
 
 def trim_white(path: Path, pad: int = 14) -> None:
-    """Ritaglia il bordo bianco uniforme del PNG.
+    """Trim the uniform white border of the PNG.
 
-    `bbox_inches="tight"` ritaglia sul RIQUADRO degli assi, non sul contenuto, e
-    un asse 3D lo riempie solo in parte: la scatola proiettata sporge con i suoi
-    spigoli oltre la cupola, che le e' inscritta.  Restano due fasce bianche sopra
-    e sotto che in pagina sarebbero margine pagato a peso d'oro, e che nessun
-    parametro di matplotlib toglie senza rimpicciolire anche il disegno.
+    `bbox_inches="tight"` trims on the axes BOX, not on the content, and a 3D axis only
+    partly fills it: the projected box juts out with its corners beyond the dome, which
+    is inscribed in it.  Two white bands are left above and below which on the page would
+    be margin paid for by the inch, and which no matplotlib parameter removes without
+    shrinking the drawing too.
     """
     from PIL import Image, ImageChops
 
     im = Image.open(path).convert("RGB")
     box = ImageChops.difference(im, Image.new("RGB", im.size, (255, 255, 255))
                                 ).getbbox()
-    if box is None:                       # immagine tutta bianca: niente da fare
+    if box is None:                       # all-white image: nothing to do
         return
     left, top, right, bottom = box
     im.crop((max(left - pad, 0), max(top - pad, 0),
@@ -575,20 +572,20 @@ def figure(case: dict, out: Path) -> None:
     tm = make_tonemap(case)
     fig = plt.figure(figsize=(7.0, 5.0))
 
-    # Assi piu' alti della figura stessa: la scatola 3D e' larga e bassa
-    # (box_aspect 2.1 x 2.1 x 1.1) e matplotlib la fa stare tutta dentro il
-    # riquadro, lasciando due fasce vuote sopra e sotto il contenuto.  Sono margine
-    # interno all'asse, quindi `bbox_inches="tight"` non le vede e resterebbero
-    # dentro la figura in pagina; sovradimensionare l'asse se le mangia.
+    # Axes taller than the figure itself: the 3D box is wide and low (box_aspect
+    # 2.1 x 2.1 x 1.1) and matplotlib fits it entirely inside the frame, leaving two
+    # empty bands above and below the content.  They are margin internal to the axis, so
+    # `bbox_inches="tight"` does not see them and they would stay inside the figure on
+    # the page; oversizing the axis eats them.
     ax = fig.add_axes([0.0, -0.07, 1.0, 1.10], projection="3d")
     panel_geometry(ax, case, tm)
 
-    # Titolo come testo di figura e non dell'asse: gli assi 3D lasciano una fascia
-    # vuota sopra il contenuto e un titolo agganciato la trasformerebbe in margine
-    # dentro la pagina.
-    # Il titolo va tenuto basso, vicino al contenuto: sopra la cupola l'asse 3D ha
-    # una fascia vuota alta (gli spigoli della scatola proiettata) e un titolo in
-    # cima alla figura resterebbe separato dal disegno anche dopo il ritaglio.
+    # Title as figure text and not axis text: 3D axes leave an empty band above the
+    # content and a title attached to the axis would turn it into margin inside the page.
+    #
+    # The title has to be kept low, close to the content: above the dome the 3D axis has
+    # a tall empty band (the corners of the projected box) and a title at the top of the
+    # figure would stay detached from the drawing even after the trim.
     fig.text(0.5, 0.84, "One hemisphere for the diffuse term, one cone per camera",
              ha="center", fontsize=14, color=C_INK)
     fig.savefig(out, dpi=190, bbox_inches="tight")
@@ -598,7 +595,7 @@ def figure(case: dict, out: Path) -> None:
 
 
 def report(case: dict) -> None:
-    """Controlli che la figura stia mostrando quello che dice di mostrare."""
+    """Checks that the figure is showing what it says it shows."""
     e = case["E"]
     print(f"\n  E            = ({e[0]:.4f}, {e[1]:.4f}, {e[2]:.4f})   "
           f"lum {luminance(e):.4f}")
@@ -607,11 +604,11 @@ def report(case: dict) -> None:
     for k, c in enumerate(case["cams"], start=1):
         err = float(np.max(np.abs(c["L"] - c["L_check"])) / np.max(c["L_check"]))
         print(f"  L_{k}({THETA:.0f} deg) = " + ", ".join(f"{v:.4f}" for v in c["L"])
-              + f"   lum {luminance(c['L']):.4f}   ({c['n_rays']} raggi, "
-                f"cono {'intero' if c['unclipped'] else 'TRONCATO'}, "
-                f"scarto dal campionamento diretto {err:.2e})")
-        assert c["unclipped"], "il cono esce dall'orizzonte: media troncata"
-        assert err < 1e-2, "la chiusura del bake non torna col cono campionato"
+              + f"   lum {luminance(c['L']):.4f}   ({c['n_rays']} rays, "
+                f"cone {'whole' if c['unclipped'] else 'TRUNCATED'}, "
+                f"gap from direct sampling {err:.2e})")
+        assert c["unclipped"], "the cone leaves the horizon: truncated mean"
+        assert err < 1e-2, "the bake's closing does not match the sampled cone"
     c1, c2 = (c["C"] for c in case["cams"])
     print(f"  C_1          = " + ", ".join(f"{v:.4f}" for v in c1)
           + f"   lum {luminance(c1):.4f}")
@@ -619,9 +616,9 @@ def report(case: dict) -> None:
           + f"   lum {luminance(c2):.4f}")
     ratio = luminance(c1) / luminance(c2)
     print(f"  C_1 / C_2 (lum) = {ratio:.2f}   "
-          f"(tutto lo scarto viene dal termine speculare)")
-    assert ratio > 1.3, "le due camere registrano quasi lo stesso colore: " \
-                        "la figura perde il suo punto, spostare le camere o il sole"
+          f"(the whole gap comes from the specular term)")
+    assert ratio > 1.3, "the two cameras record almost the same colour: " \
+                        "the figure loses its point, move the cameras or the sun"
 
 
 def main() -> int:
@@ -629,13 +626,13 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
     ap.add_argument("--figures", default="model,kernel",
-                    help="quali figure scrivere, separate da virgola: model, kernel")
+                    help="which figures to write, comma-separated: model, kernel")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     want = {f.strip() for f in args.figures.split(",") if f.strip()}
     if not want <= {"model", "kernel"}:
-        ap.error(f"figure sconosciute: {sorted(want - {'model', 'kernel'})}")
+        ap.error(f"unknown figures: {sorted(want - {'model', 'kernel'})}")
 
     if "model" in want:
         case = build_case()
