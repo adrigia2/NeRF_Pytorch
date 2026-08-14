@@ -30,9 +30,9 @@ of directions per texel, almost every texel finds something to hit and the occlu
 rays would need the NeRF, leaving no closed-form reference. Above a planar quad every
 direction lies in the hemisphere above the normal, so no ray can hit the quad itself.
 
-Note: the process exits with a non-zero code at interpreter shutdown (a pre-existing
-OptiX cleanup issue, not a test failure — as in test_spec_cone_smoke.py). The line
-that counts is "✓ all HemiVis tests passed".
+On success the process prints "✓ all HemiVis tests passed" and exits 0. (Until the
+teardown fix of 2026-08-14 it exited non-zero whatever the outcome, because the OptiX
+context was destroyed after CUDA had already unloaded.)
 
 Usage:  python test_hemivis_shared.py
 """

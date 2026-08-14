@@ -107,8 +107,9 @@ python scripts/test_spec_cone_smoke.py
 python scripts/test_hemivis_shared.py
 ```
 
-Both print a final `✓` line. **Ignore their exit code**: the process exits non-zero at
-interpreter shutdown because of a known OptiX cleanup issue, not because of a failure.
+Both print a final `✓` line and exit `0`. (They used to exit non-zero whatever happened,
+because the OptiX context was torn down after CUDA had already unloaded; fixed on
+2026-08-14, so the exit code is meaningful again.)
 
 ---
 
@@ -262,9 +263,9 @@ progress bars and the `✓` markers will raise:
 PYTHONIOENCODING=utf-8 python images_generator.py
 ```
 
-**The exit code is unreliable** (OptiX exits non-zero at interpreter shutdown). Judge the
-outcome from the final `run_pipeline_multi summary:` block, and from `console.log` inside
-each scene folder.
+Judge the outcome from the final `run_pipeline_multi summary:` block and from `console.log`
+inside each scene folder. The exit code is trustworthy since the teardown fix of 2026-08-14;
+before that, any process that had used OptiX exited non-zero regardless of outcome.
 
 ### Output layout
 
