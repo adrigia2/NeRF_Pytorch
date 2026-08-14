@@ -178,7 +178,7 @@ def main() -> int:
             elif gt_path is not None:
                 print(f"  heatmap: skip (GT not found: {gt_path})", flush=True)
             else:
-                print("  heatmap: skip (nessuna GT: usa --gt)", flush=True)
+                print("  heatmap: skip (no GT: use --gt)", flush=True)
             continue
 
         try:
@@ -193,7 +193,7 @@ def main() -> int:
                 if gt_path is not None:
                     print(f"  ⚠  GT not found ({gt_path}) — skipping the heatmap", flush=True)
                 else:
-                    print("  •  nessuna GT disponibile — skip heatmap (usa --gt)", flush=True)
+                    print("  \u2022  no GT available - heatmap skipped (use --gt)", flush=True)
             elif heatmap_exists and not args.force:
                 print(f"  ↻  {HEATMAP_REL.as_posix()} already present — skipped", flush=True)
             else:
@@ -205,11 +205,11 @@ def main() -> int:
             traceback.print_exc()
 
     if args.dry_run:
-        print("\n[bake] dry-run: nessun file scritto.", flush=True)
+        print("\n[bake] dry-run: no file written.", flush=True)
         return 0
 
-    print(f"\n[bake] Riepilogo: {n_baked} bakate, {n_skipped} saltate, {n_failed} fallite "
-          f"su {len(run_dirs)} run.", flush=True)
+    print(f"\n[bake] Summary: {n_baked} baked, {n_skipped} skipped, {n_failed} failed "
+          f"out of {len(run_dirs)} runs.", flush=True)
     return 1 if n_failed else 0
 
 

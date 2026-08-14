@@ -639,7 +639,7 @@ def do_grids(out: Path, downsample: int = 3, cameras: list[str] | None = None) -
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# mapdiff -- la colonna heatmap delle griglie delle mappe
+# mapdiff -- the heatmap column of the map grids
 # ──────────────────────────────────────────────────────────────────────────────
 
 # (name, authored file, recovered path under sources/<source>/, is it scalar?)

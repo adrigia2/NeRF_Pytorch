@@ -292,7 +292,7 @@ def main(argv=None) -> int:
         stats_all[n] = s
         vmax_global = max(vmax_global, s["max"])
         print(f"\r  {i}/{len(names)}  {n}  max={s['max']:.4g}   ", end="", flush=True)
-    print(f"\n  fatto in {time.time() - t0:.1f}s   max globale = {vmax_global:.6g}")
+    print(f"\n  done in {time.time() - t0:.1f}s   global max = {vmax_global:.6g}")
 
     if vmax_global <= args.vmin:
         raise SystemExit(
@@ -314,7 +314,7 @@ def main(argv=None) -> int:
             n, a, b, d, stats_all[n], args.vmin, vmax, args.cmap, args.dpi, out_path
         )
         print(f"\r  {i}/{len(names)}  {os.path.basename(out_path)}   ", end="", flush=True)
-    print(f"\n  fatto in {time.time() - t0:.1f}s")
+    print(f"\n  done in {time.time() - t0:.1f}s")
 
     # ---------------- Report ---------------- #
     csv_path = os.path.join(args.output, "diff_stats.csv")
@@ -334,7 +334,7 @@ def main(argv=None) -> int:
     worst = sorted(names, key=lambda n: stats_all[n]["rmse"], reverse=True)
     txt_path = os.path.join(args.output, "diff_summary.txt")
     with open(txt_path, "w", encoding="utf-8") as f:
-        f.write("Confronto EXR: Original vs Computed\n")
+        f.write("EXR comparison: Original vs Computed\n")
         f.write(f"  Original      : {args.original}\n")
         f.write(f"  Computed      : {args.computed}\n")
         f.write(f"  pairs         : {len(names)}\n\n")
@@ -345,7 +345,7 @@ def main(argv=None) -> int:
         f.write(f"  scala log vmax: {vmax:g}\n")
         f.write(f"  colormap      : {args.cmap}\n\n")
         mean_rmse = sum(stats_all[n]["rmse"] for n in names) / len(names)
-        f.write(f"  RMSE medio su tutti i frame: {mean_rmse:.8g}\n\n")
+        f.write(f"  Mean RMSE over every frame: {mean_rmse:.8g}\n\n")
         f.write("Frames sorted by decreasing RMSE (first 10):\n")
         for n in worst[:10]:
             s = stats_all[n]

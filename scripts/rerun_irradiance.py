@@ -317,7 +317,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("root", help="run tree to regenerate (a COPY)")
-    ap.add_argument("--only", nargs="+", metavar="TAG/SCENA",
+    ap.add_argument("--only", nargs="+", metavar="TAG/SCENE",
                     help="limit to these runs (e.g. exp_l1_d02/SwordShieldStudio)")
     ap.add_argument("--dry-run", action="store_true",
                     help="show config, overrides and deletions, then stop")

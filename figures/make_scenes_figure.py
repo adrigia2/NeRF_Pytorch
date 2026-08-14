@@ -195,7 +195,7 @@ def skybox_previews(out: Path, key: float, downsample: int = 4) -> None:
         a = block_mean(load_exr(p), downsample)
         expo, med = exposure_of(a, key)
         print(f"{name}: {p.name}  exposure {expo:.3f} "
-              f"(mediana luminanza {med:.4f})")
+              f"(median luminance {med:.4f})")
         save_png(tonemap(a, expo), out / f"{name}.png")
 
 

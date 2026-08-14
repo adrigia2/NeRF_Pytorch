@@ -69,7 +69,7 @@ class CameraIntrinsics:
 @dataclass
 class FrameInfo:
     file_path: str          # path assoluto risolto (per accedere al file su disco)
-    file_path_original: str # path così com'è nel JSON originale
+    file_path_original: str # path exactly as it appears in the original JSON
     transform_matrix: list[list[float]]
     sharpness: float = 1.0
 
