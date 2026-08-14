@@ -267,8 +267,8 @@ each scene folder.
 ├── nerf_train/                  Step 2: training_metrics.csv, epoch_metrics.csv, previews
 ├── nerf_render_images/iter_*/   Step 2b: per-frame pred/gt EXRs + metrics
 ├── ium/                         Step 3: inverse UV mapping (positions, normals, mask)
-├── visibility/                  Step 3: per-texel, per-camera visibility
-├── camera_mask/                 Step 3: per-camera masks (frustum + grazing filter)
+├── visibility/                  Step 3: per-texel, per-camera visibility (occlusion)
+├── camera_mask/                 Step 3: per-camera masks, occlusion + frustum + grazing
 ├── irradiance/                  Step 3: skybox irradiance, and irradiance_indirect.exr
 ├── spec_cone/                   Step 3: cam_000.exr … + spec_cone_meta.json
 ├── skybox_nerf_baked.exr        Step 3: envmap baked from the NeRF (skybox_source="nerf")
@@ -282,10 +282,22 @@ each scene folder.
 └── console.log
 ```
 
+The visibility kernel only answers "is this texel occluded from this camera?"; the
+frustum test and the grazing-angle filter are applied later, when the colour texture is
+baked. `camera_mask/` therefore holds the *authoritative* per-camera masks, and it
+overwrites `visibility.exr` — read `camera_mask/`, not `visibility/`, if you want to know
+which cameras a texel was actually fitted from.
+
 `metallic.exr` and `roughness.exr` are single-channel (`Z`). Because Blender's baker
 expects the value replicated over R/G/B, `metallic_rgb.exr` and `roughness_rgb.exr` are
 written next to them (disable with `pbr_write_blender_rgb=False`). The single-channel
 files stay the input of every internal reader.
+
+**`roughness` is a cone-width index, not a GGX α.** It is the winning cone's aperture
+divided by 180, quantised to the `spec_cone_apertures_deg` grid (mirror → 0). Exporting
+it as a Disney/Principled roughness would need an aperture→α calibration that this
+pipeline does not do. Where the fit is quasi-diffuse the lobe is ill-conditioned; the
+`pbr/r_valid.png` diagnostic marks where it is trustworthy.
 
 ---
 
