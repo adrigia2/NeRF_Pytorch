@@ -1,40 +1,40 @@
 #!/usr/bin/env python
-"""make_scenes_figure.py -- Figure di tesi sulle scene: l'interno e la spada e scudo.
+"""make_scenes_figure.py -- thesis figures on the scenes: the interior, and the sword and shield.
 
-Per ogni variante produce due PNG:
+For each variant it produces two PNGs:
 
-  <key>_view.png    la vista renderizzata, tonemappata
-  <key>_detail.png  un ritaglio a piena risoluzione sull'elemento che distingue la
+  <key>_view.png    the rendered view, tonemapped
+  <key>_detail.png  a full-resolution crop on the element that sets the variant apart
                     variante (il cubo metallico, la sfera emissiva)
 
     python make_scenes_figure.py --out ../Doc/images/scenes
     python make_scenes_figure.py --family sword --out ../Doc/images/scenes
-    python make_scenes_figure.py --contact-sheet specular --out <cartella temporanea>
+    python make_scenes_figure.py --contact-sheet specular --out <temporary folder>
 
-Tre scelte non sono negoziabili e sono il motivo per cui questo script esiste:
+Three choices are not negotiable, and are the reason this script exists:
 
-  1. La camera e' la stessa per tutte le varianti di una famiglia.  Sull'interno e'
-     presa fra le `render_Camera_Shell21_*`: i `render_config.json` differiscono, la
-     variante ad alta frequenza ha `center_offset` 0 invece di 0.5 sullo shell 1,
-     quindi solo i 30 frame dello shell 2 hanno estrinseche identiche in tutte le
-     scene.  Con una camera dello shell 1 le viste non sarebbero confrontabili.
+  1. The camera is the same for every variant of a family.  On the interior it is taken
+     from the `render_Camera_Shell21_*` set: the `render_config.json` files differ, the
+     high-frequency variant has `center_offset` 0 instead of 0.5 on shell 1, so only the
+     30 frames of shell 2 have identical extrinsics across all the scenes.  With a shell 1
+     camera the views would not be comparable.
 
-  2. Le varianti che condividono la stessa luce condividono UNA esposizione, derivata
-     dalla mediana della luminanza di una variante di riferimento.  Se ognuna avesse la
-     sua, il cubo che nella variante diffusa appare opaco potrebbe esserlo per via
-     dell'esposizione e non del materiale, che e' esattamente cio' che la figura deve
-     mostrare.  La variante notturna ha la sua, perche' con l'esposizione diurna sarebbe
+  2. Variants that share the same lighting share ONE exposure, derived from the median
+     luminance of a reference variant.  If each had its own, the cube that looks matte in
+     the diffuse variant might look so because of the exposure rather than the material,
+     which is exactly what the figure is there to show.  The night variant has its own,
+     because at the daytime exposure it would be black.
      nera.
 
-  3. Il ritaglio e' preso dall'immagine lineare a piena risoluzione e tonemappato con
-     la stessa esposizione della vista da cui proviene.  Ritagliare dopo il downsample
-     butterebbe via proprio il dettaglio che il pannello deve mostrare.
+  3. The crop is taken from the full-resolution linear image and tonemapped with the same
+     exposure as the view it comes from.  Cropping after the downsample would throw away
+     precisely the detail the panel is meant to show.
 
-Le famiglie sono due e non condividono niente se non queste tre regole: l'interno ha
-quattro varianti e due gruppi di esposizione, la spada ne ha due che sono anche i due
-gruppi.  `column_exposure()` e' il punto in cui la regola 2 e' scritta una volta sola:
-make_results_figures.py la chiama per tonemappare la riga "NeRF render" delle griglie
-con l'esposizione della riga originale della stessa colonna, che e' cio' che la
+There are two families and they share nothing but these three rules: the interior has four
+variants and two exposure groups, the sword has two which are also the two groups.
+`column_exposure()` is where rule 2 is written down once:
+make_results_figures.py calls it to tonemap the "NeRF render" row of the grids with the
+exposure of the original row of the same column, which is what the caption promises.
 didascalia promette al lettore.
 """
 from __future__ import annotations
@@ -59,23 +59,23 @@ SCENES_ROOT = Path("C:/Users/adria/Documents/GitHub/Tesi/OptixProjectCMake/Scene
 SWORD_ROOT = Path("C:/Users/adria/Documents/GitHub/Tesi/OptixProjectCMake/Scenes"
                   "/SwordShield Thesis")
 
-# Camera condivisa: solo lo shell 2 ha estrinseche identiche in tutte le varianti.
-# La 38 e' l'unica in cui i tre oggetti (sfera, coniglio, cubo) non si sovrappongono e
-# si vede anche l'ambiente, che e' cio' che spiega la tinta della luce.
+# Shared camera: only shell 2 has identical extrinsics across every variant.
+# Number 38 is the only one where the three objects (sphere, bunny, cube) do not overlap
+# and the environment is also visible, which is what explains the tint of the light.
 CAMERA = "render_Camera_Shell21_38"
 
-# La spada ha un solo shell di 60 camere, quindi il vincolo delle estrinseche che
-# governa l'interno non si pone: la scelta e' solo di inquadratura.  La copertura da
-# sola non basta come criterio, ed e' il motivo per cui questa costante ha un commento:
-# le camere che massimizzano l'area coperta (la 40 in testa) inquadrano il RETRO dello
-# scudo, dove si vedono solo le due impugnature.  La 23 e' fra le migliori per copertura
-# (12.9% dei pixel) e centratura, e in piu' e' una delle poche che mostra insieme le tre
-# cose di cui parla il testo: le assi di legno della faccia, la borchia d'acciaio e la
-# lama per intero, dal pomo alla punta.
+# The sword has a single shell of 60 cameras, so the extrinsics constraint that governs
+# the interior does not apply: the choice is only one of framing.  Coverage alone is not
+# enough as a criterion, and that is why this constant has a comment: the cameras that
+# maximise the covered area (number 40 leading) frame the BACK of the shield, where only
+# the two grips are visible.  Number 23 is among the best for coverage (12.9 % of the
+# pixels) and centring, and on top of that it is one of the few that shows the three
+# things the text talks about together: the wooden boards of the face, the steel boss and
+# the whole blade, from pommel to tip.
 SWORD_CAMERA = "render_Camera_Shell10_23"
 
-# (key, cartella del dataset, etichetta, gruppo di esposizione)
-# Il gruppo "day" condivide una sola esposizione; "night" ne ha una propria.
+# (key, dataset folder, label, exposure group)
+# The "day" group shares a single exposure; "night" has its own.
 SCENES: list[tuple[str, str, str, str]] = [
     ("specular",    "NerfOpenEXRSmooth",          "specular variant (base)", "day"),
     ("highfreq",    "NerfOpenEXRHighDetails",     "high-frequency variant",  "day"),
@@ -88,11 +88,11 @@ SWORD_SCENES: list[tuple[str, str, str, str]] = [
     ("sword_night",  "NerfNight",  "sword and shield, night",  "night"),
 ]
 
-# Ritaglio (x0, y0, larghezza, altezza) in pixel a piena risoluzione, per variante.
-# Le tre varianti che si distinguono per il cubo usano lo stesso rettangolo, cosi' il
-# confronto fra i ritagli e' diretto; quella ad alta frequenza inquadra la sfera.
-# Stesso 16:9 della vista: nella figura i due pannelli stanno affiancati alla stessa
-# larghezza, e con proporzioni diverse avrebbero altezze diverse.
+# Crop (x0, y0, width, height) in full-resolution pixels, per variant.
+# The three variants that differ by the cube use the same rectangle, so comparing the
+# crops is direct; the high-frequency one frames the sphere.
+# Same 16:9 as the view: in the figure the two panels sit side by side at the same width,
+# and with different proportions they would have different heights.
 CROPS: dict[str, tuple[int, int, int, int]] = {
     "specular":    (860, 265, 640, 360),
     "highfreq":    (460, 340, 640, 360),
@@ -100,18 +100,18 @@ CROPS: dict[str, tuple[int, int, int, int]] = {
     "diffusecube": (860, 265, 640, 360),
 }
 
-# Il ritaglio della sfera di pietra: e' lo stesso rettangolo di "highfreq", perche' la
-# sfera occupa lo stesso posto in tutte le varianti, ed e' il pannello di dettaglio
-# della sezione sul dettaglio perso (fig:res-highfreq-stone).
+# The crop of the stone sphere: the same rectangle as "highfreq", because the sphere
+# sits in the same place in every variant, and it is the detail panel of the section on
+# lost detail (fig:res-highfreq-stone).
 SPHERE_CROP = CROPS["highfreq"]
 
-# L'esposizione porta la mediana della luminanza a questo livello prima del Reinhard.
-# 0.2 e non 0.5: la mediana di questa inquadratura cade sul pavimento scuro dello studio,
-# e portarla a meta' scala bruciava il tavolo, che e' quasi tutto cio' che conta.
+# The exposure brings the median luminance to this level before the Reinhard.
+# 0.2 and not 0.5: the median of this framing falls on the studio's dark floor, and
+# bringing it to mid scale burned out the table, which is almost all that matters.
 KEY = 0.20
 
-# Preview delle due envmap per la tabella degli asset: (key, percorso relativo a
-# SCENES_ROOT).  La notturna vive nella cartella del bake, non in assets/hdri.
+# Previews of the two envmaps for the asset table: (key, path relative to
+# SCENES_ROOT).  The night one lives in the bake folder, not in assets/hdri.
 SKYBOXES: list[tuple[str, str]] = [
     ("skybox_studio", "Blender/assets/hdri/wooden_studio_13_4k.exr"),
     ("skybox_night",  "BlenderBakedSmoothNight/cobblestone_street_night_4k.exr"),
@@ -120,10 +120,10 @@ SKYBOXES: list[tuple[str, str]] = [
 
 @dataclass(frozen=True)
 class Family:
-    """Una famiglia di scene: stessa geometria, stessa camera, stesse regole di
-    esposizione.  `reference` dice, per ogni gruppo di esposizione, quale variante ne
-    detta la mediana: e' la regola 2 del docstring resa esplicita invece che scritta
-    dentro il flusso di main()."""
+    """A family of scenes: same geometry, same camera, same exposure rules.
+    `reference` says, for each exposure group, which variant dictates its median: it is
+    rule 2 of the docstring made explicit instead of being written inside the flow of
+    main()."""
     root: Path
     camera: str
     scenes: list[tuple[str, str, str, str]]
@@ -135,8 +135,8 @@ FAMILIES: dict[str, Family] = {
     "interior": Family(
         root=SCENES_ROOT, camera=CAMERA, scenes=SCENES,
         reference={"day": "specular", "night": "night"}, crops=CROPS),
-    # Studio e notte non condividono l'esposizione: sono due ambienti diversi, non due
-    # versioni dello stesso, e con una sola esposizione una delle due sarebbe illeggibile.
+    # Studio and night do not share an exposure: they are two different environments, not
+    # two versions of the same one, and with a single exposure one of them would be unreadable.
     "sword": Family(
         root=SWORD_ROOT, camera=SWORD_CAMERA, scenes=SWORD_SCENES,
         reference={"studio": "sword_studio", "night": "sword_night"}),
@@ -148,8 +148,8 @@ def frame_path(scene_dir: str, camera: str, root: Path = SCENES_ROOT) -> Path:
 
 
 def exposure_of(img: np.ndarray, key: float = KEY) -> tuple[float, float]:
-    """(esposizione, mediana della luminanza).  La mediana, e non il massimo, perche'
-    in una scena HDR il picco sta sulle sorgenti e detterebbe da solo il tonemap."""
+    """(exposure, median luminance).  The median, and not the maximum, because in an HDR
+    scene the peak sits on the light sources and would dictate the tonemap alone."""
     lum = (img * LUMA_COEFF).sum(-1)
     med = max(float(np.median(lum)), 1e-4)
     return key / med, med
@@ -157,15 +157,15 @@ def exposure_of(img: np.ndarray, key: float = KEY) -> tuple[float, float]:
 
 def column_exposure(family: str, scene_key: str, camera: str | None = None,
                     key: float = KEY) -> float:
-    """L'esposizione con cui va tonemappata una colonna delle griglie dei Results.
+    """The exposure a column of the Results grids has to be tonemapped with.
 
-    E' il punto in cui la regola 2 vive: il gruppo di esposizione della variante decide
-    quale frame ne detta la mediana, e tutti i pannelli di quella colonna la ereditano.
-    Serve fuori di qui perche' le griglie preview mettono in colonna il render
-    originale, quello del NeRF e il re-render, e la didascalia promette che i tre
-    condividono una sola esposizione: se ognuno la ricalcolasse sulla propria mediana,
-    un NeRF che sbaglia il livello medio verrebbe riportato in scala dal tonemap e la
-    figura mostrerebbe un errore che non c'e' piu'."""
+    This is where rule 2 lives: the variant's exposure group decides which frame dictates
+    its median, and every panel of that column inherits it.
+    It is needed outside this module because the preview grids stack the original render,
+    the NeRF one and the re-render in one column, and the caption promises the three share
+    a single exposure: if each recomputed it on its own median, a NeRF that gets the mean
+    level wrong would be brought back into scale by the tonemap and the figure would show
+    an error that is no longer there."""
     fam = FAMILIES[family]
     group = {k: g for k, _, _, g in fam.scenes}[scene_key]
     ref_key = fam.reference[group]
@@ -181,12 +181,12 @@ def save_png(rgb: np.ndarray, out: Path) -> None:
 
 
 def skybox_previews(out: Path, key: float, downsample: int = 4) -> None:
-    """Le due envmap tonemappate, per la tabella degli asset.
+    """The two envmaps, tonemapped, for the asset table.
 
-    Ognuna con la propria esposizione: sono due ambienti diversi, non due versioni della
-    stessa scena, e qui la figura deve solo renderle leggibili.  Il downsample e' una
-    media di blocchi in spazio lineare, prima del tonemap, per non alterare la radianza
-    media delle sorgenti piccole (stesso motivo di make_skybox_figure).
+    Each with its own exposure: they are two different environments, not two versions of
+    the same scene, and here the figure only has to make them readable.  The downsample is
+    a block mean in linear space, before the tonemap, so as not to alter the mean radiance
+    of the small sources (same reason as in make_skybox_figure).
     """
     for name, rel in SKYBOXES:
         p = SCENES_ROOT / rel
@@ -201,10 +201,10 @@ def skybox_previews(out: Path, key: float, downsample: int = 4) -> None:
 
 def contact_sheet(scene_dir: str, out: Path, downsample: int = 8,
                   ncols: int = 6, root: Path = SCENES_ROOT) -> None:
-    """Griglia di tutti i frame della scena, per scegliere la camera a occhio."""
+    """Grid of every frame of the scene, to pick the camera by eye."""
     paths = sorted((root / scene_dir / "images").glob("*.exr"))
     if not paths:
-        raise SystemExit(f"ERRORE: nessun EXR in {root / scene_dir / 'images'}")
+        raise SystemExit(f"ERROR: no EXR in {root / scene_dir / 'images'}")
     print(f"contact sheet di {scene_dir}: {len(paths)} frame")
 
     thumbs = [block_mean(load_exr(p), downsample) for p in paths]
@@ -232,21 +232,21 @@ def contact_sheet(scene_dir: str, out: Path, downsample: int = 8,
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", required=True, help="cartella di destinazione dei PNG")
+    ap.add_argument("--out", required=True, help="destination folder for the PNGs")
     ap.add_argument("--family", default="interior", choices=sorted(FAMILIES),
                     help="famiglia di scene da generare (default interior)")
     ap.add_argument("--camera", default=None,
-                    help="frame da usare (default: quello della famiglia)")
+                    help="frame to use (default: the family's own)")
     ap.add_argument("--downsample", type=int, default=2,
-                    help="media di blocchi sulla vista (default 2: 1920x1080 -> 960x540)")
+                    help="block mean on the view (default 2: 1920x1080 -> 960x540)")
     ap.add_argument("--key", type=float, default=KEY,
                     help=f"livello a cui portare la mediana della luminanza (default {KEY})")
     ap.add_argument("--contact-sheet", default=None, metavar="KEY",
-                    help="scrive solo la griglia dei frame della variante indicata")
+                    help="write only the frame grid of the given variant")
     ap.add_argument("--skyboxes", action="store_true",
-                    help="scrive solo le preview delle due envmap per la tabella asset")
+                    help="write only the previews of the two envmaps for the asset table")
     ap.add_argument("--no-crop", action="store_true",
-                    help="salta i ritagli (utile mentre si scelgono i rettangoli)")
+                    help="skip the crops (useful while choosing the rectangles)")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -267,8 +267,8 @@ def main() -> int:
                       out / f"contact_{args.contact_sheet}.png", root=fam.root)
         return 0
 
-    # Carica prima tutte le viste lineari: l'esposizione di un gruppo e' condivisa e va
-    # calcolata sulla variante di riferimento prima di tonemappare qualsiasi cosa.
+    # Load every linear view first: a group's exposure is shared and has to be computed
+    # on the reference variant before anything is tonemapped.
     linear: dict[str, np.ndarray] = {}
     for key, scene_dir, _, _ in fam.scenes:
         p = frame_path(scene_dir, camera, fam.root)
@@ -278,7 +278,7 @@ def main() -> int:
         linear[key] = load_exr(p)
         print(f"{key:14s} {p.name}  {linear[key].shape[1]}x{linear[key].shape[0]}")
 
-    # Una esposizione per gruppo, dettata dalla variante di riferimento del gruppo.
+    # One exposure per group, dictated by the group's reference variant.
     expo: dict[str, float] = {}
     print()
     for group, ref_key in fam.reference.items():

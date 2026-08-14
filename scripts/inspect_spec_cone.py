@@ -1,16 +1,16 @@
-"""inspect_spec_cone.py — Sfoglia i coni speculari già baked in spec_cone/.
+"""inspect_spec_cone.py — browse the specular cones already baked into spec_cone/.
 
-Il bake scrive per ogni camera un `spec_cone/cam_{j:03d}.exr` con un canale RGB
-per candidato, chiamato con la sua apertura (`cone_000_mirror`, `cone_005deg`,
-… `cone_180deg`), che è direttamente la L_j(r) usata dal fit PBR. Il file è già
-ispezionabile con un viewer che raggruppa i canali per prefisso (tev mostra un
-layer per apertura, in ordine di apertura); questo script serve quando si vuole:
+For each camera the bake writes a `spec_cone/cam_{j:03d}.exr` with one RGB channel per
+candidate, named after its aperture (`cone_000_mirror`, `cone_005deg`, … `cone_180deg`),
+which is directly the L_j(r) the PBR fit uses. The file can already be inspected with a
+viewer that groups channels by prefix (tev shows one layer per aperture, in aperture
+order); this script is for when one wants:
 
-  - un colpo d'occhio su tutte le aperture insieme (`contact_sheet.png`), con
-    ESPOSIZIONE CONDIVISA, così la progressione specchio → cono largo si legge
-    davvero invece di essere riscalata via apertura per apertura;
-  - i coni spacchettati in un EXR per apertura (`--unpack`), per aprirli con
-    strumenti che non gestiscono i canali multipli.
+  - a single glance at every aperture together (`contact_sheet.png`), with a SHARED
+    EXPOSURE, so that the mirror → wide-cone progression really reads instead of being
+    rescaled away aperture by aperture;
+  - the cones unpacked into one EXR per aperture (`--unpack`), to open them with tools
+    that do not handle multiple channels.
 
 Uso:
     python inspect_spec_cone.py <output_dir> [--cams 0,3,7] [--unpack]
@@ -18,11 +18,11 @@ Uso:
                                 [--preview-percentile 95]
 
 Uscite in <output_dir>/spec_cone_view/cam_{j:03d}/:
-    contact_sheet.png            griglia di tutte le aperture
-    cone_000_mirror.exr,         solo con --unpack, un file per apertura,
-    cone_005deg.exr, …           con lo stesso nome del canale nel bake
+    contact_sheet.png            grid of every aperture
+    cone_000_mirror.exr,         only with --unpack, one file per aperture,
+    cone_005deg.exr, …           with the same name as the channel in the bake
 
-Non richiede GPU, OptiX né il checkpoint NeRF: legge solo gli EXR del bake.
+Needs no GPU, no OptiX and no NeRF checkpoint: it only reads the bake's EXRs.
 """
 
 from __future__ import annotations
@@ -44,18 +44,17 @@ from pbr_solver import read_cones  # noqa: E402
 def save_contact_sheet(cones: np.ndarray, valid: np.ndarray, apertures: np.ndarray,
                        shape: "tuple[int, int]", path: Path, cam: int,
                        size: int = 1024, percentile: float = 95.0) -> None:
-    """Griglia di tutte le aperture con ESPOSIZIONE CONDIVISA.
+    """Grid of every aperture with a SHARED EXPOSURE.
 
-    La scala viene da un percentile del livello specchio sui texel validi e resta
-    la stessa per tutti i pannelli: rinormalizzare ogni apertura nasconderebbe
-    proprio la progressione che si vuole guardare (L è una media, quindi la
-    luminosità media deve restare confrontabile a ogni apertura).
+    The scale comes from a percentile of the mirror level over the valid texels and stays
+    the same for every panel: renormalising each aperture would hide precisely the
+    progression one wants to look at (L is a mean, so the mean brightness has to stay
+    comparable at every aperture).
 
-    Il default è il percentile 95 e non il 99 perché la distribuzione di L ha una
-    coda HDR ripidissima (in una scena tipica p95 ≈ 0.8 e p99 ≈ 18):
-    normalizzare sui picchi delle luci schiaccia nel nero tutto il resto della
-    texture. Con 95 i highlight saturano, e sono highlight.
-    """
+    The default is the 95th percentile and not the 99th because the distribution of L has
+    a very steep HDR tail (in a typical scene p95 ≈ 0.8 and p99 ≈ 18): normalising on the
+    peaks of the lights crushes all the rest of the texture into black. At 95 the
+    highlights saturate, and they are highlights."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -91,16 +90,16 @@ def save_contact_sheet(cones: np.ndarray, valid: np.ndarray, apertures: np.ndarr
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("output_dir", help="cartella di una scena (contiene spec_cone/)")
-    ap.add_argument("--cams", default="", help="indici camera separati da virgola (default: tutte)")
+    ap.add_argument("output_dir", help="a scene folder (holds spec_cone/)")
+    ap.add_argument("--cams", default="", help="comma-separated camera indices (default: all)")
     ap.add_argument("--unpack", action="store_true",
-                    help="scrive anche un EXR per apertura (full-res, ~39 MB l'uno)")
-    ap.add_argument("--no-preview", action="store_true", help="niente contact sheet")
+                    help="also write one EXR per aperture (full-res, ~39 MB each)")
+    ap.add_argument("--no-preview", action="store_true", help="no contact sheet")
     ap.add_argument("--preview-size", type=int, default=1024,
-                    help="lato massimo delle preview nel contact sheet (default 1024)")
+                    help="maximum side of the previews in the contact sheet (default 1024)")
     ap.add_argument("--preview-percentile", type=float, default=95.0,
-                    help="percentile del livello specchio che fissa l'esposizione "
-                         "condivisa del contact sheet (default 95)")
+                    help="percentile of the mirror level that sets the shared "
+                         "exposure of the contact sheet (default 95)")
     args = ap.parse_args()
 
     out = Path(args.output_dir)
@@ -113,10 +112,10 @@ def main() -> None:
     with open(meta_path, encoding="utf-8") as fh:
         meta = json.load(fh)
     if meta.get("format") != "cones":
-        sys.exit(f"formato {meta.get('format')!r} non supportato: serve un bake "
-                 f"'cones'. I bake 'rings'/'rings_shared' (medie per anello) sono "
-                 f"precedenti allo spostamento della chiusura dei coni nel bake e "
-                 f"vanno rifatti.")
+        sys.exit(f"format {meta.get('format')!r} not supported: a bake in the "
+                 f"'cones' format is required. The 'rings'/'rings_shared' bakes "
+                 f"(per-ring means) predate the move of the cone closing into the "
+                 f"bake and have to be redone.")
 
     cams = ([int(x) for x in args.cams.split(",") if x.strip()]
             if args.cams else list(meta["cameras"]))
@@ -126,18 +125,18 @@ def main() -> None:
 
     K = int(meta["num_levels"])
     apertures = np.asarray(meta["apertures_deg"], dtype=np.float64)
-    # stessi nomi dei canali nel bake: un solo nome per livello, ovunque
+    # the same channel names as in the bake: one name per level, everywhere
     labels = [spec_cone_level_name(apertures, k) for k in range(K)]
     view_root = out / "spec_cone_view"
 
-    # la risoluzione della texture viene dall'IUM: il bake ci scrive dentro
+    # the texture resolution comes from the IUM: the bake writes into it
     ium_mask = out / "ium" / "ium_masks.exr"
     if not ium_mask.exists():
         sys.exit(f"{ium_mask} non trovato: serve per conoscere la risoluzione IUM.")
     from pbr_solver import _read_exr
     H, W = _read_exr(ium_mask).shape[:2]
 
-    print(f"[spec_cone] scheme={meta.get('scheme')}, {K} livelli "
+    print(f"[spec_cone] scheme={meta.get('scheme')}, {K} levels "
           f"(specchio + {K - 1} coni), aperture {apertures[1:].tolist()}°")
     print(f"[spec_cone] {len(cams)} camere, texture {W}×{H} → {view_root}")
 
