@@ -67,13 +67,19 @@ def block_mean(img: np.ndarray, factor: int) -> np.ndarray:
 
     Conserva la radianza media, che un resampling per interpolazione non garantisce:
     su un envmap con sorgenti piccole e molto brillanti la differenza non e' cosmetica.
+
+    Il numero di canali si legge dall'array invece di essere fissato a 3: le heatmap di
+    make_results_figures passano di qui a canale singolo, e con il 3 cablato la reshape
+    falliva.  Sugli RGB il comportamento e' identico.
     """
     if factor <= 1:
         return img
     h, w = img.shape[:2]
+    c = img.shape[2] if img.ndim == 3 else 1
     h2, w2 = (h // factor) * factor, (w // factor) * factor
-    a = img[:h2, :w2]
-    return a.reshape(h2 // factor, factor, w2 // factor, factor, 3).mean(axis=(1, 3))
+    a = img[:h2, :w2].reshape(h2, w2, c)
+    out = a.reshape(h2 // factor, factor, w2 // factor, factor, c).mean(axis=(1, 3))
+    return out if img.ndim == 3 else out[..., 0]
 
 
 def tonemap(x: np.ndarray, exposure: float) -> np.ndarray:
