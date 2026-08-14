@@ -1,44 +1,44 @@
 #!/usr/bin/env python
-"""compare_runs.py -- Confronto tra i run di uno sweep NeRF (attivazione x loss).
+"""compare_runs.py -- comparison of the runs of a NeRF sweep (activation x loss).
 
-Legge gli artefatti gia' prodotti da images_generator.py per ogni run dello sweep
+Reads the artefacts images_generator.py already produced for every run of the sweep
 (training_metrics.csv, nerf_render_images/iter_*/metrics_per_frame.csv,
-bias_bins.csv, e le coppie frame_NNN_{gt,pred}.exr) e produce figure comparative,
-tabelle aggregate e un report testuale in una cartella NUOVA.  Nessun file dei run
-viene letto in scrittura: lo script e' puramente read-only sugli artefatti.
+bias_bins.csv, and the frame_NNN_{gt,pred}.exr pairs) and produces comparative figures,
+aggregate tables and a text report into a NEW folder.  No file of the runs is opened
+for writing: the script is purely read-only on the artefacts.
 
     python compare_runs.py [sweep_root] [-o OUT] [--no-recompute] [--reuse-cache]
                            [--runs NAME ...] [--visual-frame N]
                            [--skybox-gt GT.exr] [--no-spectrum-frames]
 
-Il punto metodologico, che e' il motivo per cui questo script esiste:
+The methodological point, which is why this script exists:
 
-  Ogni run e' per costruzione il minimo della PROPRIA loss su questi dati.
-  Classificarli con la MSE premia i run addestrati con mse, con la MAE quelli
-  addestrati con l1, con la relMSE quelli addestrati con rel_mse_raw.  Serve un
-  arbitro terzo, quindi quelle tre metriche sono ESCLUSE dalla matrice e dalle
-  classifiche (restano nei CSV grezzi): marcarle non basta, perche' una cella
-  auto-valutata pesa lo stesso nel colpo d'occhio.  La metrica di testa e' la
-  SMAPE, affiancata da mu-law PSNR e log-RMSE.
+  Every run is by construction the minimum of its OWN loss on this data.
+  Ranking them with the MSE rewards the runs trained with mse, with the MAE those
+  trained with l1, and the relMSE those trained with rel_mse_raw.  A third-party
+  arbiter is needed, so those three metrics are EXCLUDED from the matrix and from the
+  rankings (they stay in the raw CSVs): marking them is not enough, because a
+  self-evaluated cell weighs the same at a glance.  The headline metric is the
+  SMAPE, flanked by the mu-law PSNR and the log-RMSE.
 
-  Inoltre il NeRF, in questa pipeline, non viene consumato come immagine ma come
-  sorgente di radianza dentro integrali emisferici (irradianza indiretta, coni
-  speculari).  Li' il bias sistematico si accumula mentre il rumore si cancella:
-  per questo il bias con segno per fascia di luminanza e' riportato accanto
-  all'errore per pixel, e non come nota a pie' di pagina.
+  Moreover the NeRF, in this pipeline, is not consumed as an image but as a radiance
+  source inside hemispherical integrals (indirect irradiance, specular cones).  There
+  the systematic bias accumulates while the noise cancels: that is the reason why the
+  signed bias per luminance band is reported next to the per-pixel error, and not as a
+  footnote.
 
-  Per la stessa ragione la matrice non contiene solo errori per pixel: le ultime
-  due colonne misurano lo SPETTRO, cioe' quanto la distribuzione dei valori HDR
-  del run somiglia a quella della GT (distanza W1 in decadi e spostamento tonale
-  medio), calcolate sullo stesso insieme di pixel della matrice.  Un run puo'
-  avere l'errore per pixel piu' basso e lo spettro piu' storto.  La sezione
-  finale scompone quello stesso spettro per canale, per frame e sulla skybox
+  For the same reason the matrix does not hold per-pixel errors alone: the last two
+  columns measure the SPECTRUM, i.e. how much the run's distribution of HDR values
+  resembles the GT's (W1 distance in decades and mean tonal shift), computed on the
+  same set of pixels as the matrix.  A run can have the lowest per-pixel error and the
+  most skewed spectrum.  The final section decomposes that same spectrum per channel,
+  per frame and on the skybox.
   (originale contro quelle bakate dai NeRF).
 
-Le formule replicate da altri moduli sono segnalate nei commenti con il file di
-origine, cosi' che una divergenza futura sia individuabile: lo script e' autonomo
-per scelta (non importa nerf.metrics ne' images_generator) per non dipendere dalla
-pipeline mentre la tesi e' in corso.
+Formulas replicated from other modules are flagged in the comments with their source
+file, so that a future divergence is findable: the script is standalone by choice (it
+imports neither nerf.metrics nor images_generator) so as not to depend on the pipeline
+while the thesis is in progress.
 """
 from __future__ import annotations
 
@@ -63,24 +63,24 @@ from matplotlib.patches import Patch
 
 DEFAULT_ROOT = "D:/tesi_output/sweep_nerf_activation_loss_decay_find_better_nerf"
 
-# Rec.709 -- identico a _LUMA_COEFF in nerf/metrics.py
+# Rec.709 -- identical to _LUMA_COEFF in nerf/metrics.py
 LUMA_COEFF = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
-EPS = 1e-3          # stesso eps di highlight_percentile_error (nerf/metrics.py)
-PSNR_EPS = 1e-10    # stesso addendo usato in images_generator.py:2609
+EPS = 1e-3          # same eps as highlight_percentile_error (nerf/metrics.py)
+PSNR_EPS = 1e-10    # same addend used in images_generator.py:2609
 MU = 5000.0         # mu-law, Kalantari & Ramamoorthi 2017
 
-# Griglia di luminanza: 15 fasce da 1/3 di decade tra 1e-3 e 1e2, piu' underflow
-# e overflow.  I passi da 1/3 di decade cadono ESATTAMENTE su 0.1, 1 e 10, quindi
-# le quattro partizioni (shadow/midtone/highlight/extreme) sono somme di fasce
-# contigue e non servono accumulatori separati.
+# Luminance grid: 15 bands of 1/3 decade between 1e-3 and 1e2, plus underflow and
+# overflow.  The 1/3-decade steps land EXACTLY on 0.1, 1 and 10, so the four
+# partitions (shadow/midtone/highlight/extreme) are sums of contiguous bands and no
+# separate accumulators are needed.
 DEC_LO_EXP, DEC_HI_EXP = -3.0, 2.0
 DEC_PER_DECADE = 3
 N_DEC_INNER = int((DEC_HI_EXP - DEC_LO_EXP) * DEC_PER_DECADE)   # 15
 N_DEC = N_DEC_INNER + 2                                          # + underflow/overflow
 DEC_EDGES = 10.0 ** np.linspace(DEC_LO_EXP, DEC_HI_EXP, N_DEC_INNER + 1)
 
-# Partizioni: indici delle fasce che le compongono (bin 0 = underflow, 16 = overflow)
+# Partitions: indices of the bands that make them up (bin 0 = underflow, 16 = overflow)
 BANDS: dict[str, tuple[int, int]] = {
     "shadow":    (0, 6),     # L <= 0.1
     "midtone":   (7, 9),     # 0.1 < L <= 1
@@ -88,64 +88,64 @@ BANDS: dict[str, tuple[int, int]] = {
     "extreme":   (13, 16),   # L > 10
 }
 BAND_ORDER = ("shadow", "midtone", "highlight", "extreme")
-# Split binario di testa
+# Headline binary split
 SPLIT2 = {"rest": (0, 9), "highlight_all": (10, 16)}
 
 PIXEL_SETS = ("full", "fg", "bg")
 
-# Istogramma dei log-ratio per la mediana pred/gt senza campionamento
+# Histogram of the log-ratios, for the median pred/gt without sampling
 NR = 201
 RATIO_LO, RATIO_HI = -2.0, 2.0
 RATIO_STEP = (RATIO_HI - RATIO_LO) / (NR - 1)
 
-# ── Spettro dei valori ────────────────────────────────────────────────────────
-# Distribuzione dei valori HDR (non degli errori): dice se un run riproduce la
-# forma dell'istogramma della GT, cosa che nessuna metrica per pixel misura.
-# Due run con la stessa MSE possono avere spettri molto diversi, e nella pipeline
-# il NeRF finisce dentro integrali emisferici, dove conta come e' distribuita
-# l'energia.  Griglia log-spaziata come DEC_EDGES ma piu' fitta e piu' larga:
-# 20 bin per decade da 1e-5 a 1e3, piu' underflow e overflow.
+# ── Value spectrum ───────────────────────────────────────────────────────────
+# Distribution of the HDR values (not of the errors): it says whether a run reproduces
+# the shape of the GT's histogram, which no per-pixel metric measures.
+# Two runs with the same MSE can have very different spectra, and in the pipeline the
+# NeRF ends up inside hemispherical integrals, where how the energy is distributed
+# matters.  Log-spaced grid like DEC_EDGES but finer and wider: 20 bins per decade
+# from 1e-5 to 1e3, plus underflow and overflow.
 SPEC_LO_EXP, SPEC_HI_EXP = -5.0, 3.0
 SPEC_PER_DECADE = 20
 SPEC_STEP = 1.0 / SPEC_PER_DECADE                                  # dex per bin
 NS_INNER = int((SPEC_HI_EXP - SPEC_LO_EXP) * SPEC_PER_DECADE)      # 160
 NS = NS_INNER + 2                                                  # + underflow/overflow
 SPEC_EDGES = 10.0 ** np.linspace(SPEC_LO_EXP, SPEC_HI_EXP, NS_INNER + 1)
-# centro di ogni bin in log10; i bin 0 e NS-1 (aperti) prendono la stessa
-# larghezza nominale degli altri: e' un'approssimazione, ma li tiene sull'asse
+# centre of each bin in log10; bins 0 and NS-1 (open) take the same nominal width as
+# the others: an approximation, but it keeps them on the axis
 SPEC_CENTERS = SPEC_LO_EXP + (np.arange(NS) - 0.5) * SPEC_STEP
-# estremo superiore di ogni bin in log10, per i quantili: bin 0 -> SPEC_LO_EXP,
-# bin k -> SPEC_LO_EXP + k*step, ultimo bin -> SPEC_HI_EXP + step (aperto)
+# upper end of each bin in log10, for the quantiles: bin 0 -> SPEC_LO_EXP,
+# bin k -> SPEC_LO_EXP + k*step, last bin -> SPEC_HI_EXP + step (open)
 SPEC_UPPER = SPEC_LO_EXP + np.arange(NS) * SPEC_STEP
 
-# norm = ||RGB||_2 del pixel, non la luminanza Rec.709: e' la stessa quantita'
-# usata dalle heatmap di nerf/metrics.py e non privilegia il verde
+# norm = ||RGB||_2 of the pixel, not the Rec.709 luminance: it is the same quantity
+# the heatmaps of nerf/metrics.py use, and it does not privilege green
 SPEC_CHANNELS = ("R", "G", "B", "norm")
-SPEC_CH_COLORS = ("#E63946", "#2A9D8F", "#457B9D", "#9B59B6")   # come _RGB_HIST_COLORS
+SPEC_CH_COLORS = ("#E63946", "#2A9D8F", "#457B9D", "#9B59B6")   # as _RGB_HIST_COLORS
 N_SPEC_CH = len(SPEC_CHANNELS)
-NORM_CH = N_SPEC_CH - 1   # indice del canale "norm"
+NORM_CH = N_SPEC_CH - 1   # index of the "norm" channel
 
-# Quantita' accumulate per cella (set x fascia).  Tutte sono medie di quantita'
-# per campione, quindi additive sulle partizioni: e' cio' che rende esatta la
-# decomposizione del budget d'errore.
+# Quantities accumulated per cell (set x band).  All are means of per-sample
+# quantities, hence additive over the partitions: that is what makes the error-budget
+# decomposition exact.
 QUANTS = ("sq", "absd", "smape", "rel", "logsq", "musq",
           "tmclip_sq", "tmrein_sq", "p", "g")
 
-# Metriche mostrate nella matrice, con verso e famiglia.
+# Metrics shown in the matrix, with their direction and family.
 #
-# Nessuna colonna coincide con una delle loss dello sweep: MSE/PSNR lineare, MAE e
-# relMSE sono state tolte proprio perche' ognuna e' la loss di uno dei run, che quindi
-# ne e' il minimo per costruzione.  Restano nei CSV grezzi (metrics_global.csv), dove
-# nessuno le legge come una classifica.
+# No column coincides with one of the sweep's losses: linear MSE/PSNR, MAE and relMSE
+# were removed precisely because each is the loss of one of the runs, which is
+# therefore its minimum by construction.  They stay in the raw CSVs
+# (metrics_global.csv), where nobody reads them as a ranking.
 @dataclass(frozen=True)
 class MetricSpec:
     key: str
     label: str
     higher_is_better: bool
     fmt: str = "{:.4f}"
-    # True = misura la DISTRIBUZIONE dei valori, non l'errore per pixel.  Serve a
-    # separare le due famiglie nelle figure e nel report: sono domande diverse, e il
-    # caso interessante e' quando si contraddicono.
+    # True = measures the DISTRIBUTION of the values, not the per-pixel error.  It is
+    # there to separate the two families in the figures and in the report: they are
+    # different questions, and the interesting case is when they contradict each other.
     spectrum: bool = False
 
 
@@ -155,17 +155,17 @@ METRIC_SPECS = (
     MetricSpec("log_rmse",         "log-RMSE",              False, "{:.4f}"),
     MetricSpec("psnr_tm_clip",     "PSNR tm-clip [dB]",     True,  "{:.2f}"),
     MetricSpec("psnr_tm_reinhard", "PSNR tm-Reinhard [dB]", True,  "{:.2f}"),
-    # etichetta senza barre verticali: finisce dentro una tabella markdown
+    # label with no vertical bars: it ends up inside a markdown table
     MetricSpec("abs_energy_bias",  "abs. energy bias",      False, "{:.5f}"),
     MetricSpec("spec_w1",          "W1 spectrum [dex]",     False, "{:.4f}", spectrum=True),
     MetricSpec("spec_absdmean",    "abs. dmean [dex]",      False, "{:.4f}", spectrum=True),
 )
 
-# indice della prima colonna di distribuzione: separatore nelle figure
+# index of the first distribution column: the separator in the figures
 FIRST_SPEC_COL = next(j for j, sp in enumerate(METRIC_SPECS) if sp.spectrum)
 
-# Colori: la famiglia di colore identifica la loss, la tonalita' e il tratto
-# identificano l'attivazione (exp = scuro continuo, softplus = chiaro tratteggiato)
+# Colours: the colour family identifies the loss, the shade and the stroke
+# identify the activation (exp = dark solid, softplus = light dashed)
 COLORS = {
     ("exp", "l1"):               "#12436D",
     ("softplus", "l1"):          "#6BAED6",
@@ -182,8 +182,8 @@ FALLBACK_COLORS = ["#12436D", "#A63603", "#0F6B3C", "#6BAED6", "#FD8D3C", "#74C4
 # ──────────────────────────────────────────────────────────────────────────────
 
 def load_exr_rgb(path: str) -> np.ndarray:
-    """EXR -> (H, W, 3) float32.  Replica di _load_image_hw3_native
-    (images_generator.py:482), ramo EXR."""
+    """EXR -> (H, W, 3) float32.  Replica of _load_image_hw3_native
+    (images_generator.py:482), EXR branch."""
     import OpenEXR, Imath
     exr = OpenEXR.InputFile(path)
     dw = exr.header()["dataWindow"]
@@ -201,7 +201,7 @@ def load_exr_rgb(path: str) -> np.ndarray:
 
 
 def load_mask_bool(path: str) -> np.ndarray:
-    """PNG maschera -> (H, W) bool.  Soglia 127 come _load_mask_bool della pipeline."""
+    """Mask PNG -> (H, W) bool.  Threshold 127, as _load_mask_bool in the pipeline."""
     from PIL import Image
     arr = np.array(Image.open(path))
     if arr.ndim == 3:
@@ -225,12 +225,12 @@ def col_float(rows: list[dict], key: str) -> np.ndarray:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Scoperta dei run
+# Run discovery
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class Run:
-    key: str                 # nome della cartella del run
+    key: str                 # name of the run's folder
     run_dir: Path
     scene_dir: Path
     train_csv: Path
@@ -259,8 +259,8 @@ def discover_runs(root: Path, only: list[str] | None) -> list[Run]:
             print(f"  [skip] {run_dir.name}: training_metrics.csv vuoto")
             continue
         last = rows[-1]
-        # Attivazione/loss/decay si leggono dalle colonne del CSV, non dal nome
-        # della cartella: le ultime quattro colonne sono li' apposta (train.py:65-68).
+        # Activation/loss/decay are read from the CSV columns, not from the folder
+        # name: the last four columns are there for exactly that (train.py:65-68).
         iter_dirs = sorted((scene_dir / "nerf_render_images").glob("iter_*"))
         runs.append(Run(
             key=run_dir.name,
@@ -283,11 +283,11 @@ def discover_runs(root: Path, only: list[str] | None) -> list[Run]:
 # Accumulatori
 # ──────────────────────────────────────────────────────────────────────────────
 
-N_CELLS = 2 * N_DEC     # set (0=fg, 1=bg) x fascia di luminanza
+N_CELLS = 2 * N_DEC     # set (0=fg, 1=bg) x luminance band
 
 
 class Accum:
-    """Somme per cella (set x fascia).  Tutte in float64."""
+    """Sums per cell (set x band).  All in float64."""
 
     def __init__(self) -> None:
         self.n = np.zeros(N_CELLS, dtype=np.float64)
@@ -302,7 +302,7 @@ class Accum:
 
 
 def _cells_for(pixel_set: str, lo: int, hi: int) -> np.ndarray:
-    """Indici di cella per un insieme di pixel e un intervallo di fasce."""
+    """Cell indices for a pixel set and a range of bands."""
     bands = np.arange(lo, hi + 1)
     if pixel_set == "fg":
         return bands
@@ -325,7 +325,7 @@ def _hist_slice(acc: Accum, pixel_set: str, lo: int, hi: int) -> np.ndarray:
 
 
 def hist_quantile(hist: np.ndarray, q: float) -> float:
-    """Quantile del log10(ratio) da istogramma, con interpolazione dentro il bin."""
+    """Quantile of log10(ratio) from a histogram, interpolated inside the bin."""
     total = hist.sum()
     if total <= 0:
         return float("nan")
@@ -339,43 +339,43 @@ def hist_quantile(hist: np.ndarray, q: float) -> float:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Spettro dei valori: istogramma e distanze fra distribuzioni
+# Value spectrum: histogram and distances between distributions
 # ──────────────────────────────────────────────────────────────────────────────
 
 def spectrum_hist(arr_hw3: np.ndarray, weights: np.ndarray | None = None) -> np.ndarray:
-    """(H, W, 3) -> (4, NS) conteggi per bin log: R, G, B, ||RGB||_2.
+    """(H, W, 3) -> (4, NS) counts per log bin: R, G, B, ||RGB||_2.
 
-    Frame intero, nessuna maschera.  Il bin 0 raccoglie tutto cio' che sta sotto
-    1e-5 (zero e negativi inclusi), l'ultimo tutto cio' che sta sopra 1e3: nessun
-    pixel viene perso, e la somma dell'istogramma e' esattamente H*W.
-    `weights` (H, W) serve per l'envmap, dove i pixel non hanno lo stesso angolo
-    solido; None = peso 1 per pixel.
+    Whole frame, no mask.  Bin 0 collects everything below 1e-5 (zero and negatives
+    included), the last one everything above 1e3: no pixel is lost, and the sum of the
+    histogram is exactly H*W.
+    `weights` (H, W) is for the envmap, where the pixels do not have the same solid
+    angle; None = weight 1 per pixel.
     """
     a = arr_hw3.astype(np.float32, copy=False)
     vals = (a[..., 0], a[..., 1], a[..., 2], np.sqrt((a * a).sum(-1)))
     w = None if weights is None else weights.reshape(-1).astype(np.float64)
     out = np.zeros((N_SPEC_CH, NS), dtype=np.float64)
     for c, v in enumerate(vals):
-        # side="right": indice 0 sotto il primo bordo, NS-1 sopra l'ultimo.
-        # I NaN finiscono nell'overflow (searchsorted li mette in coda): sono
-        # comunque contati, quindi la verifica sulla somma li intercetta.
+        # side="right": index 0 below the first edge, NS-1 above the last.
+        # NaNs land in the overflow (searchsorted puts them at the end): they are
+        # still counted, so the check on the sum catches them.
         idx = np.clip(np.searchsorted(SPEC_EDGES, v.reshape(-1), side="right"), 0, NS - 1)
         out[c] = np.bincount(idx, weights=w, minlength=NS)
     return out
 
 
 def spectrum_hist_sets(arr_hw3: np.ndarray, fg: np.ndarray) -> np.ndarray:
-    """(H, W, 3) + maschera fg -> (3, 4, NS): full, fg, bg nell'ordine di PIXEL_SETS.
+    """(H, W, 3) + fg mask -> (3, 4, NS): full, fg, bg in the order of PIXEL_SETS.
 
-    L'indice di bin si calcola una volta sola e si ribina tre volte: la searchsorted e'
-    la parte cara, i bincount no.  I tre istogrammi sono calcolati in modo indipendente
-    (full senza pesi, fg con la maschera, bg col complemento) e non per differenza:
-    cosi' il controllo `full == fg + bg` di verify_spectrum ha davvero potere sulla
-    gestione della maschera invece di essere vero per costruzione.
+    The bin index is computed once and re-binned three times: searchsorted is the
+    expensive part, the bincounts are not.  The three histograms are computed
+    independently (full unweighted, fg with the mask, bg with its complement) and not
+    by difference: that way verify_spectrum's `full == fg + bg` check really has power
+    over the mask handling instead of being true by construction.
 
-    Il motivo per cui serve la separazione: la pipeline consuma il NeRF in due modi
-    diversi, il foreground alimenta il fit PBR e il background il bake dell'envmap, e
-    sono due distribuzioni di radianza diverse.
+    Why the separation is needed: the pipeline consumes the NeRF in two different ways,
+    the foreground feeds the PBR fit and the background the envmap bake, and they are
+    two different radiance distributions.
     """
     a = arr_hw3.astype(np.float32, copy=False)
     vals = (a[..., 0], a[..., 1], a[..., 2], np.sqrt((a * a).sum(-1)))
@@ -383,7 +383,7 @@ def spectrum_hist_sets(arr_hw3: np.ndarray, fg: np.ndarray) -> np.ndarray:
     w_bg = 1.0 - w_fg
     out = np.zeros((len(PIXEL_SETS), N_SPEC_CH, NS), dtype=np.float64)
     for c, v in enumerate(vals):
-        # side="right" e clip: stessa convenzione di spectrum_hist, nessun pixel perso
+        # side="right" and clip: same convention as spectrum_hist, no pixel lost
         idx = np.clip(np.searchsorted(SPEC_EDGES, v.reshape(-1), side="right"), 0, NS - 1)
         out[0, c] = np.bincount(idx, minlength=NS)
         out[1, c] = np.bincount(idx, weights=w_fg, minlength=NS)
@@ -392,18 +392,18 @@ def spectrum_hist_sets(arr_hw3: np.ndarray, fg: np.ndarray) -> np.ndarray:
 
 
 def spec_density(hist: np.ndarray) -> np.ndarray:
-    """Istogramma (..., NS) -> densita' che somma a 1 sull'ultimo asse."""
+    """Histogram (..., NS) -> density summing to 1 along the last axis."""
     tot = hist.sum(axis=-1, keepdims=True)
     return np.divide(hist, tot, out=np.zeros_like(hist, dtype=np.float64),
                      where=tot > 0)
 
 
 def spec_w1_dex(h_pred: np.ndarray, h_gt: np.ndarray) -> np.ndarray:
-    """Wasserstein-1 fra due spettri nel dominio log10, in decadi.
+    """Wasserstein-1 between two spectra in the log10 domain, in decades.
 
-    Con bin equispaziati in log10, W1 = somma(|F_pred - F_gt|) * passo: e' lo
-    spostamento medio dei quantili misurato in decadi.  Zero solo se le due
-    distribuzioni coincidono bin per bin.  Non richiede scipy.
+    With bins equispaced in log10, W1 = sum(|F_pred - F_gt|) * step: it is the mean
+    shift of the quantiles measured in decades.  Zero only when the two distributions
+    coincide bin by bin.  No scipy required.
     """
     fp = np.cumsum(spec_density(h_pred), axis=-1)
     fg = np.cumsum(spec_density(h_gt), axis=-1)
@@ -411,15 +411,15 @@ def spec_w1_dex(h_pred: np.ndarray, h_gt: np.ndarray) -> np.ndarray:
 
 
 def spec_dmean_dex(h_pred: np.ndarray, h_gt: np.ndarray) -> np.ndarray:
-    """Versione con segno: media(log10 pred) - media(log10 gt), in decadi.
-    Positivo = spettro spostato verso i valori alti (run piu' chiaro)."""
+    """Signed version: mean(log10 pred) - mean(log10 gt), in decades.
+    Positive = spectrum shifted towards the high values (brighter run)."""
     dp = spec_density(h_pred) @ SPEC_CENTERS
     dg = spec_density(h_gt) @ SPEC_CENTERS
     return dp - dg
 
 
 def spec_quantile(hist: np.ndarray, qs: np.ndarray) -> np.ndarray:
-    """Quantili dello spettro, in log10, interpolati sui bordi dei bin."""
+    """Quantiles of the spectrum, in log10, interpolated on the bin edges."""
     cdf = np.cumsum(spec_density(hist))
     return np.interp(qs, cdf, SPEC_UPPER)
 
@@ -430,7 +430,7 @@ METRIC_KEYS = ("n", "mse_lin", "psnr_lin", "mae_lin", "smape", "rel_mse_gt",
 
 
 def metrics_from(n: float, s: dict[str, float], mu_scale: float) -> dict[str, float]:
-    """Converte le somme di una cella (o unione di celle) in metriche."""
+    """Turn the sums of a cell (or a union of cells) into metrics."""
     if n <= 0:
         out = {k: float("nan") for k in METRIC_KEYS}
         out["n"] = 0.0
@@ -463,16 +463,16 @@ def metrics_from(n: float, s: dict[str, float], mu_scale: float) -> dict[str, fl
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Contesto GT per frame (calcolato una volta, riusato da tutti i run)
+# Per-frame GT context (computed once, reused by every run)
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class GtCtx:
     g: np.ndarray            # (H, W, 3) float32
-    cell_flat: np.ndarray    # (H*W*3,) int32  -> set*N_DEC + fascia
+    cell_flat: np.ndarray    # (H*W*3,) int32  -> set*N_DEC + band
     n_cell: np.ndarray       # (N_CELLS,) conteggi
     log_g: np.ndarray        # (H, W, 3) float32  log(g + EPS)
-    t_g: np.ndarray          # (H, W, 3) float32  mu-law della GT
+    t_g: np.ndarray          # (H, W, 3) float32  mu-law of the GT
     clip_g: np.ndarray
     rein_g: np.ndarray
     den_rel: np.ndarray      # (g + EPS)^2
@@ -489,15 +489,15 @@ def mu_law(x: np.ndarray, scale: float) -> np.ndarray:
 
 def build_gt_ctx(gt: np.ndarray, fg: np.ndarray, mu_scale: float) -> GtCtx:
     lum = (gt * LUMA_COEFF).sum(-1)                      # (H, W)
-    # fascia: 0 = underflow, 1..15 = 1/3 decade, 16 = overflow
+    # band: 0 = underflow, 1..15 = 1/3 decade, 16 = overflow
     band = np.searchsorted(DEC_EDGES, lum, side="right").astype(np.int32)
     band = np.clip(band, 0, N_DEC - 1)
     cell = np.where(fg, band, band + N_DEC).astype(np.int32)
     cell_flat = np.repeat(cell.ravel(), 3)
     n_cell = np.bincount(cell_flat, minlength=N_CELLS).astype(np.float64)
 
-    # soglie highlight identiche a highlight_percentile_error (nerf/metrics.py):
-    # percentile della luminanza GT calcolato sui soli pixel di foreground
+    # highlight thresholds identical to highlight_percentile_error (nerf/metrics.py):
+    # percentile of the GT luminance computed on the foreground pixels alone
     lum_fg = lum[fg]
     if lum_fg.size:
         t99 = float(np.percentile(lum_fg, 99.0))
@@ -523,7 +523,7 @@ def build_gt_ctx(gt: np.ndarray, fg: np.ndarray, mu_scale: float) -> GtCtx:
 
 
 def accumulate_frame(pred: np.ndarray, ctx: GtCtx, mu_scale: float) -> Accum:
-    """Somme per cella di un singolo frame di un singolo run."""
+    """Per-cell sums for a single frame of a single run."""
     acc = Accum()
     acc.n = ctx.n_cell.copy()
 
@@ -537,7 +537,7 @@ def accumulate_frame(pred: np.ndarray, ctx: GtCtx, mu_scale: float) -> Accum:
     acc.s["sq"] = bc(d * d)
     absd = np.abs(d)
     acc.s["absd"] = bc(absd)
-    # SMAPE: simmetrica, invariante di scala, limitata in [0, 1]
+    # SMAPE: symmetric, scale-invariant, bounded in [0, 1]
     acc.s["smape"] = bc(absd / (np.abs(pred) + np.abs(g) + np.float32(EPS)))
     acc.s["rel"] = bc((d * d) / ctx.den_rel)
     dlog = np.log(np.maximum(pred, 0.0) + np.float32(EPS)) - ctx.log_g
@@ -551,7 +551,7 @@ def accumulate_frame(pred: np.ndarray, ctx: GtCtx, mu_scale: float) -> Accum:
     acc.s["p"] = bc(pred)
     acc.s["g"] = bc(g)
 
-    # istogramma dei log10(ratio) per la mediana pred/gt senza campionamento
+    # histogram of the log10(ratio), for the median pred/gt without sampling
     lr = np.log10((pred + np.float32(EPS)) / (g + np.float32(EPS)))
     rb = np.clip(np.round((lr - RATIO_LO) / RATIO_STEP), 0, NR - 1).astype(np.int32)
     acc.hist = np.bincount(idx * NR + rb.reshape(-1),
@@ -560,7 +560,7 @@ def accumulate_frame(pred: np.ndarray, ctx: GtCtx, mu_scale: float) -> Accum:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Passo 1: statistiche sulle GT (costanti globali condivise da tutti i run)
+# Step 1: statistics on the GTs (global constants shared by every run)
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -570,22 +570,22 @@ class GtStats:
     per_frame_max: np.ndarray
     band_frac: dict[str, float]
     fg_frac: float
-    hl_in_fg: float          # quota degli highlight (L>1) che cade nel foreground
+    hl_in_fg: float          # share of the highlights (L>1) that falls in the foreground
     percentiles: dict[float, float]
     # (F, 3, 4, NS): frame x pixel set (PIXEL_SETS) x canale x bin
     spec_gt: np.ndarray = field(
         default_factory=lambda: np.zeros((0, len(PIXEL_SETS), N_SPEC_CH, NS)))
-    n_pixels: int = 0        # pixel per frame, per la verifica sugli istogrammi
+    n_pixels: int = 0        # pixels per frame, for the histogram check
 
 
 def gt_prepass(gt_paths: list[Path], mask_paths: list[Path]) -> GtStats:
-    print(f"[1/3] Pre-pass sulle {len(gt_paths)} GT (costanti globali)...")
+    print(f"[1/3] Pre-pass over the {len(gt_paths)} GTs (global constants)...")
     samples: list[np.ndarray] = []
     p999 = np.zeros(len(gt_paths))
     gmax = np.zeros(len(gt_paths))
     n_cell_tot = np.zeros(N_CELLS)
-    # spettro della GT: calcolato qui perche' questo passo carica gia' ogni GT e la
-    # sua maschera, quindi i tre pixel set non costano un EXR in piu'
+    # GT spectrum: computed here because this pass already loads every GT and its mask,
+    # so the three pixel sets do not cost one extra EXR
     spec_gt = np.zeros((len(gt_paths), len(PIXEL_SETS), N_SPEC_CH, NS), dtype=np.float64)
     n_pixels = 0
     t0 = time.perf_counter()
@@ -600,7 +600,7 @@ def gt_prepass(gt_paths: list[Path], mask_paths: list[Path]) -> GtStats:
         band = np.clip(np.searchsorted(DEC_EDGES, lum, side="right"), 0, N_DEC - 1)
         cell = np.where(fg, band, band + N_DEC).astype(np.int32)
         n_cell_tot += np.bincount(cell.ravel(), minlength=N_CELLS)
-        # sottocampione deterministico (nessun RNG): stride fisso
+        # deterministic subsample (no RNG): fixed stride
         flat = lum.ravel()
         stride = max(1, flat.size // 50_000)
         samples.append(flat[::stride].copy())
@@ -622,16 +622,16 @@ def gt_prepass(gt_paths: list[Path], mask_paths: list[Path]) -> GtStats:
     hl_tot = n_cell_tot[hl_cells_all].sum()
     hl_in_fg = float(n_cell_tot[hl_cells_fg].sum() / hl_tot) if hl_tot > 0 else float("nan")
 
-    print(f"      mu-law scale X = p99.99 della luminanza GT = {mu_scale:.4f}")
+    print(f"      mu-law scale X = p99.99 of the GT luminance = {mu_scale:.4f}")
     print(f"      quote: " + ", ".join(f"{k} {100 * v_:.2f}%" for k, v_ in band_frac.items()))
-    print(f"      foreground {100 * fg_frac:.1f}% dei pixel, "
-          f"contiene il {100 * hl_in_fg:.1f}% degli highlight (L>1)")
+    print(f"      foreground {100 * fg_frac:.1f}% of the pixels, "
+          f"holding {100 * hl_in_fg:.1f}% of the highlights (L>1)")
     return GtStats(mu_scale, p999, gmax, band_frac, fg_frac, hl_in_fg, pct,
                    spec_gt=spec_gt, n_pixels=n_pixels)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Passo 2: metriche per run
+# Step 2: per-run metrics
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -639,7 +639,7 @@ class RunResult:
     run: Run
     acc: Accum
     per_frame: list[dict] = field(default_factory=list)
-    # (F, 3, 4, NS), stessa disposizione di GtStats.spec_gt
+    # (F, 3, 4, NS), same layout as GtStats.spec_gt
     spec: np.ndarray = field(
         default_factory=lambda: np.zeros((0, len(PIXEL_SETS), N_SPEC_CH, NS)))
 
@@ -655,7 +655,7 @@ def compute_all(runs: list[Run], gt_paths: list[Path], mask_paths: list[Path],
     done = 0
     t0 = time.perf_counter()
     print(f"[2/3] Ricalcolo metriche: {n_frames} frame x {len(runs)} run "
-          f"= {total} immagini...")
+          f"= {total} images...")
 
     for i, (gp, mp) in enumerate(zip(gt_paths, mask_paths)):
         gt = load_exr_rgb(str(gp))
@@ -668,7 +668,7 @@ def compute_all(runs: list[Run], gt_paths: list[Path], mask_paths: list[Path],
                 raise ValueError(f"{r.key} frame {i}: shape {pred.shape} != GT {gt.shape}")
             facc = accumulate_frame(pred, ctx, stats.mu_scale)
             results[r.key].acc.add(facc)
-            # spettro sui tre pixel set: la maschera e' gia' in mano, nessun EXR in piu'
+            # spectrum on the three pixel sets: the mask is already at hand, no extra EXR
             results[r.key].spec[i] = spectrum_hist_sets(pred, fg)
 
             row = {"run": r.key, "frame": i}
@@ -678,13 +678,13 @@ def compute_all(runs: list[Run], gt_paths: list[Path], mask_paths: list[Path],
                 for k in ("psnr_lin", "smape", "mu_psnr", "psnr_tm_clip",
                           "psnr_tm_reinhard", "energy_bias", "mae_lin"):
                     row[f"{k}_{ps}"] = m[k]
-            # highlight/rest sul set completo
+            # highlight/rest on the complete set
             for name, (lo, hi) in SPLIT2.items():
                 n, s = _slice(facc, "full", lo, hi)
                 m = metrics_from(n, s, stats.mu_scale)
                 row[f"smape_{name}"] = m["smape"]
                 row[f"energy_bias_{name}"] = m["energy_bias"]
-            # errore relativo agli highlight, definizione di nerf/metrics.py
+            # relative error on the highlights, definition from nerf/metrics.py
             for tag, sel in (("p99", ctx.sel99), ("p999", ctx.sel999)):
                 if sel.any():
                     ps_, gs_ = pred[sel], gt[sel]
@@ -706,18 +706,18 @@ def compute_all(runs: list[Run], gt_paths: list[Path], mask_paths: list[Path],
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Cache dei risultati
+# Result cache
 # ──────────────────────────────────────────────────────────────────────────────
 #
-# Il ricalcolo legge 420 EXR da 24 MB e costa qualche minuto, mentre ritoccare una
-# figura costa secondi.  Gli accumulatori sono poche migliaia di float, quindi si
-# salvano interi: cosi' iterare sulle figure non ripaga il costo di I/O ogni volta.
+# Recomputing reads 420 EXRs of 24 MB and costs a few minutes, whereas tweaking a
+# figure costs seconds.  The accumulators are a few thousand floats, so they are saved
+# whole: iterating on the figures then does not pay the I/O cost every time.
 
 CACHE_NAME = "_cache_metrics.npz"
-# v2 = aggiunti gli spettri (per run e per la GT).  Una cache v1 non ha le chiavi
-# corrispondenti: va ignorata invece di far esplodere un KeyError.
-# v3 = gli spettri hanno un asse in piu' (pixel set): stessa chiave, shape diversa,
-# quindi anche qui va ignorata e non riletta.
+# v2 = the spectra were added (per run and for the GT).  A v1 cache does not have the
+# matching keys: it has to be ignored rather than blow up with a KeyError.
+# v3 = the spectra have one axis more (pixel set): same key, different shape, so this
+# one too has to be ignored and not re-read.
 CACHE_VERSION = 3
 
 
@@ -763,14 +763,14 @@ def load_cache(out: Path, runs: list[Run]) -> tuple[dict[str, RunResult], GtStat
     meta = json.loads(bytes(z["__meta__"]).decode("utf-8"))
     by_key = {r.key: r for r in runs}
     if set(meta["runs"]) != set(by_key):
-        print(f"  cache presente ma per run diversi ({meta['runs']}), la ignoro")
+        print(f"  cache present but for different runs ({meta['runs']}), ignoring it")
         return None
     if meta.get("version", 1) != CACHE_VERSION:
-        print(f"  cache di versione {meta.get('version', 1)} (attuale {CACHE_VERSION}), "
-              "la ignoro: ricalcolo dagli EXR")
+        print(f"  cache of version {meta.get('version', 1)} (current {CACHE_VERSION}), "
+              "ignoring it: recomputing from the EXRs")
         return None
     if meta.get("spec_grid") != _spec_grid():
-        print("  cache con una griglia di spettro diversa, la ignoro: ricalcolo")
+        print("  cache with a different spectrum grid, ignoring it: recomputing")
         return None
     results: dict[str, RunResult] = {}
     for key in meta["runs"]:
@@ -798,20 +798,20 @@ def load_cache(out: Path, runs: list[Run]) -> tuple[dict[str, RunResult], GtStat
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Verifica contro gli artefatti esistenti
+# Check against the existing artefacts
 # ──────────────────────────────────────────────────────────────────────────────
 
 def verify_against_artifacts(results: dict[str, RunResult], tol: float = 1e-3) -> list[str]:
-    """Il PSNR ricalcolato su `full` deve coincidere con la colonna `psnr` di
-    metrics_per_frame.csv, e il PSNR tonemap-clip su `fg` con psnr_tonemap_clip.
-    E' la prova che loader, ordine dei frame e insieme di pixel corrispondono a
-    quelli usati dalla pipeline (images_generator.py:2609 e :2628)."""
+    """The PSNR recomputed on `full` has to match the `psnr` column of
+    metrics_per_frame.csv, and the tonemap-clip PSNR on `fg` that of psnr_tonemap_clip.
+    It is the proof that loader, frame order and pixel set match those the pipeline
+    used (images_generator.py:2609 and :2628)."""
     lines = []
     ok = True
     for key, res in results.items():
         csv_path = res.run.iter_dir / "metrics_per_frame.csv"
         if not csv_path.exists():
-            lines.append(f"  {key:26s} metrics_per_frame.csv assente, verifica saltata")
+            lines.append(f"  {key:26s} metrics_per_frame.csv absent, check skipped")
             continue
         rows = read_csv_rows(csv_path)
         ref_psnr = col_float(rows, "psnr")
@@ -827,15 +827,15 @@ def verify_against_artifacts(results: dict[str, RunResult], tol: float = 1e-3) -
         lines.append(f"  [{flag}] {key:26s} max|dPSNR|={d1:.2e} dB   "
                      f"max|dPSNR_tm_fg|={d2:.2e} dB")
     if not ok:
-        lines.append("  ATTENZIONE: deviazione oltre la tolleranza. Loader, ordine dei "
-                     "frame o insieme di pixel non corrispondono alla pipeline.")
+        lines.append("  WARNING: deviation beyond tolerance. Loader, frame order or "
+                     "pixel set do not match the pipeline.")
     return lines
 
 
 def verify_decomposition(results: dict[str, RunResult], mu_scale: float) -> list[str]:
-    """La ricomposizione sum_p (n_p/n_tot)*M_p deve riprodurre M_tot, e la somma
-    degli err_share deve fare 1.  E' cio' che rende leggibile la frase
-    'gli highlight pesano X% dell'errore'."""
+    """The recomposition sum_p (n_p/n_tot)*M_p has to reproduce M_tot, and the sum of
+    the err_shares has to be 1.  It is what makes the sentence readable.
+    'the highlights account for X% of the error' readable."""
     lines = []
     worst = 0.0
     for key, res in results.items():
@@ -853,8 +853,8 @@ def verify_decomposition(results: dict[str, RunResult], mu_scale: float) -> list
                     share += s_b[sk] / s_tot[sk] if s_tot[sk] > 0 else 0.0
                 rel = abs(recon - tot[mk]) / max(abs(tot[mk]), 1e-30)
                 worst = max(worst, rel, abs(share - 1.0))
-    lines.append(f"  [{'OK ' if worst < 1e-6 else 'FAIL'}] decomposizione per fasce: "
-                 f"errore relativo massimo {worst:.2e} (atteso < 1e-6)")
+    lines.append(f"  [{'OK ' if worst < 1e-6 else 'FAIL'}] decomposition by band: "
+                 f"maximum relative error {worst:.2e} (expected < 1e-6)")
     return lines
 
 
@@ -892,7 +892,7 @@ def write_metrics_global(out: Path, results: dict[str, RunResult], mu_scale: flo
 
 
 def band_table(res: RunResult, pixel_set: str, mu_scale: float) -> list[dict]:
-    """Righe per (fascia) di un run: livello d'errore + quota del budget."""
+    """Rows per (band) of a run: error level + share of the budget."""
     n_tot, s_tot = _slice(res.acc, pixel_set, 0, N_DEC - 1)
     rows = []
     for name, (lo, hi) in BANDS.items():
@@ -986,8 +986,8 @@ def write_per_frame(out: Path, results: dict[str, RunResult]) -> None:
 def _save(fig, path: Path, dpi: int = 150, constrained: bool = True) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if constrained:
-        # evita che i titoli dei pannelli finiscano sopra le etichette della riga
-        # superiore; bbox_inches="tight" ritaglia i bordi ma non risolve le
+        # keeps the panel titles from landing on the labels of the row above;
+        # bbox_inches="tight" trims the borders but does not fix it
         # collisioni interne
         fig.set_layout_engine("constrained")
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
@@ -1018,8 +1018,8 @@ def fig_training(runs: list[Run], figdir: Path) -> None:
     data = {}
     for r in runs:
         rows = read_csv_rows(r.train_csv)
-        # dedup difensivo: un crash tra display block e checkpoint puo' lasciare
-        # iterazioni duplicate/non monotone (train.py:92-96)
+        # defensive dedup: a crash between a display block and a checkpoint can leave
+        # duplicate/non-monotone iterations (train.py:92-96)
         seen: dict[int, dict] = {}
         for row in rows:
             try:
@@ -1031,7 +1031,7 @@ def fig_training(runs: list[Run], figdir: Path) -> None:
                        ("iter", "loss", "mse", "psnr_db", "lr", "iters_per_s",
                         "rays_per_s", "acc_fg", "wall_s")}
 
-    # 1. PSNR di training
+    # 1. training PSNR
     fig, ax = plt.subplots(figsize=(9, 5))
     for r in runs:
         d = data[r.key]
@@ -1055,7 +1055,7 @@ def fig_training(runs: list[Run], figdir: Path) -> None:
     axin.patch.set_alpha(0.95)
     _save(fig, figdir / "train_psnr.png", constrained=False)
 
-    # 2. loss per tipo (unita' non confrontabili tra pannelli)
+    # 2. loss per type (units not comparable between panels)
     losses = sorted({r.loss for r in runs})
     fig, axes = plt.subplots(1, len(losses), figsize=(4.2 * len(losses), 4), squeeze=False)
     for ax, lt in zip(axes[0], losses):
@@ -1074,7 +1074,7 @@ def fig_training(runs: list[Run], figdir: Path) -> None:
                  fontsize=10)
     _save(fig, figdir / "train_loss_by_type.png")
 
-    # 3. MSE di training
+    # 3. training MSE
     fig, ax = plt.subplots(figsize=(9, 5))
     for r in runs:
         d = data[r.key]
@@ -1104,7 +1104,7 @@ def fig_training(runs: list[Run], figdir: Path) -> None:
     fig.suptitle("Training diagnostics: schedule, geometry convergence, throughput")
     _save(fig, figdir / "train_diagnostics.png")
 
-    # 5. qualita' a parita' di tempo
+    # 5. quality at equal time
     fig, ax = plt.subplots(figsize=(9, 5))
     for r in runs:
         d = data[r.key]
@@ -1120,7 +1120,7 @@ def fig_training(runs: list[Run], figdir: Path) -> None:
 
 
 def fig_bias_bins_existing(runs: list[Run], figdir: Path) -> None:
-    """Replot diretto dei bias_bins.csv gia' su disco."""
+    """Direct replot of the bias_bins.csv files already on disk."""
     channels = ["R", "G", "B", "Luma"]
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
     any_data = False
@@ -1155,7 +1155,7 @@ def fig_bias_bins_existing(runs: list[Run], figdir: Path) -> None:
 
 
 def fig_existing_per_frame(runs: list[Run], figdir: Path) -> None:
-    """Boxplot delle colonne gia' presenti in metrics_per_frame.csv."""
+    """Boxplot of the columns already present in metrics_per_frame.csv."""
     cols = [("psnr", "PSNR linear [dB] (full frame)", True),
             ("psnr_tonemap_clip", "PSNR tonemap-clip [dB] (fg only)", True),
             ("rel_err_p99", "relative error above p99 (fg only)", False)]
@@ -1252,7 +1252,7 @@ def _matrix_values(results: dict[str, RunResult], runs: list[Run], pixel_set: st
     for i, r in enumerate(runs):
         n, s = _slice(results[r.key].acc, pixel_set, 0, N_DEC - 1)
         m = metrics_from(n, s, mu_scale)
-        # le colonne di distribuzione vengono dallo spettro dello STESSO pixel set
+        # the distribution columns come from the spectrum of the SAME pixel set
         m.update(spectrum_metrics(an, r.key, pixel_set))
         for j, sp in enumerate(METRIC_SPECS):
             vals[i, j] = m[sp.key]
@@ -1270,8 +1270,8 @@ def fig_metric_matrix(results: dict[str, RunResult], runs: list[Run], mu_scale: 
     span = max(len(runs) - 1, 1)
     for i, r in enumerate(runs):
         for j, sp in enumerate(METRIC_SPECS):
-            # testo bianco sulle celle scure (rank estremi): il grigio scuro su verde
-            # o rosso saturo non si legge
+            # white text on the dark cells (extreme ranks): dark grey on saturated green
+            # or red is unreadable
             cr, cg, cb, _ = cmap((ranks[i, j] - 1) / span)
             fgc = "white" if (0.2126 * cr + 0.7152 * cg + 0.0722 * cb) < 0.5 else "black"
             ax.text(j, i - 0.16, sp.fmt.format(vals[i, j]), ha="center", va="center",
@@ -1279,7 +1279,7 @@ def fig_metric_matrix(results: dict[str, RunResult], runs: list[Run], mu_scale: 
                     fontweight="bold" if ranks[i, j] == 1 else "normal")
             ax.text(j, i + 0.24, f"#{ranks[i, j]}", ha="center", va="center",
                     fontsize=6.5, color=fgc)
-    # separatore fra errore per pixel e distribuzione: misurano cose diverse
+    # separator between per-pixel error and distribution: they measure different things
     ax.axvline(FIRST_SPEC_COL - 0.5, color="k", lw=1.6)
     ax.set_xticks(range(len(METRIC_SPECS)))
     ax.set_xticklabels([s.label for s in METRIC_SPECS], rotation=35, ha="right", fontsize=8)
@@ -1301,9 +1301,9 @@ def fig_rank_bump(results: dict[str, RunResult], runs: list[Run], mu_scale: floa
     for i, r in enumerate(runs):
         ax.plot(x, ranks[i], color=r.color, ls=r.linestyle, lw=2, marker="o", ms=6,
                 label=r.label)
-    # Le colonne di distribuzione sono su fondo ombreggiato invece che etichettate:
-    # con sei curve che attraversano tutti i rank non esiste un punto del riquadro
-    # dove un'etichetta non copra una linea, e sopra il riquadro c'e' il titolo.
+    # The distribution columns are on a shaded background instead of labelled: with six
+    # curves crossing every rank there is no point in the frame where a label would not
+    # cover a line, and above the frame there is the title.
     ax.axvspan(FIRST_SPEC_COL - 0.5, len(METRIC_SPECS) - 0.5, color="#8C8CB4",
                alpha=0.13, lw=0, zorder=0)
     ax.axvline(FIRST_SPEC_COL - 0.5, color="k", lw=1.4, alpha=0.7, zorder=1)
@@ -1324,9 +1324,9 @@ def fig_rank_bump(results: dict[str, RunResult], runs: list[Run], mu_scale: floa
 
 def fig_bias_by_decade(results: dict[str, RunResult], runs: list[Run], mu_scale: float,
                        figdir: Path) -> None:
-    # due righe: in alto scala log, perche' nelle fasce piu' scure il rapporto
-    # arriva a 20x e schiaccerebbe tutto il resto sulla linea 1; in basso uno zoom
-    # lineare stretto attorno a 1, che e' il regime che conta per gli integrali
+    # two rows: log scale on top, because in the darker bands the ratio reaches 20x and
+    # would crush everything else onto the line at 1; a narrow linear zoom around 1 at
+    # the bottom, which is the regime that matters for the integrals
     fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=True)
     for col, ps in enumerate(PIXEL_SETS):
         for row in (0, 1):
@@ -1447,18 +1447,18 @@ def _error_split_axes(axes, results, runs, mu_scale, pixel_set: str) -> None:
             ax.bar(x, v, 0.62, bottom=bottom, color=BAND_COLORS[band],
                    edgecolor="k", lw=0.4, label=band)
             bottom += v
-        # riferimento: quota cumulata di pixel di ciascuna fascia.  Serve a leggere
-        # lo scarto tra "quanti pixel" e "quanto errore": se la barra di una fascia
-        # sfora la sua linea, quella fascia produce piu' errore di quanto pesi.
+        # reference: cumulative share of pixels of each band.  It is there to read the
+        # gap between "how many pixels" and "how much error": if a band's bar overshoots
+        # its line, that band produces more error than it weighs.
         cum = 0.0
         for bi, band in enumerate(BAND_ORDER[:-1]):
-            # n_frac dipende solo dalla GT (le fasce sono definite sulla luminanza
-            # della ground truth), quindi e' identico per tutti i run: prenderlo dal
-            # primo non introduce nessuna asimmetria
+            # n_frac depends on the GT alone (the bands are defined on the ground-truth
+            # luminance), so it is identical for every run: taking it from the first
+            # introduces no asymmetry
             cum += tables[runs[0].key][band]["n_frac"]
             ax.axhline(cum, ls="--", lw=1.0, color="k")
-            # etichette alternate sopra/sotto: le ultime due linee cumulate distano
-            # pochi punti percentuali e si sovrapporrebbero
+            # labels alternating above/below: the last two cumulative lines are
+            # a few percentage points apart and would overlap
             above = bi % 2 == 0
             ax.text(-0.45, cum + (0.008 if above else -0.008),
                     f"{band} pixels, cumulative {100 * cum:.1f}%",
@@ -1498,7 +1498,7 @@ def fig_error_split_fg_bg(results: dict[str, RunResult], runs: list[Run], mu_sca
 
 
 def _tonemap_srgb(x: np.ndarray, exposure: float) -> np.ndarray:
-    """Reinhard + gamma 2.2, esposizione condivisa fra tutte le immagini."""
+    """Reinhard + gamma 2.2, exposure shared by every image."""
     y = x * exposure
     y = y / (1.0 + y)
     return np.clip(y, 0, 1) ** (1 / 2.2)
@@ -1506,12 +1506,12 @@ def _tonemap_srgb(x: np.ndarray, exposure: float) -> np.ndarray:
 
 def _best_window(score_map: np.ndarray, crop: int, valid: np.ndarray | None = None
                  ) -> tuple[slice, slice]:
-    """Finestra crop x crop che massimizza la media di score_map.
+    """crop x crop window that maximises the mean of score_map.
 
-    Ricerca su una griglia con passo crop//2: un argmax puntuale prenderebbe il
-    pixel piu' luminoso, che in una scena con una sorgente in vista cade in mezzo
-    a una superficie satura e senza struttura, cioe' esattamente dove non si vede
-    nulla del comportamento dei modelli.
+    Searched on a grid of step crop//2: a pointwise argmax would take the brightest
+    pixel, which in a scene with a visible source falls in the middle of a saturated,
+    structureless surface, i.e. exactly where nothing of the models' behaviour can be
+    seen.
     """
     h, w = score_map.shape
     step = max(crop // 2, 1)
@@ -1538,12 +1538,12 @@ def fig_visual(runs: list[Run], gt_paths: list[Path], mask_paths: list[Path],
     preds = {r.key: load_exr_rgb(str(r.iter_dir / f"frame_{frame_idx:03d}_pred.exr"))
              for r in runs}
 
-    # 1) zona luminosa E strutturata: la frazione sopra 1 pesa la brillantezza,
-    #    il gradiente locale garantisce che ci sia qualcosa da guardare
+    # 1) bright AND structured area: the fraction above 1 weighs the brightness, the
+    #    local gradient guarantees there is something to look at
     grad = np.abs(np.gradient(loglum)[0]) + np.abs(np.gradient(loglum)[1])
     bright = (lum > 1.0).astype(np.float32)
     score_bright = grad * (0.25 + bright)
-    # 2) zona di massimo disaccordo tra modelli: e' quella che discrimina
+    # 2) area of maximum disagreement between models: that is what discriminates
     if len(runs) > 1:
         stack = np.stack([np.log10((preds[r.key] * LUMA_COEFF).sum(-1) + 1e-3)
                           for r in runs])
@@ -1562,8 +1562,8 @@ def fig_visual(runs: list[Run], gt_paths: list[Path], mask_paths: list[Path],
                              figsize=(2.3 * ncol, 2.6 * 2 * len(crops)))
     for ci, (cname, (sy, sx)) in enumerate(crops):
         gc = gt[sy, sx]
-        # esposizione "key": la mediana del crop finisce a meta' scala, cosi' il
-        # tonemap non e' dettato dal picco HDR
+        # "key" exposure: the crop's median lands at mid scale, so the tonemap is not
+        # dictated by the HDR peak
         med = float(np.median((gc * LUMA_COEFF).sum(-1)))
         expo = 0.5 / max(med, 1e-4)
         diffs = {r.key: np.abs(preds[r.key][sy, sx] - gc).mean(-1) for r in runs}
@@ -1593,31 +1593,31 @@ def fig_visual(runs: list[Run], gt_paths: list[Path], mask_paths: list[Path],
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Spettro dei colori
+# Colour spectrum
 # ──────────────────────────────────────────────────────────────────────────────
 #
-# Domanda a cui risponde questa sezione: quale run riproduce la DISTRIBUZIONE dei
-# valori della GT.  E' una domanda diversa da "quale run sbaglia meno per pixel":
-# un run puo' avere l'errore per pixel piu' basso e lo spettro piu' storto (per
-# esempio comprimendo le alte luci e alzando il fondo scala).  Sempre frame
-# intero, mai fg/bg separati.
+# The question this section answers: which run reproduces the DISTRIBUTION of the GT's
+# values.  It is a different question from "which run errs least per pixel": a run can
+# have the lowest per-pixel error and the most skewed spectrum (for instance by
+# compressing the highlights and lifting the black floor).  Always the whole frame,
+# never fg/bg separately.
 
 @dataclass
 class SpectrumAnalysis:
     keys: list[str]                  # run, nell'ordine di `runs`
-    # Le quantita' per frame restano sul FRAME INTERO: sono quelle che alimentano le
-    # figure e le tabelle di questa sezione.  La divisione per pixel set vive solo
-    # negli array `*_pooled_set`, che alimentano le tre matrici run x metrica.
+    # The per-frame quantities stay on the WHOLE FRAME: they are what feeds the figures
+    # and the tables of this section.  The split by pixel set lives only in the
+    # `*_pooled_set` arrays, which feed the three run x metric matrices.
     w1: np.ndarray                   # (n_run, n_frame, 4)  distanza per frame
-    dmean: np.ndarray                # (n_run, n_frame, 4)  bias con segno
-    w1_pooled: np.ndarray            # (n_run, 4)   su tutti i frame insieme, full
+    dmean: np.ndarray                # (n_run, n_frame, 4)  signed bias
+    w1_pooled: np.ndarray            # (n_run, 4)   over every frame together, full
     dmean_pooled: np.ndarray         # (n_run, 4)
     w1_pooled_set: np.ndarray        # (n_run, 3, 4)  per pixel set (PIXEL_SETS)
     dmean_pooled_set: np.ndarray     # (n_run, 3, 4)
     spec_gt_tot: np.ndarray          # (4, NS)      full
     spec_run_tot: np.ndarray         # (n_run, 4, NS)
-    notable: dict[str, int]          # etichetta -> indice di frame
-    order: list[int]                 # run ordinati per w1 sul canale norm
+    notable: dict[str, int]          # label -> frame index
+    order: list[int]                 # runs sorted by w1 on the norm channel
 
 
 def analyze_spectrum(results: dict[str, RunResult], runs: list[Run],
@@ -1647,8 +1647,8 @@ def analyze_spectrum(results: dict[str, RunResult], runs: list[Run],
     dmean_pooled = dmean_pooled_set[:, 0]
 
     # ── frame notevoli ───────────────────────────────────────────────────────
-    # Riferimento: il canale `norm`, che e' la quantita' che il resto della
-    # pipeline consuma (radianza del pixel, non il singolo canale).
+    # Reference: the `norm` channel, which is the quantity the rest of the pipeline
+    # consumes (the pixel's radiance, not the single channel).
     per_frame_mean = w1[:, :, NORM_CH].mean(axis=0)           # (F,) media sui run
     spread = w1[:, :, NORM_CH].max(axis=0) - w1[:, :, NORM_CH].min(axis=0)
     order_frames = np.argsort(per_frame_mean)
@@ -1656,17 +1656,17 @@ def analyze_spectrum(results: dict[str, RunResult], runs: list[Run],
         "worst": int(order_frames[-1]),
         "best": int(order_frames[0]),
         "median": int(order_frames[len(order_frames) // 2]),
-        # il frame che separa di piu' i run: e' quello da guardare per capire
-        # DOVE si vede la differenza, non quello con l'errore piu' grande
+        # the frame that separates the runs the most: that is the one to look at to see
+        # WHERE the difference shows, not the one with the largest error
         "most_discriminant": int(np.argmax(spread)),
-        # stesso criterio di fig_visual: p99.9 e non il massimo
+        # same criterion as fig_visual: p99.9 and not the maximum
         "most_hdr": int(np.argmax(stats.per_frame_p999)),
     }
 
-    # Classifica sul canale `norm` e non sulla media dei quattro: e' la stessa
-    # quantita' che la matrice run x metrica mette in colonna, quindi le due
-    # classifiche non possono divergere.  La media sui quattro canali conterebbe
-    # comunque due volte la stessa informazione, dato che norm e' funzione di RGB.
+    # Ranking on the `norm` channel and not on the mean of the four: it is the same
+    # quantity the run x metric matrix puts in a column, so the two rankings cannot
+    # diverge.  Averaging the four channels would count the same information twice
+    # anyway, since norm is a function of RGB.
     order = list(np.argsort(w1_pooled[:, NORM_CH]))
     return SpectrumAnalysis(keys, w1, dmean, w1_pooled, dmean_pooled,
                             w1_pooled_set, dmean_pooled_set,
@@ -1674,44 +1674,43 @@ def analyze_spectrum(results: dict[str, RunResult], runs: list[Run],
 
 
 def spectrum_metrics(an: SpectrumAnalysis, key: str, pixel_set: str) -> dict[str, float]:
-    """Le due colonne di spettro della matrice, canale norm (= ||RGB||_2).
+    """The matrix's two spectrum columns, norm channel (= ||RGB||_2).
 
-    `dmean` entra in valore assoluto perche' il rank ha bisogno di un verso; il segno
-    resta leggibile nella sezione spettro e in spectrum_distance.csv.
-    """
+    `dmean` enters in absolute value because the rank needs a direction; the sign stays
+    readable in the spectrum section and in spectrum_distance.csv."""
     if key not in an.keys:
-        raise KeyError(f"{key} non e' nell'analisi di spettro ({an.keys})")
+        raise KeyError(f"{key} is not in the spectrum analysis ({an.keys})")
     i, s = an.keys.index(key), PIXEL_SETS.index(pixel_set)
     return {"spec_w1": float(an.w1_pooled_set[i, s, NORM_CH]),
             "spec_absdmean": float(abs(an.dmean_pooled_set[i, s, NORM_CH]))}
 
 
 def verify_spectrum(results: dict[str, RunResult], stats: GtStats) -> list[str]:
-    """Nessun pixel perso nel binning, partizione fg/bg esatta, GT a distanza nulla
-    da se stessa."""
+    """No pixel lost in the binning, exact fg/bg partition, GT at zero distance from
+    itself."""
     lines = []
     n_pix = stats.n_pixels
     all_spec = [stats.spec_gt] + [res.spec for res in results.values()]
 
     tot = np.concatenate([s[:, 0].sum(axis=-1).ravel() for s in all_spec])   # full
     bad = 0 if n_pix <= 0 else int(np.count_nonzero(np.abs(tot - n_pix) > 0.5))
-    lines.append(f"  [{'OK ' if bad == 0 else 'FAIL'}] spettro: ogni istogramma somma "
-                 f"a {n_pix} pixel ({bad} violazioni)")
+    lines.append(f"  [{'OK ' if bad == 0 else 'FAIL'}] spectrum: every histogram sums "
+                 f"to {n_pix} pixels ({bad} violations)")
 
-    # I tre insiemi sono binnati indipendentemente (spectrum_hist_sets), quindi questa
-    # uguaglianza e' una verifica vera sulla maschera: prova che nessun pixel finisce
+    # The three sets are binned independently (spectrum_hist_sets), so this equality is
+    # a real check on the mask: it proves no pixel ends up
     # in due insiemi o in nessuno.
     worst = max(float(np.abs(s[:, 0] - s[:, 1] - s[:, 2]).max()) for s in all_spec)
-    lines.append(f"  [{'OK ' if worst == 0.0 else 'FAIL'}] spettro: full == fg + bg bin "
-                 f"per bin (scarto max {worst:.3e})")
+    lines.append(f"  [{'OK ' if worst == 0.0 else 'FAIL'}] spectrum: full == fg + bg bin "
+                 f"by bin (max gap {worst:.3e})")
 
     self_w1 = float(np.abs(spec_w1_dex(stats.spec_gt[:, 0], stats.spec_gt[:, 0])).max())
-    lines.append(f"  [{'OK ' if self_w1 == 0.0 else 'FAIL'}] spettro: W1(GT, GT) = "
+    lines.append(f"  [{'OK ' if self_w1 == 0.0 else 'FAIL'}] spectrum: W1(GT, GT) = "
                  f"{self_w1:.3e}")
 
     dens = spec_density(stats.spec_gt[:, 0])
     err = float(np.abs(dens.sum(axis=-1) - 1.0).max())
-    lines.append(f"  [{'OK ' if err < 1e-12 else 'FAIL'}] spettro: densita' a somma 1 "
+    lines.append(f"  [{'OK ' if err < 1e-12 else 'FAIL'}] spectrum: densities sum to 1 "
                  f"(scarto max {err:.2e})")
     return lines
 
@@ -1723,7 +1722,7 @@ def _spec_x() -> np.ndarray:
 
 
 def _spec_xlim(*hists: np.ndarray, floor: float = 1e-7) -> tuple[float, float]:
-    """Estremi in x comuni a tutte le figure: bin in cui esiste massa."""
+    """x limits common to every figure: bins where mass exists."""
     m = np.zeros(NS)
     for h in hists:
         m += h.reshape(-1, NS).sum(axis=0)
@@ -1742,7 +1741,7 @@ def _spec_panel_grid(figsize=(12, 8), **kw):
 
 
 def _draw_spectrum(ax, x, spec_gt_ch, curves, ylim, xlim):
-    """Un pannello: GT come area grigia, un profilo per run."""
+    """One panel: GT as a grey area, one profile per run."""
     g = spec_density(spec_gt_ch)
     ax.fill_between(x, np.maximum(g, 1e-12), 1e-12, step="mid",
                     color="#B0B0B0", alpha=0.75, lw=0, label="GT", zorder=1)
@@ -1784,7 +1783,7 @@ def fig_spectrum_global(an: SpectrumAnalysis, runs: list[Run], figdir: Path) -> 
 
 
 def fig_spectrum_ratio(an: SpectrumAnalysis, runs: list[Run], figdir: Path) -> None:
-    """log2(densita' run / densita' GT): le differenze che l'istogramma schiaccia."""
+    """log2(run density / GT density): the differences the histogram flattens."""
     x = _spec_x()
     xlim = _spec_xlim(an.spec_gt_tot, an.spec_run_tot)
     fig, axs = _spec_panel_grid(sharex=True, sharey=True)
@@ -1792,7 +1791,7 @@ def fig_spectrum_ratio(an: SpectrumAnalysis, runs: list[Run], figdir: Path) -> N
     for c, ch in enumerate(SPEC_CHANNELS):
         ax = axs[c]
         g = spec_density(an.spec_gt_tot[c])
-        # sotto questa densita' la GT ha troppi pochi pixel: il rapporto e' rumore
+        # below this density the GT has too few pixels: the ratio is noise
         keep = g > 1e-6
         for i, r in enumerate(runs):
             p = spec_density(an.spec_run_tot[i, c])
@@ -1844,10 +1843,10 @@ def fig_spectrum_cdf(an: SpectrumAnalysis, runs: list[Run], figdir: Path) -> Non
 
 def fig_spectrum_qq(an: SpectrumAnalysis, runs: list[Run], figdir: Path) -> None:
     qs = np.linspace(0.005, 0.995, 199)
-    # niente sharey: in un Q-Q i due assi devono avere lo stesso intervallo dentro
-    # ogni pannello, altrimenti la bisettrice non e' piu' a 45 gradi.  I run che
-    # collassano nel bin di underflow escono dal riquadro, ed e' voluto: la loro
-    # distanza si legge nelle altre figure
+    # no sharey: in a Q-Q the two axes must have the same range inside each panel,
+    # otherwise the bisector is no longer at 45 degrees.  The runs that collapse into
+    # the underflow bin leave the frame, and that is deliberate: their distance reads
+    # in the other figures
     fig, axs = _spec_panel_grid()
     for c, ch in enumerate(SPEC_CHANNELS):
         ax = axs[c]
@@ -1876,8 +1875,8 @@ def fig_spectrum_qq(an: SpectrumAnalysis, runs: list[Run], figdir: Path) -> None
 def fig_spectrum_per_frame(an: SpectrumAnalysis, runs: list[Run], figdir: Path) -> None:
     n_frames = an.w1.shape[1]
     xs = np.arange(n_frames)
-    # scala condivisa fra i run (e' lo stesso pannello), non fra i canali: il G
-    # ha picchi 6 volte piu' alti e schiaccerebbe gli altri tre a una riga piatta
+    # scale shared between the runs (it is the same panel), not between the channels:
+    # G has peaks 6 times higher and would flatten the other three into a line
     fig, axs = _spec_panel_grid(figsize=(13, 8), sharex=True)
     for c, ch in enumerate(SPEC_CHANNELS):
         ax = axs[c]
@@ -1920,13 +1919,13 @@ def fig_spectrum_box(an: SpectrumAnalysis, runs: list[Run], figdir: Path) -> Non
 
 def fig_spectrum_frames(an: SpectrumAnalysis, runs: list[Run], results: dict[str, RunResult],
                         stats: GtStats, figdir: Path) -> None:
-    """Uno spettro per frame, con assi identici in tutti i file della cartella."""
+    """One spectrum per frame, with identical axes in every file of the folder."""
     outdir = figdir / "spectrum_frames"
     outdir.mkdir(parents=True, exist_ok=True)
     x = _spec_x()
     xlim = _spec_xlim(an.spec_gt_tot, an.spec_run_tot)
-    # limiti in y dai singoli frame (piu' alti del pooled: meno pixel per bin).
-    # Fetta `full`: mescolare i tre pixel set conterebbe due volte gli stessi pixel.
+    # y limits from the individual frames (higher than the pooled: fewer pixels per bin).
+    # `full` slice: mixing the three pixel sets would count the same pixels twice.
     ylim = _spec_ylim(stats.spec_gt[:, 0], *[results[k].spec[:, 0] for k in an.keys])
     by_frame: dict[int, list[str]] = {}
     for name, f in an.notable.items():
@@ -1953,29 +1952,28 @@ def fig_spectrum_frames(an: SpectrumAnalysis, runs: list[Run], results: dict[str
     print(f"\r      + spectrum_frames/ ({n_frames} figure)")
 
 
-# ── skybox: originale vs bakate ───────────────────────────────────────────────
+# ── skybox: original vs baked ─────────────────────────────────────────────────
 
 def _equirect_solid_angle_weights(h: int, w: int) -> np.ndarray:
-    """Peso per pixel di una equirettangolare: sin(theta) per riga.
+    """Per-pixel weight of an equirectangular map: sin(theta) per row.
 
-    Senza questo peso i poli, dove i pixel coprono un angolo solido minuscolo,
-    conterebbero quanto l'equatore e lo spettro dell'envmap sarebbe distorto.
+    Without this weight the poles, where pixels cover a tiny solid angle,
+    would count as much as the equator and the envmap spectrum would be distorted.
     """
     theta = np.pi * (np.arange(h, dtype=np.float64) + 0.5) / h
     return np.repeat(np.sin(theta)[:, None], w, axis=1)
 
 
 def resolve_skybox_gt(runs: list[Run], cli: str | None) -> Path | None:
-    """Skybox originale: argomento CLI, altrimenti il campo nel run_manifest.json.
+    """Original skybox: CLI argument, otherwise the field in run_manifest.json.
 
-    Stesso ordine di risoluzione di bake_skyboxes.py.  Nello sweep attuale il
-    manifest ha il campo vuoto (skybox_path e' commentato nella SceneConfig),
-    quindi senza --skybox-gt il pannello viene saltato.
-    """
+    Same resolution order as bake_skyboxes.py.  In the current sweep the manifest has
+    the field empty (skybox_path is commented out in the SceneConfig), so without
+    --skybox-gt the panel is skipped."""
     if cli:
         p = Path(cli)
         if not p.exists():
-            print(f"  [skybox] {p} non esiste: pannello skybox saltato")
+            print(f"  [skybox] {p} does not exist: skybox panel skipped")
             return None
         return p
     for r in runs:
@@ -1990,13 +1988,13 @@ def resolve_skybox_gt(runs: list[Run], cli: str | None) -> Path | None:
                 or meta.get("scene", {}).get("skybox_path") or "")
         if cand and Path(cand).exists():
             return Path(cand)
-    print("  [skybox] nessuna skybox di riferimento (usa --skybox-gt): "
-          "pannello skybox saltato")
+    print("  [skybox] no reference skybox (use --skybox-gt): "
+          "skybox panel skipped")
     return None
 
 
 def spectrum_skybox(runs: list[Run], gt_path: Path) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """(spettro della skybox originale, {run: spettro della bakata})."""
+    """(spectrum of the original skybox, {run: spectrum of the baked one})."""
     gt = load_exr_rgb(str(gt_path))
     spec_gt = spectrum_hist(gt, _equirect_solid_angle_weights(*gt.shape[:2]))
     del gt
@@ -2004,8 +2002,8 @@ def spectrum_skybox(runs: list[Run], gt_path: Path) -> tuple[np.ndarray, dict[st
     for r in runs:
         p = r.scene_dir / "skybox_nerf_baked.exr"
         if not p.exists():
-            print(f"      [skip] {r.key}: skybox_nerf_baked.exr assente "
-                  f"(generala con bake_skyboxes.py)")
+            print(f"      [skip] {r.key}: skybox_nerf_baked.exr missing "
+                  f"(generate it with bake_skyboxes.py)")
             continue
         a = load_exr_rgb(str(p))
         per_run[r.key] = spectrum_hist(a, _equirect_solid_angle_weights(*a.shape[:2]))
@@ -2117,25 +2115,25 @@ def _md_table(header: list[str], rows: list[list[str]]) -> str:
 
 def _report_spectrum(A, runs: list[Run], an: SpectrumAnalysis,
                      sky: tuple[np.ndarray, dict[str, np.ndarray], Path] | None) -> None:
-    A("## Spettro dei colori")
+    A("## Colour spectrum")
     A("")
-    A("Le metriche per pixel dicono quanto un run sbaglia, non se riproduce la "
-      "**distribuzione** dei valori della GT. Sono domande diverse: un run puo' avere "
-      "l'errore piu' basso e lo spettro piu' storto, per esempio comprimendo le alte "
-      "luci e alzando il fondo scala. Dentro gli integrali emisferici della pipeline "
-      "conta la seconda.")
+    A("Per-pixel metrics say how much a run errs, not whether it reproduces the "
+      "**distribution** of the GT's values. They are different questions: a run can have "
+      "the lowest error and the most skewed spectrum, for instance by compressing the "
+      "highlights and lifting the black floor. Inside the pipeline's hemispherical "
+      "integrals it is the second one that counts.")
     A("")
-    A("Le due colonne `W1 spectrum` e `abs. dmean` della matrice vengono da qui, li' "
-      "divise per insieme di pixel. Questa sezione resta sul **frame intero** e lo "
-      "scompone: per canale, per frame, e sulla skybox.")
+    A("The two `W1 spectrum` and `abs. dmean` columns of the matrix come from here, "
+      "there split by pixel set. This section stays on the **whole frame** and "
+      "decomposes it: per channel, per frame, and on the skybox.")
     A("")
-    A(f"Lo spettro e' l'istogramma dei valori HDR su griglia log ({SPEC_PER_DECADE} bin "
-      f"per decade da 1e{SPEC_LO_EXP:.0f} a 1e{SPEC_HI_EXP:.0f}), qui calcolato sul "
-      "**frame intero**, per i canali R, G, B e per la norma "
-      "`||RGB||` del pixel. La distanza dalla GT e' la **W1 nel dominio log10**, cioe' "
-      "lo spostamento medio dei quantili misurato in **decadi**: 0 = distribuzioni "
-      "identiche, 0.1 = i quantili sono spostati in media di un decimo di decade "
-      "(+26%). `dmean` e' la stessa cosa con segno: positivo = run piu' chiaro della GT.")
+    A(f"The spectrum is the histogram of the HDR values on a log grid ({SPEC_PER_DECADE} "
+      f"bins per decade from 1e{SPEC_LO_EXP:.0f} to 1e{SPEC_HI_EXP:.0f}), computed here on "
+      "the **whole frame**, for the R, G, B channels and for the norm "
+      "`||RGB||` of the pixel. The distance from the GT is the **W1 in the log10 "
+      "domain**, i.e. the mean shift of the quantiles measured in **decades**: 0 = "
+      "identical distributions, 0.1 = the quantiles are shifted on average by a tenth "
+      "of a decade (+26%). `dmean` is the same thing with a sign: positive = run brighter than the GT.")
     A("")
     rows = []
     for i in an.order:
@@ -2145,53 +2143,53 @@ def _report_spectrum(A, runs: list[Run], an: SpectrumAnalysis,
                     + [f"{an.w1_pooled[i].mean():.4f}",
                        f"{an.dmean_pooled[i, NORM_CH]:+.4f}"])
     A(_md_table(["#", "run", "act.", "loss"] + [f"W1 {c}" for c in SPEC_CHANNELS]
-                + ["W1 media", "dmean norm"], rows))
+                + ["W1 mean", "dmean norm"], rows))
     A("")
-    A("Classifica sul canale `norm`, su tutti i frame insieme: e' la radianza del "
-      "pixel, cioe' la quantita' che la pipeline consuma, ed e' la stessa colonna che "
-      "compare nella matrice, quindi le due classifiche non possono divergere. La "
-      "colonna `W1 media` resta come diagnosi, ma mediare i quattro canali conterebbe "
-      "due volte la stessa informazione, dato che `norm` e' funzione di R, G, B.")
+    A("Ranking on the `norm` channel, over every frame together: it is the pixel's "
+      "radiance, i.e. the quantity the pipeline consumes, and it is the same column "
+      "that appears in the matrix, so the two rankings cannot diverge. The "
+      "`W1 mean` column stays as a diagnostic, but averaging the four channels would "
+      "count the same information twice, since `norm` is a function of R, G, B.")
     A("")
-    A("Statistiche per frame in `spectrum_distance.csv`. Figure: "
-      "`spectrum_global.png` (istogrammi), `spectrum_global_ratio.png` (residuo, "
-      "dove le differenze si vedono), `spectrum_cdf.png` (l'area fra le curve **e'** "
-      "la W1), `spectrum_qq.png` (quantile per quantile).")
+    A("Per-frame statistics in `spectrum_distance.csv`. Figures: "
+      "`spectrum_global.png` (histograms), `spectrum_global_ratio.png` (residual, "
+      "where the differences show), `spectrum_cdf.png` (the area between the curves "
+      "**is** the W1), `spectrum_qq.png` (quantile by quantile).")
     A("")
-    A("### Frame notevoli")
+    A("### Notable frames")
     A("")
     rows = []
     labels = {
-        "worst": "spettro piu' lontano dalla GT (media sui run)",
-        "best": "spettro piu' vicino alla GT (media sui run)",
-        "median": "frame mediano",
-        "most_discriminant": "massima differenza fra i run: il frame da guardare",
-        "most_hdr": "p99.9 della luminanza GT piu' alto",
+        "worst": "spectrum furthest from the GT (mean over the runs)",
+        "best": "spectrum closest to the GT (mean over the runs)",
+        "median": "median frame",
+        "most_discriminant": "largest difference between the runs: the frame to look at",
+        "most_hdr": "highest p99.9 of the GT luminance",
     }
     for name, f in an.notable.items():
         vals = an.w1[:, f, NORM_CH]
         rows.append([f"`{name}`", str(f), labels.get(name, ""),
                      f"{vals.mean():.4f}", f"{vals.min():.4f}", f"{vals.max():.4f}"])
-    A(_md_table(["etichetta", "frame", "criterio", "W1 norm media", "min", "max"], rows))
+    A(_md_table(["label", "frame", "criterion", "W1 norm mean", "min", "max"], rows))
     A("")
-    A("Sono marcati in `spectrum_w1_per_frame.png`, annotati nel titolo del file "
-      "corrispondente in `figures/spectrum_frames/` e nella colonna `notable` di "
-      "`spectrum_per_frame.csv`. Le 60 figure per frame hanno assi identici fra loro, "
-      "quindi scorrerle e' un confronto valido.")
+    A("They are marked in `spectrum_w1_per_frame.png`, annotated in the title of the "
+      "corresponding file in `figures/spectrum_frames/` and in the `notable` column of "
+      "`spectrum_per_frame.csv`. The 60 per-frame figures have identical axes, "
+      "so scrolling through them is a valid comparison.")
     A("")
 
     if sky is not None:
         spec_sky_gt, per_run, sky_path = sky
-        A("### Skybox: originale vs bakate dai NeRF")
+        A("### Skybox: original vs baked from the NeRFs")
         A("")
-        A(f"Stessa analisi sull'envmap: `{sky_path.name}` contro le "
-          "`skybox_nerf_baked.exr` prodotte da `bake_skyboxes.py`. Gli istogrammi sono "
-          "**pesati per angolo solido** (sin(theta) per riga dell'equirettangolare): "
-          "senza il peso i poli conterebbero quanto l'equatore.")
+        A(f"Same analysis on the envmap: `{sky_path.name}` against the "
+          "`skybox_nerf_baked.exr` produced by `bake_skyboxes.py`. The histograms are "
+          "**weighted by solid angle** (sin(theta) per row of the equirectangular map): "
+          "without the weight the poles would count as much as the equator.")
         A("")
         rows = []
         pairs = [(r, per_run[r.key]) for r in runs if r.key in per_run]
-        # stesso criterio della classifica sui frame: canale norm, non media sui 4
+        # same criterion as the per-frame ranking: norm channel, not the mean of the 4
         pairs.sort(key=lambda t: float(spec_w1_dex(t[1], spec_sky_gt)[NORM_CH]))
         for rank, (r, h) in enumerate(pairs, start=1):
             w1 = spec_w1_dex(h, spec_sky_gt)
@@ -2200,25 +2198,25 @@ def _report_spectrum(A, runs: list[Run], an: SpectrumAnalysis,
                         + [f"{w1[c]:.4f}" for c in range(N_SPEC_CH)]
                         + [f"{w1.mean():.4f}", f"{dm[NORM_CH]:+.4f}"])
         A(_md_table(["#", "run", "act.", "loss"] + [f"W1 {c}" for c in SPEC_CHANNELS]
-                    + ["W1 media", "dmean norm"], rows))
+                    + ["W1 mean", "dmean norm"], rows))
         A("")
-        A("Figura: `spectrum_skybox.png`, tabella completa in `spectrum_skybox.csv`. "
-          "Questa classifica e' indipendente da quella sui frame: misura quanto il "
-          "**fondo** del NeRF, che e' cio' che finisce nel bake dell'envmap e quindi "
-          "nell'irradianza, riproduce la distribuzione di radianza della sorgente.")
+        A("Figure: `spectrum_skybox.png`, full table in `spectrum_skybox.csv`. "
+          "This ranking is independent of the per-frame one: it measures how well the "
+          "**background** of the NeRF, which is what ends up in the envmap bake and "
+          "hence in the irradiance, reproduces the source's radiance distribution.")
         A("")
-    A("`dmean` (media dei log) e `energy_bias` di `metrics_global.csv` (media "
-      "lineare) **possono avere segno diverso**, e qui succede per i run "
-      "`rel_mse_raw`: l'energia totale e' leggermente sottostimata mentre la media "
-      "geometrica sale. Non e' una contraddizione, e' la firma di uno spettro che "
-      "comprime le alte luci e alza il fondo scala, cioe' esattamente cio' che una "
-      "loss relativa incentiva. La media lineare la vedono i pixel piu' luminosi, "
-      "la media dei log il grosso della distribuzione.")
+    A("`dmean` (mean of the logs) and `energy_bias` in `metrics_global.csv` (linear "
+      "mean) **can have different signs**, and that happens here for the "
+      "`rel_mse_raw` runs: the total energy is slightly underestimated while the "
+      "geometric mean rises. It is not a contradiction, it is the signature of a "
+      "spectrum that compresses the highlights and lifts the black floor, i.e. exactly "
+      "what a relative loss rewards. The linear mean is seen by the brightest pixels, "
+      "the mean of the logs by the bulk of the distribution.")
     A("")
-    A("Nota sui bin estremi: il primo raccoglie tutti i valori sotto "
-      f"1e{SPEC_LO_EXP:.0f} (**zero incluso**) e l'ultimo tutti quelli sopra "
-      f"1e{SPEC_HI_EXP:.0f}; nel calcolo della W1 entrano con la larghezza nominale "
-      "degli altri bin. E' un'approssimazione che tocca solo le code.")
+    A("Note on the extreme bins: the first collects every value below "
+      f"1e{SPEC_LO_EXP:.0f} (**zero included**) and the last every value above "
+      f"1e{SPEC_HI_EXP:.0f}; in the W1 they enter with the nominal width of the "
+      "other bins. It is an approximation that touches the tails alone.")
     A("")
 
 
@@ -2228,51 +2226,51 @@ def write_report(out: Path, runs: list[Run], results: dict[str, RunResult],
                  sky: tuple[np.ndarray, dict[str, np.ndarray], Path] | None = None) -> None:
     mu_scale = stats.mu_scale
     vals, ranks = _matrix_values(results, runs, "full", mu_scale, an)
-    order = np.argsort([r for r in ranks[:, 0]])   # rank sulla SMAPE (prima colonna)
+    order = np.argsort([r for r in ranks[:, 0]])   # rank on the SMAPE (first column)
 
     L: list[str] = []
     A = L.append
-    A("# Confronto dei run dello sweep attivazione x loss")
+    A("# Comparison of the runs of the activation x loss sweep")
     A("")
-    A(f"Sorgente: `{root}`  ")
-    A(f"Run confrontati: {len(runs)}, frame per run: {n_frames}, "
-      f"generato il {time.strftime('%Y-%m-%d %H:%M')}")
+    A(f"Source: `{root}`  ")
+    A(f"Runs compared: {len(runs)}, frames per run: {n_frames}, "
+      f"generated on {time.strftime('%Y-%m-%d %H:%M')}")
     A("")
-    A("## Come va letta questa classifica")
+    A("## How to read this ranking")
     A("")
-    A("Ogni run e' per costruzione il minimo della **propria** loss su questi dati. "
-      "Classificarli con la MSE premia i run `mse`, con la MAE i run `l1`, con la relMSE "
-      "i run `rel_mse_raw`. Per questo le tre metriche che coincidono con le loss dello "
-      "sweep, cioe' **MSE/PSNR lineare, MAE e relMSE**, sono state **tolte dalla "
-      "matrice** invece che marcate: una cella auto-valutata resta ingannevole anche "
-      "quando e' etichettata, e marcarne alcune ma non tutte lascerebbe il campo di casa "
-      "a una loss sola. Restano calcolate in `metrics_global.csv`, dove nessuno le legge "
-      "come una classifica.")
+    A("Every run is by construction the minimum of its **own** loss on this data. "
+      "Ranking them with the MSE rewards the `mse` runs, with the MAE the `l1` runs, "
+      "with the relMSE the `rel_mse_raw` runs. That is why the three metrics that "
+      "coincide with the sweep's losses, i.e. **linear MSE/PSNR, MAE and relMSE**, were "
+      "**removed from the matrix** rather than marked: a self-evaluated cell stays "
+      "misleading even when labelled, and marking some but not all would give home "
+      "advantage to a single loss. They stay computed in `metrics_global.csv`, where "
+      "nobody reads them as a ranking.")
     A("")
-    A("La metrica di testa e' la **SMAPE**, `mean(|p-g| / (|p|+|g|+1e-3))`: e' "
-      "simmetrica, invariante di scala (in HDR ogni decade pesa uguale) e limitata in "
-      "[0,1], quindi un singolo pixel incandescente non decide la classifica. mu-PSNR e "
-      "log-RMSE la affiancano come controllo. Una precisazione che serve per non "
-      "vendere piu' di quanto c'e': nessuna colonna della matrice **e'** una delle loss, "
-      "ma `PSNR tm-clip` e `PSNR tm-Reinhard` restano quadratiche e `log-RMSE` resta "
-      "relativa, quindi la parentela di famiglia con `mse` e `rel_mse_raw` esiste. E' "
-      "molto piu' debole della coincidenza esatta, e viene dichiarata invece che "
-      "nascosta.")
+    A("The headline metric is the **SMAPE**, `mean(|p-g| / (|p|+|g|+1e-3))`: it is "
+      "symmetric, scale-invariant (in HDR every decade weighs the same) and bounded in "
+      "[0,1], so a single incandescent pixel does not decide the ranking. mu-PSNR and "
+      "log-RMSE flank it as a control. One clarification, so as not to sell more than "
+      "is there: no column of the matrix **is** one of the losses, but `PSNR tm-clip` "
+      "and `PSNR tm-Reinhard` stay quadratic and `log-RMSE` stays relative, so the "
+      "family resemblance with `mse` and `rel_mse_raw` does exist. It is much weaker "
+      "than exact coincidence, and it is declared rather than "
+      "hidden.")
     A("")
-    A("Il secondo criterio non e' un errore per pixel. Il NeRF, qui, e' consumato dentro "
-      "integrali emisferici (irradianza indiretta, coni speculari): il **bias con segno** "
-      "sopravvive all'integrazione, il rumore a media nulla si cancella. Un modello "
-      "leggermente piu' rumoroso ma centrato e' preferibile a uno piu' liscio ma che "
-      "sottostima sistematicamente gli highlight.")
+    A("The second criterion is not a per-pixel error. The NeRF, here, is consumed inside "
+      "hemispherical integrals (indirect irradiance, specular cones): the **signed bias** "
+      "survives the integration, zero-mean noise cancels. A model that is slightly "
+      "noisier but centred is preferable to one that is smoother but systematically "
+      "underestimates the highlights.")
     A("")
-    A("Il terzo criterio e' lo **spettro**, cioe' la distribuzione dei valori, e non e' "
-      "piu' un'appendice: le ultime due colonne della matrice sono la distanza W1 dalla "
-      "distribuzione della GT e lo spostamento tonale medio, entrambe in decadi e "
-      "calcolate sullo **stesso insieme di pixel** della colonna accanto. La sezione "
-      "\"Spettro dei colori\" le scompone per canale e per frame.")
+    A("The third criterion is the **spectrum**, i.e. the distribution of the values, and "
+      "it is no longer an appendix: the last two columns of the matrix are the W1 "
+      "distance from the GT's distribution and the mean tonal shift, both in decades "
+      "and computed on the **same pixel set** as the column next to them. The "
+      "\"Colour spectrum\" section decomposes them per channel and per frame.")
     A("")
 
-    A("## Classifica secondo la metrica di testa (SMAPE, full frame)")
+    A("## Ranking by the headline metric (SMAPE, full frame)")
     A("")
     rows = []
     for i in order:
@@ -2289,17 +2287,17 @@ def write_report(out: Path, runs: list[Run], results: dict[str, RunResult],
                      f"{m['mu_psnr']:.2f}",
                      f"{spectrum_metrics(an, r.key, 'full')['spec_w1']:.4f}"])
     A(_md_table(["#", "run", "act.", "loss", "SMAPE", "SMAPE rest", "SMAPE highlight",
-                 "bias rest", "bias highlight", "mu-PSNR", "W1 spettro"], rows))
+                 "bias rest", "bias highlight", "mu-PSNR", "W1 spectrum"], rows))
     A("")
-    A("`rest` = luminanza GT <= 1, `highlight` = luminanza GT > 1. Il bias e' "
-      "`(sum pred - sum gt) / sum gt` sulla zona: negativo = sottostima. `W1 spettro` "
-      "e' la distanza fra la distribuzione dei valori del run e quella della GT, in "
-      "decadi, sul frame intero: non si divide fra `rest` e `highlight` perche' e' una "
-      "proprieta' dell'intera distribuzione, non di una sua fascia.")
+    A("`rest` = GT luminance <= 1, `highlight` = GT luminance > 1. The bias is "
+      "`(sum pred - sum gt) / sum gt` over the zone: negative = underestimate. `W1 spectrum` "
+      "is the distance between the run's value distribution and the GT's, in "
+      "decades, on the whole frame: it is not split between `rest` and `highlight` "
+      "because it is a property of the whole distribution, not of one of its bands.")
     A("")
-    A("La stessa classifica sui tre insiemi di pixel, perche' la pipeline consuma il "
-      "NeRF in due modi diversi: il foreground alimenta il fit PBR, il background "
-      "alimenta il bake dell'envmap.")
+    A("The same ranking on the three pixel sets, because the pipeline consumes the "
+      "NeRF in two different ways: the foreground feeds the PBR fit, the background "
+      "feeds the envmap bake.")
     A("")
     by_set = {ps: _matrix_values(results, runs, ps, mu_scale, an) for ps in PIXEL_SETS}
     j_w1 = next(j for j, sp in enumerate(METRIC_SPECS) if sp.key == "spec_w1")
@@ -2314,20 +2312,20 @@ def write_report(out: Path, runs: list[Run], results: dict[str, RunResult],
     A(_md_table(["run", "SMAPE full", "SMAPE foreground", "SMAPE background",
                  "W1 full", "W1 foreground", "W1 background"], rows))
     A("")
-    A("Le colonne `W1` sono lo spettro calcolato sullo stesso insieme di pixel, non il "
-      "valore del frame intero ripetuto tre volte: la distribuzione della radianza "
-      "dell'oggetto e quella dell'envmap sono due cose diverse, e un run puo' "
-      "riprodurre bene l'una e male l'altra.")
+    A("The `W1` columns are the spectrum computed on the same pixel set, not the "
+      "whole-frame value repeated three times: the distribution of the object's "
+      "radiance and that of the envmap are two different things, and a run can "
+      "reproduce one well and the other badly.")
     A("")
 
-    # ── Il compromesso, calcolato dai dati e non asserito ────────────────────
-    A("## Che cosa si guadagna e che cosa si perde")
+    # ── The trade-off, computed from the data and not asserted ───────────────
+    A("## What is gained and what is lost")
     A("")
     top = [runs[i] for i in order]
     win = int(order[0])
-    # i rank sono una permutazione di 1..n, quindi argmin da' l'indice del primo.
-    # La partizione non e' piu' neutre/diagonali (non ci sono piu' diagonali) ma per
-    # famiglia: errore per pixel contro distribuzione dei valori.
+    # the ranks are a permutation of 1..n, so argmin gives the index of the first.
+    # The partition is no longer neutral/diagonal (there are no diagonals any more) but
+    # by family: per-pixel error against distribution of the values.
     per_pixel = [(j, sp) for j, sp in enumerate(METRIC_SPECS) if not sp.spectrum]
     spec_fam = [(j, sp) for j, sp in enumerate(METRIC_SPECS) if sp.spectrum]
     p_agree = [sp.label for j, sp in per_pixel if int(np.argmin(ranks[:, j])) == win]
@@ -2335,55 +2333,55 @@ def write_report(out: Path, runs: list[Run], results: dict[str, RunResult],
     s_agree = [sp.label for j, sp in spec_fam if int(np.argmin(ranks[:, j])) == win]
     s_dis = [sp.label for j, sp in spec_fam if sp.label not in s_agree]
 
-    A(f"Le metriche di **errore per pixel** sono {len(per_pixel)}, nessuna delle quali "
-      f"coincide con una loss dello sweep. Di queste, {len(p_agree)} indicano lo stesso "
-      f"vincitore della metrica di testa"
+    A(f"There are {len(per_pixel)} **per-pixel error** metrics, none of which "
+      f"coincides with a loss of the sweep. Of those, {len(p_agree)} point to the same "
+      f"winner as the headline metric"
       + (f": {', '.join(p_agree)}" if p_agree else "")
-      + (f"; le restanti no: {', '.join(p_dis)}." if p_dis else "."))
+      + (f"; the remaining ones do not: {', '.join(p_dis)}." if p_dis else "."))
     A("")
-    A(f"Le metriche di **distribuzione** sono {len(spec_fam)}. "
-      + (f"{', '.join(s_agree)} " + ("indicano" if len(s_agree) > 1 else "indica")
-         + " lo stesso vincitore. " if s_agree else "")
-      + (f"{', '.join(s_dis)} " + ("indicano" if len(s_dis) > 1 else "indica")
-         + " un vincitore diverso: il run che sbaglia meno per pixel non e' quello che "
-           "riproduce meglio la distribuzione dei valori, ed e' la seconda che conta "
-           "dentro gli integrali emisferici." if s_dis else ""))
+    A(f"There are {len(spec_fam)} **distribution** metrics. "
+      + (f"{', '.join(s_agree)} " + ("point" if len(s_agree) > 1 else "points")
+         + " to the same winner. " if s_agree else "")
+      + (f"{', '.join(s_dis)} " + ("point" if len(s_dis) > 1 else "points")
+         + " to a different winner: the run that errs least per pixel is not the one "
+           "that best reproduces the distribution of the values, and it is the second "
+           "that counts inside the hemispherical integrals." if s_dis else ""))
     A("")
     if not p_dis and not s_dis:
-        A("Nessuna metrica contraddice la classifica di testa: il ranking non dipende "
-          "dalla metrica scelta, e nessuna delle metriche e' una delle loss.")
+        A("No metric contradicts the headline ranking: the ranking does not depend on "
+          "the metric chosen, and none of the metrics is one of the losses.")
     elif not s_dis:
-        A("Le due famiglie concordano sul vincitore, ma almeno una metrica per pixel "
-          "no: il risultato va presentato come compromesso e non come vincitore "
-          "assoluto.")
+        A("The two families agree on the winner, but at least one per-pixel metric "
+          "does not: the result should be presented as a trade-off and not as an "
+          "absolute winner.")
     else:
-        A("Le due famiglie non concordano. E' il caso interessante: errore per pixel e "
-          "fedelta' della distribuzione sono domande diverse, e la scelta va motivata "
-          "su quale delle due la pipeline consuma davvero.")
+        A("The two families do not agree. This is the interesting case: per-pixel error "
+          "and distribution fidelity are different questions, and the choice has to be "
+          "justified on which of the two the pipeline actually consumes.")
     A("")
 
-    # confronto appaiato fra i primi due, sui 60 frame
+    # paired comparison between the top two, over the 60 frames
     if len(top) >= 2:
         a = np.array([x["smape_full"] for x in results[top[0].key].per_frame])
         b = np.array([x["smape_full"] for x in results[top[1].key].per_frame])
-        d = b - a                      # >0 = il primo e' migliore su quel frame
+        d = b - a                      # >0 = the first is better on that frame
         won = int((d > 0).sum())
-        A(f"**{top[0].label} contro {top[1].label}**, confronto appaiato sui "
-          f"{len(d)} frame: differenza media di SMAPE {d.mean():+.5f} "
-          f"(deviazione standard {d.std(ddof=1):.5f}), il primo vince su "
-          f"{won}/{len(d)} frame. " +
-          ("Lo scarto e' dello stesso ordine della dispersione fra frame: sulla "
-           "metrica di testa i due sono equivalenti e la scelta va fatta su un altro "
-           "criterio."
+        A(f"**{top[0].label} against {top[1].label}**, paired comparison over the "
+          f"{len(d)} frames: mean SMAPE difference {d.mean():+.5f} "
+          f"(standard deviation {d.std(ddof=1):.5f}), the first wins on "
+          f"{won}/{len(d)} frames. " +
+          ("The gap is of the same order as the spread between frames: on the "
+           "headline metric the two are equivalent and the choice has to be made on "
+           "another criterion."
            if abs(d.mean()) < d.std(ddof=1) else
-           "Lo scarto supera la dispersione fra frame: la differenza e' sistematica."))
+           "The gap exceeds the spread between frames: the difference is systematic."))
         A("")
 
-    # il criterio che decide quando la metrica di testa non separa: il bias che
-    # sopravvive all'integrazione emisferica
-    A("Criterio di spareggio, il bias con segno che sopravvive all'integrazione "
-      "emisferica (le due fasce piu' luminose del background sono l'envmap, che il "
-      "bake dell'irradianza integra in unita' lineari):")
+    # the criterion that decides when the headline metric does not separate: the bias
+    # that survives the hemispherical integration
+    A("Tie-breaker, the signed bias that survives the hemispherical integration "
+      "(the two brightest background bands are the envmap, which the irradiance bake "
+      "integrates in linear units):")
     A("")
     rows = []
     for r in runs:
@@ -2399,13 +2397,13 @@ def write_report(out: Path, runs: list[Run], results: dict[str, RunResult],
     A(_md_table(["run", "bias bg extreme (L>10)", "bias bg highlight (1<L<=10)",
                  "bias fg shadow (L<=0.1)", "MSE bg extreme"], rows))
     A("")
-    A("L'ultima colonna e' l'errore quadratico assoluto sui pixel piu' luminosi del "
-      "background. E' li' che le loss relative pagano il loro vantaggio: l'errore "
-      "relativo tipico e' piu' basso, ma la coda in valore assoluto e' piu' pesante, "
-      "ed e' il valore assoluto che entra nell'integrale di irradianza.")
+    A("The last column is the absolute squared error on the brightest pixels of the "
+      "background. That is where the relative losses pay for their advantage: the "
+      "typical relative error is lower, but the tail in absolute value is heavier, "
+      "and it is the absolute value that enters the irradiance integral.")
     A("")
 
-    A("## Matrice completa (full frame)")
+    A("## Full matrix (full frame)")
     A("")
     hdr = ["run"] + [s.label for s in METRIC_SPECS]
     rows = []
@@ -2419,15 +2417,15 @@ def write_report(out: Path, runs: list[Run], results: dict[str, RunResult],
         rows.append([r.label] + cells)
     A(_md_table(hdr, rows))
     A("")
-    A("Nessuna colonna e' una delle loss dello sweep, quindi nessuna cella e' "
-      "auto-valutata. Le ultime due misurano la distribuzione e non l'errore per "
-      "pixel: sono la W1 dalla distribuzione della GT e lo spostamento tonale medio in "
-      "valore assoluto, sul canale `norm` e sullo stesso insieme di pixel della "
-      "matrice. Le stesse due colonne, calcolate su `fg` e `bg`, sono in "
+    A("No column is one of the sweep's losses, so no cell is self-evaluated. The last "
+      "two measure the distribution and not the per-pixel error: they are the W1 from "
+      "the GT's distribution and the mean tonal shift in absolute value, on the "
+      "`norm` channel and on the same pixel set as the matrix. The same two columns, "
+      "computed on `fg` and `bg`, are in "
       "`metric_matrix_fg.png` e `metric_matrix_bg.png`.")
     A("")
 
-    A("## Errore sugli highlight e sul resto")
+    A("## Error on the highlights and on the rest")
     A("")
     for ps in ("full", "fg", "bg"):
         A(f"### pixel set: {ps}")
@@ -2445,68 +2443,68 @@ def write_report(out: Path, runs: list[Run], results: dict[str, RunResult],
         A(_md_table(["run", "band", "pixels", "SMAPE", "median pred/gt", "signed bias",
                      "share of MSE", "share of SMAPE"], rows))
         A("")
-    A("Le due ultime colonne sono la decomposizione esatta del budget d'errore: dentro "
-      "ogni blocco (un run, un insieme di pixel) sommano a 100%. Il confronto tra "
-      "`share of MSE` e `share of SMAPE` dice quanta parte della classifica dipende "
-      "dalla metrica scelta invece che dal modello.")
+    A("The last two columns are the exact decomposition of the error budget: inside "
+      "each block (one run, one pixel set) they sum to 100%. The comparison between "
+      "`share of MSE` and `share of SMAPE` says how much of the ranking depends on "
+      "the metric chosen rather than on the model.")
     A("")
 
     if an is not None:
         _report_spectrum(A, runs, an, sky)
 
-    A("## Costanti globali usate")
+    A("## Global constants used")
     A("")
-    A(f"- scala mu-law `X` = p99.99 della luminanza GT su tutti i frame = **{mu_scale:.4f}**, "
-      f"mu = {MU:.0f}. La codifica satura sopra `X`: lo 0.01% di pixel piu' luminosi "
-      f"entra nel mu-PSNR con l'errore compresso. E' la ragione per cui il mu-PSNR "
-      f"affianca la SMAPE invece di sostituirla.")
-    A(f"- soglie delle partizioni: shadow L<=0.1, midtone 0.1<L<=1, highlight 1<L<=10, "
+    A(f"- mu-law scale `X` = p99.99 of the GT luminance over every frame = **{mu_scale:.4f}**, "
+      f"mu = {MU:.0f}. The encoding saturates above `X`: the brightest 0.01% of pixels "
+      f"enter the mu-PSNR with a compressed error. That is why the mu-PSNR "
+      f"flanks the SMAPE instead of replacing it.")
+    A(f"- partition thresholds: shadow L<=0.1, midtone 0.1<L<=1, highlight 1<L<=10, "
       f"extreme L>10")
-    A(f"- griglia delle fasce: {N_DEC_INNER} bin da 1/3 di decade tra 1e-3 e 1e2, "
-      f"piu' underflow e overflow")
-    A(f"- percentili della luminanza GT: " +
+    A(f"- band grid: {N_DEC_INNER} bins of 1/3 decade between 1e-3 and 1e2, "
+      f"plus underflow and overflow")
+    A(f"- percentiles of the GT luminance: " +
       ", ".join(f"p{k}={v:.4f}" for k, v in stats.percentiles.items()))
-    A(f"- quote di pixel: " + ", ".join(f"{k} {100 * v:.2f}%" for k, v in stats.band_frac.items()))
-    A(f"- foreground = {100 * stats.fg_frac:.1f}% dei pixel, ma contiene solo il "
-      f"**{100 * stats.hl_in_fg:.1f}%** degli highlight (L>1): senza separare fg e bg, "
-      f"\"errore sugli highlight\" significa di fatto \"errore sull'envmap\"")
+    A(f"- pixel shares: " + ", ".join(f"{k} {100 * v:.2f}%" for k, v in stats.band_frac.items()))
+    A(f"- foreground = {100 * stats.fg_frac:.1f}% of the pixels, but it holds only "
+      f"**{100 * stats.hl_in_fg:.1f}%** of the highlights (L>1): without separating fg and bg, "
+      f"\"error on the highlights\" effectively means \"error on the envmap\"")
     A("")
 
-    A("## Controlli eseguiti")
+    A("## Checks performed")
     A("")
     for c in checks:
         A(f"- `{c.strip()}`")
     A("")
 
-    A("## Avvertenze")
+    A("## Caveats")
     A("")
-    A("1. **Circolarita'.** Ogni run e' il minimo della propria loss su questi dati. Le "
-      "tre metriche che coincidono con le loss dello sweep (MSE/PSNR lineare, MAE, "
-      "relMSE) sono percio' escluse dalla matrice e dalle classifiche; sopravvivono "
-      "solo in `metrics_global.csv` e `metrics_per_frame_all_runs.csv`, che sono dump "
-      "grezzi. Se le si usa per confrontare i run, il confronto e' circolare.")
-    A("2. **Sono tutte viste di training.** `hold_out_preview` e' `False` di default "
-      "(`nerf/dataset.py`), quindi tutti i frame valutati qui sono stati visti in "
-      "addestramento. Si sta misurando la qualita' del fit, non la generalizzazione.")
-    A("3. **`psnr_db` in `training_metrics.csv`** e' misurato sul batch di training "
-      "dell'iterazione (fg e bg mescolati) ed e' `-10*log10(mse)` con `MAX_I=1` su target "
-      "HDR: rimappatura monotona della MSE, confrontabile tra run sugli stessi dati ma "
-      "non con i PSNR della letteratura.")
-    A("4. **La colonna `loss`** e' nelle unita' della rispettiva loss: ha senso solo "
-      "dentro un run, mai tra run diversi. Per questo la figura `train_loss_by_type.png` "
-      "usa un pannello separato per tipo di loss.")
-    A("5. **Gli artefatti esistenti mescolano insiemi di pixel**: in "
-      "`metrics_per_frame.csv` la colonna `psnr` e' calcolata sul frame intero, mentre "
-      "`psnr_tonemap_*`, `rel_err_*` e `residual_*` solo sul foreground "
-      "(`images_generator.py:2609` contro `:2628-2631`). Qui ogni metrica e' riportata "
-      "esplicitamente su `full`, `fg` e `bg`.")
-    A("6. **`metrics_summary.txt` fa la media dei PSNR per frame.** Con un range dinamico "
-      "che va da 1.0 a 56 a seconda del frame, quella media e' dominata da pochi frame. "
-      "Le tabelle qui sopra aggregano invece le somme su tutti i pixel e convertono alla "
-      "fine; le distribuzioni per frame sono nei boxplot.")
-    A("7. **Lo sweep su disco ha 6 configurazioni** (3 loss x 2 attivazioni, un solo "
-      "decay), mentre `tab:results-nerf-ablation` in `Doc/chapters/results.tex` ne "
-      "prevede 8 (2 loss x 2 attivazioni x 2 decay). La tabella della tesi va riallineata.")
+    A("1. **Circularity.** Every run is the minimum of its own loss on this data. The "
+      "three metrics that coincide with the sweep's losses (linear MSE/PSNR, MAE, "
+      "relMSE) are therefore excluded from the matrix and from the rankings; they "
+      "survive only in `metrics_global.csv` and `metrics_per_frame_all_runs.csv`, which "
+      "are raw dumps. If they are used to compare the runs, the comparison is circular.")
+    A("2. **They are all training views.** `hold_out_preview` is `False` by default "
+      "(`nerf/dataset.py`), so every frame evaluated here was seen during "
+      "training. What is being measured is the quality of the fit, not generalisation.")
+    A("3. **`psnr_db` in `training_metrics.csv`** is measured on the iteration's "
+      "training batch (fg and bg mixed) and is `-10*log10(mse)` with `MAX_I=1` on HDR "
+      "targets: a monotone remapping of the MSE, comparable between runs on the same "
+      "data but not with the PSNR figures of the literature.")
+    A("4. **The `loss` column** is in the units of its own loss: it only makes sense "
+      "within a run, never between different runs. That is why the figure "
+      "`train_loss_by_type.png` uses a separate panel per loss type.")
+    A("5. **The existing artefacts mix pixel sets**: in "
+      "`metrics_per_frame.csv` the `psnr` column is computed on the whole frame, while "
+      "`psnr_tonemap_*`, `rel_err_*` and `residual_*` only on the foreground "
+      "(`images_generator.py:2609` against `:2628-2631`). Here every metric is reported "
+      "explicitly on `full`, `fg` and `bg`.")
+    A("6. **`metrics_summary.txt` averages the per-frame PSNRs.** With a dynamic range "
+      "going from 1.0 to 56 depending on the frame, that average is dominated by a few "
+      "frames. The tables above instead aggregate the sums over every pixel and convert "
+      "at the end; the per-frame distributions are in the boxplots.")
+    A("7. **The sweep on disk has 6 configurations** (3 losses x 2 activations, a single "
+      "decay), while `tab:results-nerf-ablation` in `Doc/chapters/results.tex` expects "
+      "8 (2 losses x 2 activations x 2 decays). The thesis table has to be realigned.")
     A("")
 
     (out / "report.md").write_text("\n".join(L), encoding="utf-8")
@@ -2522,28 +2520,28 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("sweep_root", nargs="?", default=DEFAULT_ROOT)
     ap.add_argument("-o", "--out", default=None,
-                    help="cartella di output (default: <sweep_root>/_comparison)")
+                    help="output folder (default: <sweep_root>/_comparison)")
     ap.add_argument("--no-recompute", action="store_true",
-                    help="solo le figure derivate dai CSV gia' su disco")
+                    help="only the figures derived from the CSVs already on disk")
     ap.add_argument("--reuse-cache", action="store_true",
-                    help=f"riusa <out>/{CACHE_NAME} invece di rileggere gli EXR "
-                         f"(per iterare sulle figure senza ripagare l'I/O)")
+                    help=f"reuse <out>/{CACHE_NAME} instead of re-reading the EXRs "
+                         f"(to iterate on the figures without paying the I/O again)")
     ap.add_argument("--runs", nargs="*", default=None,
-                    help="limita a questi nomi di cartella")
+                    help="restrict to these folder names")
     ap.add_argument("--visual-frame", type=int, default=None,
-                    help="frame per la figura dei crop (default: il piu' HDR)")
+                    help="frame for the crop figure (default: the most HDR one)")
     ap.add_argument("--skybox-gt", default=None,
-                    help="EXR equirettangolare della skybox originale, per il "
-                         "confronto con le skybox_nerf_baked.exr dei run "
-                         "(default: campo skybox_path del run_manifest.json)")
+                    help="equirectangular EXR of the original skybox, for the "
+                         "comparison with the runs' skybox_nerf_baked.exr "
+                         "(default: the skybox_path field of run_manifest.json)")
     ap.add_argument("--no-spectrum-frames", action="store_true",
-                    help="salta le figure di spettro per singolo frame "
-                         "(una per frame in figures/spectrum_frames/)")
+                    help="skip the per-frame spectrum figures "
+                         "(one per frame in figures/spectrum_frames/)")
     args = ap.parse_args()
 
     root = Path(args.sweep_root)
     if not root.is_dir():
-        print(f"ERRORE: {root} non e' una cartella")
+        print(f"ERROR: {root} is not a folder")
         return 2
     out = Path(args.out) if args.out else root / "_comparison"
     figdir = out / "figures"
@@ -2552,28 +2550,28 @@ def main() -> int:
 
     runs = discover_runs(root, args.runs)
     if not runs:
-        print(f"ERRORE: nessun run trovato sotto {root}")
+        print(f"ERROR: no run found under {root}")
         return 2
-    print(f"Run trovati ({len(runs)}):")
+    print(f"Runs found ({len(runs)}):")
     for r in runs:
-        it = r.iter_dir.name if r.iter_dir else "(nessun render)"
+        it = r.iter_dir.name if r.iter_dir else "(no render)"
         print(f"  {r.key:28s} act={r.activation:9s} loss={r.loss:12s} "
               f"decay={r.decay:g}  {it}")
     print(f"Output: {out}")
     print()
 
-    print("[figure dai CSV]")
+    print("[figures from the CSVs]")
     fig_training(runs, figdir)
     fig_bias_bins_existing(runs, figdir)
     fig_existing_per_frame(runs, figdir)
 
     if args.no_recompute:
-        print("\n--no-recompute: salto il ricalcolo dagli EXR.")
+        print("\n--no-recompute: skipping the recomputation from the EXRs.")
         return 0
 
     usable = [r for r in runs if r.iter_dir is not None]
     if not usable:
-        print("Nessun run con render su disco: niente da ricalcolare.")
+        print("No run with renders on disk: nothing to recompute.")
         return 0
 
     ref = usable[0]
@@ -2585,7 +2583,7 @@ def main() -> int:
     mask_paths = [ref.scene_dir / frames[i]["mask_path"] for i in range(n_frames)]
     missing = [p for p in gt_paths + mask_paths if not p.exists()]
     if missing:
-        print(f"ERRORE: file mancanti, ad esempio {missing[0]}")
+        print(f"ERROR: missing files, for instance {missing[0]}")
         return 2
     for r in usable:
         r.n_frames = n_frames
@@ -2594,27 +2592,27 @@ def main() -> int:
     cached = load_cache(out, usable) if args.reuse_cache else None
     if cached is not None:
         results, stats = cached
-        print(f"[1-2/3] Cache riusata da {out / CACHE_NAME}: nessun EXR riletto.")
+        print(f"[1-2/3] Cache reused from {out / CACHE_NAME}: no EXR re-read.")
     else:
         stats = gt_prepass(gt_paths, mask_paths)
         print()
         results = compute_all(usable, gt_paths, mask_paths, stats)
         save_cache(out, results, stats)
 
-    print("\n[3/3] Verifiche, tabelle e figure")
+    print("\n[3/3] Checks, tables and figures")
     checks = verify_against_artifacts(results)
     checks += verify_decomposition(results, stats.mu_scale)
     checks += verify_spectrum(results, stats)
     for c in checks:
         print(c)
     smax = max(max(x["smape_full"] for x in res.per_frame) for res in results.values())
-    print(f"  [{'OK ' if 0 <= smax <= 1 else 'FAIL'}] SMAPE dentro [0,1]: max={smax:.4f}")
+    print(f"  [{'OK ' if 0 <= smax <= 1 else 'FAIL'}] SMAPE inside [0,1]: max={smax:.4f}")
 
-    # Prima delle tabelle e delle figure: due colonne della matrice vengono da qui.
+    # Before the tables and the figures: two columns of the matrix come from here.
     an = analyze_spectrum(results, usable, stats)
-    print("      frame notevoli (canale norm): " +
+    print("      notable frames (norm channel): " +
           ", ".join(f"{k}={v}" for k, v in an.notable.items()))
-    print("      classifica per spettro (W1 sul canale norm, in decadi): " +
+    print("      spectrum ranking (W1 on the norm channel, in decades): " +
           ", ".join(f"{usable[i].label} {an.w1_pooled[i, NORM_CH]:.4f}" for i in an.order))
 
     write_metrics_global(out, results, stats.mu_scale)
@@ -2634,13 +2632,13 @@ def main() -> int:
     fig_highlight_bias(results, usable, stats.mu_scale, figdir)
     fig_error_split(results, usable, stats.mu_scale, figdir)
     fig_error_split_fg_bg(results, usable, stats.mu_scale, figdir, stats.hl_in_fg)
-    # frame piu' HDR per p99.9 e non per il massimo: il massimo e' un singolo
-    # pixel e sceglierebbe un frame con una sorgente puntiforme in vista
+    # most HDR frame by p99.9 and not by the maximum: the maximum is a single pixel
+    # and would pick a frame with a point source in view
     vf = (args.visual_frame if args.visual_frame is not None
           else int(np.argmax(stats.per_frame_p999)))
     fig_visual(usable, gt_paths, mask_paths, vf, figdir)
 
-    # ── spettro dei colori ───────────────────────────────────────────────────
+    # ── colour spectrum ──────────────────────────────────────────────────────
     write_spectrum_tables(out, an, usable)
     print("      + spectrum_distance.csv, spectrum_per_frame.csv")
     fig_spectrum_global(an, usable, figdir)
@@ -2664,7 +2662,7 @@ def main() -> int:
         fig_spectrum_frames(an, usable, results, stats, figdir)
 
     write_report(out, usable, results, stats, checks, root, n_frames, an=an, sky=sky)
-    print(f"\nFatto. Apri: {out / 'report.md'}")
+    print(f"\nDone. Open: {out / 'report.md'}")
     return 0
 
 
