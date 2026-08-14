@@ -50,7 +50,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-sys.path.insert(0, str(Path(__file__).parent))
+import _paths  # noqa: F401
 
 from make_skybox_figure import LUMA_COEFF, block_mean, load_exr, tonemap
 

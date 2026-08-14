@@ -40,7 +40,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent))
+import _paths  # noqa: F401
 
 from pbr_solver import _ExrBandReader  # noqa: E402
 

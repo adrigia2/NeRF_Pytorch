@@ -76,7 +76,7 @@ def main() -> None:
         sys.exit(1)
 
     # Importa le funzioni di plot da nerf.metrics (non da images_generator)
-    sys.path.insert(0, str(Path(__file__).parent))
+    import _paths  # noqa: F401
     from nerf.metrics import plot_error_heatmap, plot_skybox_compare
 
     # ── Per-vista: ultima iter_* ─────────────────────────────────────────────

@@ -1,7 +1,11 @@
 # legacy/
 
-Contiene l'implementazione custom di NeRF pre-refactor (`nerf_module.py`), archiviata per
-riferimento storico. Non è importata da nessun file attivo del progetto.
+Archived code, kept for historical reference only. **Nothing here is imported by
+any active file of the project**, and none of it is maintained.
 
-Sostituita dal package `nerf/` che implementa vanilla bmild/nerf in PyTorch con coarse+fine
-hierarchical sampling e depth-hints opzionali per l'indirect irradiance pass.
+| File | What it was |
+|---|---|
+| `nerf_module.py` | The pre-refactor custom NeRF implementation (model + training + query). Replaced by the `nerf/` package, which implements vanilla bmild/nerf in PyTorch with coarse+fine hierarchical sampling and optional depth hints for the indirect irradiance pass. |
+| `tiny_nerf_data.npz` | The toy dataset `nerf_module.py` was developed against. |
+| `pbr_solver_coscone.py.bak` | The PBR solver as it was before the 2026-07-16 model revision, when `L_j` was a cosine-weighted integral over the cone (`"coscone"`) instead of a pure solid-angle mean. Kept because the thesis discusses the difference. |
+| `inspect_pbr_results.py`, `inspect_pbr_results2.py` | Diagnostic viewers for the PBR fit. Deprecated: they read the old flat output layout and the `"rings"` file patterns, both of which predate the `sources/{source}/` layout and the `"cones"` bake format. Use `scripts/inspect_final_maps.py` and `scripts/inspect_spec_cone.py` instead. |

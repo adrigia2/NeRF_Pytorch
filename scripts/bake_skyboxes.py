@@ -154,7 +154,7 @@ def main() -> int:
     print(f"[bake] {len(run_dirs)} run trovate sotto {root}", flush=True)
 
     # Le funzioni della pipeline stanno accanto a questo file.
-    sys.path.insert(0, str(Path(__file__).parent))
+    import _paths  # noqa: F401
 
     n_baked = n_skipped = n_failed = 0
 

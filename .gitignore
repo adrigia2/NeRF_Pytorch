@@ -221,3 +221,9 @@ __marimo__/
 
 /output/
 /render_output/
+
+# Editor / IDE project metadata
+.idea/
+
+# Scratch files left behind by `conda env create` on Windows
+condaenv.*.requirements.txt

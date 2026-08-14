@@ -28,7 +28,7 @@ import time
 import traceback
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+import _paths  # noqa: F401
 
 from images_generator import (  # noqa: E402
     SceneConfig,

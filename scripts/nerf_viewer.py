@@ -32,6 +32,8 @@ from pathlib import Path
 
 import numpy as np
 
+import _paths  # noqa: F401
+
 WORLD_UP = np.array([0.0, 0.0, 1.0], dtype=np.float32)  # Z-up (Blender)
 ELEV_LIMIT = np.deg2rad(85.0)
 DEPTH_MISS_SENTINEL = 1e10

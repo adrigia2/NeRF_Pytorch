@@ -44,7 +44,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Circle, Polygon, Wedge
 from scipy.spatial import SphericalVoronoi
 
-sys.path.insert(0, str(Path(__file__).parent))
+import _paths  # noqa: F401
 
 from images_generator import (_cones_from_rings_np, ring_weights_mean,
                               spec_cone_ring_samples,

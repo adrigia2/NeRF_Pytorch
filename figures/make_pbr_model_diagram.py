@@ -50,7 +50,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import proj3d
 
-sys.path.insert(0, str(Path(__file__).parent))
+import _paths  # noqa: F401
 
 from images_generator import (_cones_from_rings_np, ring_weights_mean,
                               spec_cone_shared_ring_samples)

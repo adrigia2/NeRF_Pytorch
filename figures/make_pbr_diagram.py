@@ -1,9 +1,13 @@
-"""Genera il diagramma illustrativo dell'approccio PBR multi-vista a cono:
+"""Generate the illustrative diagram of the multi-view cone PBR approach:
 
     C_j = X * D + (1 - X) * L_j(r)
 
-Quattro pannelli: (A) termine diffuso, (B) cono speculare con hit/miss,
-(C) sistema multi-camera, (D) scan su r + forma chiusa per X.
+Four panels: (A) diffuse term, (B) specular cone with hit/miss,
+(C) multi-camera system, (D) scan over r + closed form for X.
+
+NOTE: this is the older diagram. It illustrates the pre-2026-07-16 model
+(D approximated by color_min); the current model is the one drawn by
+make_pbr_model_diagram.py.
 """
 
 import numpy as np
@@ -15,8 +19,8 @@ from matplotlib.patches import Wedge, Rectangle, FancyArrowPatch, Circle
 P = np.array([5.0, 0.0])  # texel
 SKY_R = 5.0
 
-C_SKY0 = np.array([0.45, 0.65, 0.95])   # azzurro
-C_SUN = np.array([1.00, 0.78, 0.25])    # caldo
+C_SKY0 = np.array([0.45, 0.65, 0.95])   # light blue
+C_SUN = np.array([1.00, 0.78, 0.25])    # warm
 C_HIT = "#d62728"
 C_MISS = "#1f77b4"
 C_CONE = "#9467bd"
@@ -69,7 +73,7 @@ def draw_occluder(ax):
     x0, y0, w, h = OCCL
     ax.add_patch(Rectangle((x0, y0), w, h, facecolor="0.75",
                            edgecolor="0.3", lw=1.2, zorder=4))
-    ax.annotate("geometria\n(scena)", (x0 + w / 2, y0 + h + 0.12),
+    ax.annotate("geometry\n(scene)", (x0 + w / 2, y0 + h + 0.12),
                 ha="center", va="bottom", fontsize=8, color="0.3")
 
 
@@ -81,9 +85,9 @@ def setup(ax, title):
     ax.set_title(title, fontsize=11, pad=6)
 
 
-# ---------------------------------------------------------------- Pannello A
+# ----------------------------------------------------------------- Panel A
 def panel_diffuse(ax):
-    setup(ax, "A — Termine diffuso  $D$  (vista-indipendente, già nel pipeline)")
+    setup(ax, "A — Diffuse term  $D$  (view-independent, already in the pipeline)")
     draw_sky(ax)
     draw_occluder(ax)
     draw_surface(ax)
@@ -104,15 +108,15 @@ def panel_diffuse(ax):
     ax.annotate("hit → Indirect_Generator\n(query NeRF)",
                 (7.0, 0.55), fontsize=8.5, color=C_HIT, ha="left")
     ax.annotate(r"$D = d \cdot E$,   $E=\int L\,\cos\theta\, d\omega$"
-                "   su tutto l'emisfero",
+                "   over the whole hemisphere",
                 (5.0, 6.45), ha="center", fontsize=10)
-    ax.annotate(r"in pratica:  $D \approx$ color_min  (minimo tra le camere)",
+    ax.annotate(r"in practice:  $D \approx$ color_min  (minimum across cameras)",
                 (5.0, 5.9), ha="center", fontsize=8.5, color="0.35")
 
 
-# ---------------------------------------------------------------- Pannello B
+# ----------------------------------------------------------------- Panel B
 def panel_cone(ax):
-    setup(ax, "B — Termine speculare  $L_j(r)$ :  cono attorno al raggio riflesso")
+    setup(ax, "B — Specular term  $L_j(r)$ :  cone around the reflected ray")
     draw_sky(ax)
     draw_occluder(ax)
     draw_surface(ax)
@@ -125,7 +129,7 @@ def panel_cone(ax):
                                  mutation_scale=12, color="0.2", lw=1.4, zorder=4))
     ax.annotate("$v_j$", (2.9, 2.2), fontsize=10, style="italic")
 
-    refl = 45.0  # direzione riflessa (specchio di v_j rispetto a n)
+    refl = 45.0  # reflected direction (mirror of v_j about n)
     half1, half2 = 13.0, 34.0
     ax.add_patch(Wedge(P, 4.4, refl - half1, refl + half1, color=C_CONE,
                        alpha=0.30, lw=0, zorder=2))
@@ -135,9 +139,9 @@ def panel_cone(ax):
     ax.add_patch(FancyArrowPatch(P, Rj, arrowstyle="-|>", mutation_scale=13,
                                  color=C_CONE, lw=2.0, zorder=4))
     ax.annotate("$R_j$", Rj + (0.15, 0.1), fontsize=11, color=C_CONE)
-    ax.annotate("$r$ piccolo", P + 2.45 * deg2dir(refl + half1 + 4),
+    ax.annotate("small $r$", P + 2.45 * deg2dir(refl + half1 + 4),
                 fontsize=8.5, color=C_CONE, rotation=refl)
-    ax.annotate("$r$ grande", P + 4.05 * deg2dir(refl + half2 + 5),
+    ax.annotate("large $r$", P + 4.05 * deg2dir(refl + half2 + 5),
                 fontsize=8.5, color=C_CONE, rotation=refl + 18)
 
     for a in (refl - 9, refl - 4.5, refl, refl + 4.5, refl + 9):
@@ -154,17 +158,17 @@ def panel_cone(ax):
 
     ax.annotate("miss → envmap", (5.6, 5.0), fontsize=8.5, color=C_MISS)
     ax.annotate("hit → query NeRF", (8.2, 0.5), fontsize=8.5, color=C_HIT)
-    ax.annotate(r"$L_j(r)$ = media della radianza sul cono"
-                "   (r = apertura, 0°–180°)",
+    ax.annotate(r"$L_j(r)$ = mean radiance over the cone"
+                "   (r = aperture, 0°–180°)",
                 (5.0, 6.45), ha="center", fontsize=10)
-    ax.annotate("r = 0 → singolo raggio specchio (riflesso nitido);"
-                "  r grande → riflesso sfocato",
+    ax.annotate("r = 0 → single mirror ray (sharp reflection);"
+                "  large r → blurred reflection",
                 (5.0, 5.9), ha="center", fontsize=8.5, color="0.35")
 
 
-# ---------------------------------------------------------------- Pannello C
+# ----------------------------------------------------------------- Panel C
 def panel_multicam(ax):
-    setup(ax, "C — Multi-vista:  stesso $D$, $X$, $r$  —  $L_j$ cambia con la camera")
+    setup(ax, "C — Multi-view:  same $D$, $X$, $r$  —  $L_j$ changes with the camera")
     draw_surface(ax)
     draw_normal(ax)
 
@@ -188,14 +192,14 @@ def panel_multicam(ax):
                 r"$C_3 = X\,D + (1-X)\,L_3(r)$",
                 (0.4, 5.4), fontsize=10.5, va="top",
                 bbox=dict(boxstyle="round,pad=0.45", fc="#f5f0e8", ec="0.6"))
-    ax.annotate("3 camere × 3 canali RGB = 9 equazioni,\n2 incognite (X, r)"
-                " → molto sovradeterminato",
+    ax.annotate("3 cameras × 3 RGB channels = 9 equations,\n2 unknowns (X, r)"
+                " → heavily overdetermined",
                 (9.8, 5.9), fontsize=8.5, ha="right", color="0.3")
 
 
-# ---------------------------------------------------------------- Pannello D
+# ----------------------------------------------------------------- Panel D
 def panel_solve(ax):
-    ax.set_title("D — Soluzione:  scan su $r$,  $X$ in forma chiusa", fontsize=11, pad=6)
+    ax.set_title("D — Solution:  scan over $r$,  $X$ in closed form", fontsize=11, pad=6)
     r = np.linspace(0, 180, 400)
     res = 0.05 + 0.40 * ((r - 55) / 110) ** 2 + 0.22 * np.exp(-r / 14)
     ax.plot(r, res, color="0.25", lw=1.8)
@@ -204,29 +208,34 @@ def panel_solve(ax):
     ax.plot(grid, resg, "o", color=C_CONE, ms=7, zorder=5)
     k = np.argmin(resg)
     ax.axvline(grid[k], color=C_CONE, ls="--", lw=1.2)
-    ax.annotate("$r^*$ (residuo minimo)", (grid[k] + 5, resg[k] + 0.015),
+    ax.annotate("$r^*$ (minimum residual)", (grid[k] + 5, resg[k] + 0.015),
                 fontsize=9.5, color=C_CONE)
-    ax.annotate("per ogni $r$ provato:", (98, 0.275), fontsize=9.5)
+    ax.annotate("for every candidate $r$:", (98, 0.275), fontsize=9.5)
     ax.annotate(r"$X^*(r)=\dfrac{\sum_{j,c}(C-L)(D-L)}{\sum_{j,c}(D-L)^2}$"
                 r"$\;\in[0,1]$",
                 (98, 0.255), fontsize=11, va="top",
                 bbox=dict(boxstyle="round,pad=0.45", fc="#f5f0e8", ec="0.6"))
-    ax.set_xlabel("apertura del cono  $r$  (gradi)", fontsize=10)
-    ax.set_ylabel("residuo del fit", fontsize=10)
+    ax.set_xlabel("cone aperture  $r$  (degrees)", fontsize=10)
+    ax.set_ylabel("fit residual", fontsize=10)
     ax.set_xlim(-5, 185)
     ax.set_ylim(0.0, 0.33)
     ax.spines[["top", "right"]].set_visible(False)
 
 
-fig, axs = plt.subplots(2, 2, figsize=(14.5, 10.5))
-panel_diffuse(axs[0, 0])
-panel_cone(axs[0, 1])
-panel_multicam(axs[1, 0])
-panel_solve(axs[1, 1])
-fig.suptitle(r"Stima PBR multi-vista:   $C_j = X \cdot D + (1-X)\cdot L_j(r)$"
-             "    —    $X$ = metallic (forma chiusa),  $r$ = apertura cono (scan)",
-             fontsize=13.5, y=0.985)
-fig.tight_layout(rect=(0, 0, 1, 0.965))
-out = "pbr_cone_approach.png"
-fig.savefig(out, dpi=140)
-print("salvato:", out)
+def main() -> None:
+    fig, axs = plt.subplots(2, 2, figsize=(14.5, 10.5))
+    panel_diffuse(axs[0, 0])
+    panel_cone(axs[0, 1])
+    panel_multicam(axs[1, 0])
+    panel_solve(axs[1, 1])
+    fig.suptitle(r"Multi-view PBR estimation:   $C_j = X \cdot D + (1-X)\cdot L_j(r)$"
+                 "    —    $X$ = metallic (closed form),  $r$ = cone aperture (scan)",
+                 fontsize=13.5, y=0.985)
+    fig.tight_layout(rect=(0, 0, 1, 0.965))
+    out = "pbr_cone_approach.png"
+    fig.savefig(out, dpi=140)
+    print("saved:", out)
+
+
+if __name__ == "__main__":
+    main()

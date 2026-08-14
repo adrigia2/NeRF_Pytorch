@@ -28,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent))
+import _paths  # noqa: F401
 import OptixProgrammablePasses as optix
 
 REPO = Path(__file__).resolve().parents[1] / "OptixProjectCMake"

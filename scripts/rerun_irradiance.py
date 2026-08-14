@@ -44,7 +44,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+import _paths  # noqa: F401
 
 from images_generator import _console_to_file, run_pipeline  # noqa: E402
 from roi_rerun import check_against_manifest, config_from_manifest  # noqa: E402

@@ -43,7 +43,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 
-sys.path.insert(0, str(Path(__file__).parent))
+import _paths  # noqa: F401
 
 BAKED_NAME = "skybox_nerf_baked.exr"
 # Rec.709, identico a LUMA_COEFF di compare_runs.py

@@ -34,7 +34,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent))
+import _paths  # noqa: F401
 from images_generator import (  # noqa: E402
     DataLayer, ImageFormat, _save_layer, spec_cone_level_name,
 )

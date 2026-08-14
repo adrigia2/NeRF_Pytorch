@@ -30,7 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent))
+import _paths  # noqa: F401
 
 from make_depth_figure import normal_rgb, save_png     # noqa: E402
 from make_skybox_figure import load_exr                # noqa: E402
