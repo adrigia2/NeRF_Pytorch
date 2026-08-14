@@ -5,10 +5,10 @@ Python side of a thesis project that reconstructs PBR material maps by combining
 
 The repository has two halves:
 
-- **`OptixProjectCMake/`** (sibling folder, C++/CUDA) — the OptiX ray tracing passes:
-  depth, positions, normals, masks, inverse UV mapping, visibility, baked colour
-  textures, skybox irradiance, indirect irradiance and specular cones. It is exposed to
-  Python as the module `OptixProgrammablePasses`.
+- **[`OptixProjectCMake/`](../OptixProjectCMake/README.md)** (sibling folder, C++/CUDA) — the
+  OptiX ray tracing passes: depth, positions, normals, masks, inverse UV mapping, visibility,
+  baked colour textures, skybox irradiance, indirect irradiance and specular cones. It is
+  exposed to Python as the module `OptixProgrammablePasses`.
 - **`NeRF_Pytorch/`** (this folder) — the pipeline that calls those passes, trains the
   NeRF, bakes everything into texture space and fits the PBR model.
 
@@ -76,8 +76,7 @@ Prerequisites:
 
 - Visual Studio 2022 (MSVC toolset, x64)
 - NVIDIA CUDA Toolkit
-- NVIDIA OptiX SDK 9.0.0, installed at its default path
-  `C:/ProgramData/NVIDIA Corporation/OptiX SDK 9.0.0`
+- NVIDIA OptiX SDK 9.0.0
 
 Then, from inside the activated environment:
 
@@ -86,9 +85,15 @@ pip install -e ../OptixProjectCMake
 python -c "import OptixProgrammablePasses; print('ok')"
 ```
 
-> The prebuilt wheels sitting in `OptixProjectCMake/dist/` and
-> `OptixProjectCMake/wheelhouse/` are **cp312** and cannot be installed into this
-> Python 3.10 environment. Build from source as above.
+If the SDK is not at its default path
+(`C:/ProgramData/NVIDIA Corporation/OptiX SDK 9.0.0`), point the build at it:
+
+```bash
+OPTIX_INSTALL_DIR="D:/SDKs/OptiX SDK 9.0.0" pip install -e ../OptixProjectCMake
+```
+
+See [`OptixProjectCMake/README.md`](../OptixProjectCMake/README.md) for the passes
+themselves, the architecture, and how to add one.
 
 To verify the OptiX path end to end:
 
