@@ -275,7 +275,7 @@ def _finish(fig, out: Path) -> None:
     print(f"  + {out.name}")
 
 
-# ── Figure 1-4: barre per camera, grezze e centrate ───────────────────────────
+# ── Figures 1-4: per-camera bars, raw and centred ────────────────────────────
 def fig_bars(values, means, ylim, scale, out: Path, suptitle: str, note: str,
              fmt: str = "{:.3f}") -> None:
     fig = plt.figure(figsize=(9.6, 4.6 if scale is not None else 3.9))
