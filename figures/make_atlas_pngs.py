@@ -1,19 +1,19 @@
 #!/usr/bin/env python
-"""make_atlas_pngs.py -- Converte i canali di un bake Blender in PNG per la tesi.
+"""make_atlas_pngs.py -- convert the channels of a Blender bake into PNGs for the thesis.
 
-    python make_atlas_pngs.py <cartella del bake> --out <cartella> [--channels roughness]
+    python make_atlas_pngs.py <bake folder> --out <folder> [--channels roughness]
 
-Le convenzioni non sono arbitrarie: riproducono quelle dei PNG gia' presenti in
-Doc/images/, misurate contro gli EXR sorgente.
+The conventions are not arbitrary: they reproduce those of the PNGs already in
+Doc/images/, measured against the source EXRs.
 
-  1. Il base color e' l'unico canale di COLORE e va codificato in sRGB (la curva esatta,
-     non gamma 2.2: e' quella che riproduce i file esistenti con scarto 0.0065).  Gli
-     altri tre sono DATI, non colore, e vanno scritti lineari: applicare una gamma a una
-     roughness significa mostrare un valore che non e' quello che il renderer ha usato.
+  1. The base colour is the only COLOUR channel and has to be sRGB encoded (the exact
+     curve, not gamma 2.2: that is what reproduces the existing files to within 0.0065).
+     The other three are DATA, not colour, and must be written linear: applying a gamma
+     to a roughness shows a value that is not the one the renderer used.
 
-  2. Il downsample 8192 -> 4096 e' una media di blocchi in spazio lineare.  Un
-     sottocampionamento puntuale butterebbe tre quarti del segnale autoriale e aliaserebbe
-     il resto, che e' lo stesso motivo per cui la ground truth viene ridotta cosi'.
+  2. The 8192 -> 4096 downsample is a block mean in linear space.  Point subsampling
+     would throw away three quarters of the authored signal and alias the rest, which is
+     the same reason the ground truth is reduced this way.
 """
 from __future__ import annotations
 
@@ -32,12 +32,12 @@ import _paths  # noqa: F401
 from make_skybox_figure import block_mean, load_exr
 
 CHANNELS = ("base_color", "metallic", "roughness", "normal")
-# Solo il base color e' colore: gli altri sono dati e restano lineari.
+# Only the base colour is colour: the others are data and stay linear.
 SRGB_CHANNELS = {"base_color"}
 
 
 def srgb(x: np.ndarray) -> np.ndarray:
-    """Codifica sRGB (IEC 61966-2-1), non gamma 2.2."""
+    """sRGB encoding (IEC 61966-2-1), not gamma 2.2."""
     x = np.clip(x, 0.0, 1.0)
     return np.where(x <= 0.0031308, x * 12.92, 1.055 * x ** (1 / 2.4) - 0.055)
 
@@ -45,24 +45,24 @@ def srgb(x: np.ndarray) -> np.ndarray:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("bake_dir", help="cartella con i BakedMaterial_<canale>.exr")
-    ap.add_argument("--out", required=True, help="cartella di destinazione dei PNG")
+    ap.add_argument("bake_dir", help="folder holding the BakedMaterial_<channel>.exr files")
+    ap.add_argument("--out", required=True, help="destination folder for the PNGs")
     ap.add_argument("--channels", nargs="+", default=list(CHANNELS),
-                    help=f"canali da convertire (default: {' '.join(CHANNELS)})")
+                    help=f"channels to convert (default: {' '.join(CHANNELS)})")
     ap.add_argument("--downsample", type=int, default=2,
-                    help="media di blocchi (default 2: 8192x8192 -> 4096x4096)")
+                    help="block mean (default 2: 8192x8192 -> 4096x4096)")
     args = ap.parse_args()
 
     bake, out = Path(args.bake_dir), Path(args.out)
     if not bake.is_dir():
-        print(f"ERRORE: {bake} non e' una cartella")
+        print(f"ERROR: {bake} is not a folder")
         return 2
     out.mkdir(parents=True, exist_ok=True)
 
     for ch in args.channels:
         src = bake / f"BakedMaterial_{ch}.exr"
         if not src.exists():
-            print(f"ERRORE: {src} non esiste")
+            print(f"ERROR: {src} does not exist")
             return 2
         a = block_mean(load_exr(src), args.downsample)
         rgb = srgb(a) if ch in SRGB_CHANNELS else np.clip(a, 0.0, 1.0)
@@ -70,7 +70,7 @@ def main() -> int:
         plt.imsave(dst, rgb)
         print(f"  + {dst}  {rgb.shape[1]}x{rgb.shape[0]}  "
               f"range [{a.min():.3f}, {a.max():.3f}]  "
-              f"{'sRGB' if ch in SRGB_CHANNELS else 'lineare'}")
+              f"{'sRGB' if ch in SRGB_CHANNELS else 'linear'}")
 
     return 0
 

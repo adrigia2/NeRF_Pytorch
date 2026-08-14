@@ -1,18 +1,18 @@
 #!/usr/bin/env python
-"""make_pipeline_diagram.py -- Schema a blocchi della pipeline (figura 3.1).
+"""make_pipeline_diagram.py -- block diagram of the pipeline (figure 3.1).
 
     python make_pipeline_diagram.py --out ../Doc/images/diagrams
 
-Scrive `pipeline_overview.png`.
+Writes `pipeline_overview.png`.
 
-Lo schema e' DATI, non disegno: si modifica editando `NODES` e `EDGES` qui sotto, e il
-layout viene fuori da solo.  Ogni nodo dichiara la colonna e la riga in cui sta, la
-larghezza in colonne, e a quale gruppo appartiene (il gruppo decide solo il colore).  Le
-frecce sono coppie di identificatori: non ci sono coordinate scritte a mano da nessuna
-parte, quindi spostare un blocco non richiede di risistemare le frecce.
+The diagram is DATA, not drawing: it is edited by changing `NODES` and `EDGES` below, and
+the layout follows on its own.  Each node declares the column and row it sits in, its
+width in columns, and which group it belongs to (the group only decides the colour).  The
+arrows are pairs of identifiers: there are no hand-written coordinates anywhere, so moving
+a block does not require rearranging the arrows.
 
-Le colonne sono equispaziate e le righe pure; se un blocco risulta stretto per il suo
-testo, la cosa da cambiare e' `COL_W` o il testo, non la posizione.
+The columns are equally spaced and so are the rows; if a block turns out too narrow for
+its text, the thing to change is `COL_W` or the text, not the position.
 """
 from __future__ import annotations
 
@@ -28,14 +28,14 @@ plt.rcParams.update({"font.size": 13})
 
 DPI = 190
 
-# ── Aspetto ──────────────────────────────────────────────────────────────────
-# Le misure sono in POLLICI e la figura viene dimensionata perche' una unita' dati valga
-# esattamente un pollice.  Serve a poter ragionare sulla larghezza di una scatola in
-# punti tipografici: con unita' arbitrarie il testo sborda appena si cambia figsize, ed
-# e' esattamente cio' che succedeva prima.
-COL_W, COL_GAP = 2.05, 0.62      # larghezza di una colonna e spazio fra colonne
-ROW_H, ROW_GAP = 0.88, 0.34      # altezza di una riga e spazio fra righe
-FONT = 11                        # a 11pt una riga di ~20 caratteri sta in COL_W
+# ── Appearance ───────────────────────────────────────────────────────────────
+# The measurements are in INCHES and the figure is sized so that one data unit is exactly
+# one inch.  That makes it possible to reason about a box's width in typographic points:
+# with arbitrary units the text overflows as soon as figsize changes, which is exactly
+# what used to happen.
+COL_W, COL_GAP = 2.05, 0.62      # column width and gap between columns
+ROW_H, ROW_GAP = 0.88, 0.34      # row height and gap between rows
+FONT = 11                        # at 11pt a line of ~20 characters fits in COL_W
 MARGIN = 0.22
 
 STYLE = {
@@ -46,7 +46,7 @@ STYLE = {
     "output": dict(fc="#dcf0dc", ec="#2ca02c", tc="#12470f"),
 }
 
-# id, colonna, riga, larghezza in colonne, gruppo, testo
+# id, column, row, width in columns, group, text
 NODES = [
     ("img",   0, 2.0, 1, "input",  "Multi-view images\nwith known poses"),
     ("mesh",  0, 1.0, 1, "input",  "Scene mesh\n(UV-unwrapped)"),
@@ -96,20 +96,20 @@ def main() -> int:
     ys = [r[1] for r in rects.values()] + [r[1] + r[3] for r in rects.values()]
     w, h = max(xs) - min(xs), max(ys) - min(ys)
 
-    # Una unita' dati = un pollice: figsize e limiti sono coerenti per costruzione
+    # One data unit = one inch: figsize and limits are consistent by construction
     fig, ax = plt.subplots(figsize=(w + 2 * MARGIN, h + 2 * MARGIN))
 
     for a, b in EDGES:
         xa, ya, wa, ha, _, _ = rects[a]
         xb, yb, wb, hb, _, _ = rects[b]
         if abs(xa - xb) < 1e-9:
-            # Stessa colonna: l'arco va verticale, altrimenti esce a destra e rientra
-            # a sinistra facendo il giro attorno al blocco.
+            # Same column: the arc goes vertical, otherwise it leaves on the right and
+            # comes back on the left, going around the block.
             up = yb > ya
             p0 = (xa + wa / 2, ya + (ha if up else 0.0))
             p1 = (xb + wb / 2, yb + (0.0 if up else hb))
-            # Curvatura marcata: un connettore verticale dritto passerebbe dietro il
-            # blocco interposto e si leggerebbe come due archi separati.
+            # Pronounced curvature: a straight vertical connector would pass behind the
+            # intervening block and read as two separate arcs.
             rad = 0.55
         else:
             p0, p1, rad = (xa + wa, ya + ha / 2), (xb, yb + hb / 2), 0.06
@@ -133,7 +133,7 @@ def main() -> int:
     path = out / "pipeline_overview.png"
     fig.savefig(path, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
-    print(f"  {path.name}  ({len(NODES)} blocchi, {len(EDGES)} archi)")
+    print(f"  {path.name}  ({len(NODES)} blocks, {len(EDGES)} arcs)")
     return 0
 
 

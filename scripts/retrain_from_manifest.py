@@ -1,22 +1,22 @@
 #!/usr/bin/env python
-"""Riallena le scene di uno sweep esistente in una cartella nuova, cambiando pochi parametri.
+"""Retrain the scenes of an existing sweep into a new folder, changing a few parameters.
 
-Serve a rispondere a domande del tipo "il NeRF si allena anche senza questo
-iperparametro?" senza toccare le run di riferimento: la configurazione viene
-ricostruita dal `run_manifest.json` di ogni scena, così l'unica differenza fra il
-braccio nuovo e quello vecchio è ciò che si sovrascrive esplicitamente da riga di
+It answers questions of the form "does the NeRF still train without this
+hyper-parameter?" without touching the reference runs: the configuration is rebuilt
+from each scene's `run_manifest.json`, so the only difference between the new arm and
+the old one is whatever is overridden explicitly on the command line.
 comando. Ritrascrivere la config a mano invaliderebbe il confronto.
 
-Esegue solo Step 1 e Step 2 (più lo Step 2b se il manifest lo prevede): la
-ricostruzione texture-space non c'entra e costerebbe ore.
+Only Step 1 and Step 2 are run (plus Step 2b when the manifest calls for it): the
+texture-space reconstruction is beside the point and would cost hours.
 
 Uso:
     python retrain_from_manifest.py <src_root> <dst_root> \
         --iters 10000 --raw-noise-std 0.0 [--configs exp_l1_d02 ...] [--scenes ...]
 
-`src_root` è la radice di uno sweep, cioè <root>/<config>/<scena>/run_manifest.json;
-la stessa struttura viene replicata sotto `dst_root`. Le run girano in SEQUENZA:
-la GPU è una sola.
+`src_root` is the root of a sweep, i.e. <root>/<config>/<scene>/run_manifest.json;
+the same structure is replicated under `dst_root`. The runs go in SEQUENCE: there is
+only one GPU.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ from roi_rerun import config_from_manifest  # noqa: E402
 
 
 def find_runs(src: Path, configs, scenes) -> "list[tuple[str, str, Path]]":
-    """(config, scena, manifest) per ogni run trovata sotto src_root."""
+    """(config, scene, manifest) for every run found under src_root."""
     out = []
     for cfg_dir in sorted(p for p in src.glob("*") if p.is_dir()):
         if configs and cfg_dir.name not in configs:
@@ -58,14 +58,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("src_root", help="radice dello sweep di riferimento")
-    ap.add_argument("dst_root", help="radice nuova (viene creata)")
+    ap.add_argument("dst_root", help="the new root (it gets created)")
     ap.add_argument("--iters", type=int, default=10000)
     ap.add_argument("--raw-noise-std", type=float, default=0.0)
     ap.add_argument("--configs", nargs="*", default=None, help="filtra le config")
     ap.add_argument("--scenes", nargs="*", default=None, help="filtra le scene")
     ap.add_argument("--step2b", choices=("keep", "on", "off"), default="keep",
-                    help="render dei frame di training col modello (default: come il manifest)")
-    ap.add_argument("--note", default="", help="nota da salvare nel manifest nuovo")
+                    help="render the training frames with the model (default: as in the manifest)")
+    ap.add_argument("--note", default="", help="note to store in the new manifest")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -91,7 +91,7 @@ def main() -> int:
         out_dir = dst / conf / scene_name
         cfg, manifest, notes = config_from_manifest(man)
 
-        # Override: solo gli step, la durata, l'iperparametro in prova e i path.
+        # Override: only the steps, the length, the hyper-parameter under test and the paths.
         cfg.run_step1 = cfg.run_step2 = True
         cfg.run_step3 = cfg.run_step4 = False
         cfg.resume_skip_step2_if_ckpt = False
@@ -100,7 +100,7 @@ def main() -> int:
         cfg.nerf_raw_noise_std = args.raw_noise_std
         if args.step2b != "keep":
             cfg.enable_nerf_render_train_images = (args.step2b == "on")
-        # I path derivati devono ripartire da output_dir, non dal manifest vecchio.
+        # The derived paths must start from output_dir, not from the old manifest.
         cfg.nerf_ckpt_path = ""
         cfg.nerf_train_output_dir = ""
         cfg.nerf_render_train_images_dir = ""

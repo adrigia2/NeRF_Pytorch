@@ -1,26 +1,26 @@
-"""nerf_viewer.py — viewer interattivo di novel view per il NeRF allenato.
+"""nerf_viewer.py — interactive novel-view viewer for the trained NeRF.
 
-Pipeline per frame:  posa orbit → OptiX DepthGenerator (depth della mesh)
-                     → nerf.render_image (depth-guided) → tonemap → finestra cv2.
+Per-frame pipeline:  orbit pose → OptiX DepthGenerator (mesh depth)
+                     → nerf.render_image (depth-guided) → tonemap → cv2 window.
 
-Uso:
+Usage:
     python nerf_viewer.py --ckpt <nerf_model_cache.pt> \
                           --transforms <transforms_extended.json> \
                           --obj <model.obj> [--res 256] [--chunk N]
 
-Comandi (finestra attiva):
-    A / D       orbita in azimut
-    W / S       orbita in elevazione
+Controls (with the window focused):
+    A / D       orbit in azimuth
+    W / S       orbit in elevation
     Q / E       zoom out / in
-    ← / →       pan del centro dell'orbita: sinistra / destra (right della camera)
-    ↑ / ↓       pan del centro dell'orbita: avanti / indietro (forward della camera)
-    + / -       esposizione (±0.5 EV)
-    H           render alla risoluzione del dataset (lento, una tantum)
-    R           ricarica il checkpoint da disco
-    T           toggle watch-mode: ricarica automatica quando il ckpt cambia
-                (utile con il training in corso, che salva ogni display_every)
-    X           salva la vista corrente (EXR lineare + PNG tonemappato)
-    ESC         esci
+    ← / →       pan the orbit centre: left / right (the camera's right)
+    ↑ / ↓       pan the orbit centre: forward / backward (the camera's forward)
+    + / -       exposure (±0.5 EV)
+    H           render at the dataset resolution (slow, one-off)
+    R           reload the checkpoint from disk
+    T           toggle watch mode: reload automatically when the ckpt changes
+                (useful while training runs, since it saves every display_every)
+    X           save the current view (linear EXR + tonemapped PNG)
+    ESC         quit
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ DEPTH_MISS_SENTINEL = 1e10
 def _orbit_c2w(center: np.ndarray, radius: float, az: float, el: float) -> np.ndarray:
     """Posa camera-to-world 4×4 (convenzione NeRF: -Z forward) in orbita attorno a center.
 
-    az=0, el=0 → camera sul lato -Y che guarda verso +Y (forward di Blender).
+    az=0, el=0 → camera on the -Y side looking towards +Y (Blender's forward).
     """
     ce, se = np.cos(el), np.sin(el)
     offset = np.array([ce * np.sin(az), -ce * np.cos(az), se], dtype=np.float32)
@@ -60,7 +60,7 @@ def _orbit_c2w(center: np.ndarray, radius: float, az: float, el: float) -> np.nd
 
 
 def _orbit_from_pose(pose: np.ndarray, center: np.ndarray) -> tuple[float, float, float]:
-    """(radius, az, el) della posa rispetto al centro — inverso di _orbit_c2w."""
+    """(radius, az, el) of the pose relative to the centre — the inverse of _orbit_c2w."""
     off = pose[:3, 3] - center
     radius = float(np.linalg.norm(off))
     d = off / max(radius, 1e-8)
@@ -70,7 +70,7 @@ def _orbit_from_pose(pose: np.ndarray, center: np.ndarray) -> tuple[float, float
 
 
 def _tonemap(img: np.ndarray, ev: float) -> np.ndarray:
-    """HDR lineare → uint8 BGR per display: esposizione, Reinhard, gamma 2.2."""
+    """Linear HDR → uint8 BGR for display: exposure, Reinhard, gamma 2.2."""
     x = np.clip(img, 0.0, None) * (2.0 ** ev)
     x = x / (1.0 + x)
     x = np.clip(x, 0.0, 1.0) ** (1.0 / 2.2)
@@ -112,9 +112,9 @@ class NerfViewer:
         self.data_h  = int(data["h"])
         self.fl_x    = float(data["fl_x"])
         self.fl_y    = float(data.get("fl_y", data["fl_x"]))
-        self.fovy    = float(data["camera_angle_y"])  # radianti, come in Step 1/3
+        self.fovy    = float(data["camera_angle_y"])  # radians, as in Steps 1 and 3
 
-        # Risoluzione di preview: lato lungo = res, aspect del dataset
+        # Preview resolution: long side = res, dataset aspect ratio
         scale = res / max(self.data_w, self.data_h)
         self.vw = max(1, round(self.data_w * scale))
         self.vh = max(1, round(self.data_h * scale))
@@ -127,7 +127,7 @@ class NerfViewer:
         self.depth_gen.need_render_position(False)
         self.depth_gen.need_render_normal(False)
 
-        # Orbit iniziale: stessa inquadratura del primo frame di training
+        # Initial orbit: the same framing as the first training frame
         center = self.bundle[4].cpu().numpy().astype(np.float32)
         pose0 = np.array(data["frames"][0]["transform_matrix"], dtype=np.float32)
         self.center = center
@@ -201,8 +201,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Viewer interattivo NeRF (OptiX depth + render depth-guided)")
     ap.add_argument("--ckpt",       required=True, help="checkpoint NeRF (nerf_model_cache.pt)")
     ap.add_argument("--transforms", required=True, help="transforms_extended.json dello Step 1")
-    ap.add_argument("--obj",        required=True, help="mesh OBJ della scena")
-    ap.add_argument("--res",   type=int, default=256, help="lato lungo della preview (default 256)")
+    ap.add_argument("--obj",        required=True, help="the scene's OBJ mesh")
+    ap.add_argument("--res",   type=int, default=256, help="long side of the preview (default 256)")
     ap.add_argument("--chunk", type=int, default=None, help="override cfg.chunk (riduci se VRAM scarsa)")
     args = ap.parse_args()
 
@@ -244,8 +244,8 @@ def main() -> None:
             cv2.imshow(win, disp)
             dirty = False
 
-        kraw = cv2.waitKeyEx(50)          # waitKeyEx: serve per i codici estesi (frecce)
-        k = (kraw & 0xFF) if kraw != -1 else 255   # valore mascherato per i tasti ASCII
+        kraw = cv2.waitKeyEx(50)          # waitKeyEx: needed for the extended codes (arrows)
+        k = (kraw & 0xFF) if kraw != -1 else 255   # masked value, for the ASCII keys
         if k == 27:                       # ESC
             break
         elif k in (ord("a"), ord("A")):
@@ -260,7 +260,7 @@ def main() -> None:
             viewer.radius *= ZOOM; dirty = True
         elif k in (ord("e"), ord("E")):
             viewer.radius /= ZOOM; dirty = True
-        # frecce: pan del centro dell'orbita relativo all'orientamento della camera (3D pieno)
+        # arrows: pan the orbit centre relative to the camera orientation (full 3D)
         elif kraw in (65361, 2424832, 65363, 2555904,    # left / right
                       65362, 2490368, 65364, 2621440):   # up / down
             c2w_cur = _orbit_c2w(viewer.center, viewer.radius, viewer.az, viewer.el)
@@ -271,7 +271,7 @@ def main() -> None:
                 viewer.center -= cam_right * step
             elif kraw in (65363, 2555904):    # →  destra
                 viewer.center += cam_right * step
-            elif kraw in (65362, 2490368):    # ↑  avanti (lungo il forward della camera)
+            elif kraw in (65362, 2490368):    # ↑  forward (along the camera's forward)
                 viewer.center += cam_fwd * step
             else:                             # ↓  indietro
                 viewer.center -= cam_fwd * step

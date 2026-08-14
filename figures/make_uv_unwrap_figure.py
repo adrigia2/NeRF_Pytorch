@@ -1,26 +1,27 @@
 #!/usr/bin/env python
-"""make_uv_unwrap_figure.py -- I due pannelli della figura 3.3.
+"""make_uv_unwrap_figure.py -- the two panels of figure 3.3.
 
     python make_uv_unwrap_figure.py <run_dir> --world C:/.../positional_image.exr \
         --out ../Doc/images/ium
 
-Scrive due PNG:
+Writes two PNGs:
 
-  uv_unwrap_world.png   la mesh disegnata dalle posizioni dei suoi vertici in world space
-  uv_unwrap_uv.png      la stessa mesh alle sue coordinate UV, cioe' la ium_positions
-                        della run, che e' la posizione world scritta nello spazio texture
+  uv_unwrap_world.png   the mesh drawn from the world-space positions of its vertices
+  uv_unwrap_uv.png      the same mesh at its UV coordinates, i.e. the run's ium_positions,
+                        which is the world position written into texture space
 
-**La mappatura e' l'identita', non una normalizzazione.**  I due pannelli mostrano una
-coordinata, non una radianza: riscalare per canale sull'estensione della geometria, come
-fa `position_rgb` in make_depth_figure.py, produrrebbe due immagini con due fattori
-diversi, e il lettore le confronterebbe credendo di vedere lo stesso colore per lo stesso
-punto.  Qui il valore va sul pixel com'e': i negativi vengono portati a zero e quello che
-supera 1 satura, che e' l'unica cosa che un PNG a 8 bit possa fare.  Nessuna gamma, per
-la stessa ragione per cui non ce n'e' nella figura dei layer di depth.
+**The mapping is the identity, not a normalization.**  The two panels show a coordinate,
+not a radiance: rescaling per channel over the extent of the geometry, as `position_rgb`
+in make_depth_figure.py does, would produce two images with two different factors, and
+the reader would compare them believing the same colour meant the same point.  Here the
+value goes to the pixel as it is: negatives are brought to zero and anything above 1
+saturates, which is all an 8-bit PNG can do.  No gamma, for the same reason there is
+none in the depth-layer figure.
 
-Conseguenza da tenere presente leggendo la figura: le parti della scena a coordinata
-negativa risultano nere in quel canale, e quelle oltre 1 saturano.  E' voluto: dice dove
-sta la geometria rispetto all'origine, cosa che una versione riscalata nasconde.
+A consequence to keep in mind when reading the figure: the parts of the scene at a
+negative coordinate come out black in that channel, and those beyond 1 saturate.  That is
+deliberate: it says where the geometry sits relative to the origin, which a rescaled
+version hides.
 """
 from __future__ import annotations
 
@@ -35,17 +36,17 @@ import _paths  # noqa: F401
 from make_depth_figure import position_rgb, save_png   # noqa: E402
 from make_skybox_figure import load_exr                # noqa: E402
 
-# La mappatura vive in `position_rgb` (make_depth_figure.py) e non e' duplicata qui:
-# e' la stessa convenzione di tutte le mappe di posizione della tesi, e averne due
-# implementazioni vorrebbe dire poterle far divergere senza accorgersene.
+# The mapping lives in `position_rgb` (make_depth_figure.py) and is not duplicated here:
+# it is the same convention as every position map in the thesis, and having two
+# implementations would mean being able to let them diverge unnoticed.
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("run_dir", help="run da cui prendere ium/ium_positions.exr")
+    ap.add_argument("run_dir", help="run to take ium/ium_positions.exr from")
     ap.add_argument("--world", required=True,
-                    help="EXR della mesh disegnata dalle posizioni dei vertici")
+                    help="EXR of the mesh drawn from its vertex positions")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 

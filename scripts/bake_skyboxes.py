@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""bake_skyboxes.py — Bake della skybox NeRF per tutte le run di uno sweep.
+"""bake_skyboxes.py — bake the NeRF skybox for every run of a sweep.
 
-Produce lo stesso `skybox_nerf_baked.exr` dello Step 3 senza eseguire nulla del resto
-della pipeline texture-space (niente OptiX, niente mesh, niente transforms.json):
-serve solo il checkpoint `<run_dir>/model/nerf_model_cache.pt`, da cui si legge la
-bg-sphere del NeRF. Il bake è di qualche decina di secondi per run a 4096x2048.
+Produces the same `skybox_nerf_baked.exr` as Step 3 without running any of the rest of
+the texture-space pipeline (no OptiX, no mesh, no transforms.json): all it needs is the
+checkpoint `<run_dir>/model/nerf_model_cache.pt`, from which the NeRF background sphere
+is read. The bake takes a few tens of seconds per run at 4096x2048.
 
-Se una skybox HDR ground-truth è disponibile (opzione --gt oppure skybox_path nel
-run_manifest.json della run), genera anche `<run_dir>/skybox_compare/skybox_heatmap.png`,
-identico a quello prodotto dallo Step 3 con compare_skybox_to_gt=True.
+When a ground-truth HDR skybox is available (the --gt option, or skybox_path in the
+run's run_manifest.json), it also writes `<run_dir>/skybox_compare/skybox_heatmap.png`,
+identical to the one Step 3 produces with compare_skybox_to_gt=True.
 
 Uso:
   python bake_skyboxes.py <root> [--gt GT.exr] [--force] [--size W H] [--yaw DEG] [--dry-run]
 
-  <root>    : root di uno sweep (contiene <tag>/<scena>/model/...) oppure una singola run dir.
-  --gt      : HDR equirettangolare di riferimento per la heatmap di confronto.
-  --force   : rifà bake e heatmap anche dove i file esistono già (default: skip).
-  --size    : override di skybox_size; default = quello del run_manifest.json (o 4096 2048).
-  --yaw     : override di skybox_yaw_degrees; default = quello del manifest (o 0.0).
-  --dry-run : elenca le run trovate e cosa verrebbe fatto, senza caricare torch.
+  <root>    : the root of a sweep (holding <tag>/<scene>/model/...) or a single run dir.
+  --gt      : reference equirectangular HDR for the comparison heatmap.
+  --force   : redo bake and heatmap even where the files exist (default: skip).
+  --size    : override skybox_size; default = the one in run_manifest.json (or 4096 2048).
+  --yaw     : override skybox_yaw_degrees; default = the manifest's (or 0.0).
+  --dry-run : list the runs found and what would be done, without importing torch.
 
 Esempi:
   conda run --no-capture-output -n nerfpytorch python -u bake_skyboxes.py ^
@@ -43,11 +43,11 @@ DEFAULT_YAW    = 0.0
 
 
 # ---------------------------------------------------------------------------
-# Discovery e parametri per-run
+# Discovery and per-run parameters
 # ---------------------------------------------------------------------------
 
 def find_run_dirs(root: Path) -> list[Path]:
-    """Run dir (parent di model/nerf_model_cache.pt) sotto root, a profondità 0/1/2."""
+    """Run dirs (the parent of model/nerf_model_cache.pt) under root, at depth 0/1/2."""
     found = set()
     for pattern in (CKPT_REL, Path("*") / CKPT_REL, Path("*") / "*" / CKPT_REL):
         for ckpt in root.glob(pattern.as_posix()):
@@ -68,7 +68,7 @@ def _read_manifest(run_dir: Path) -> dict:
 
 
 def resolve_params(run_dir: Path, size_override, yaw_override) -> tuple[int, int, float, str]:
-    """(width, height, yaw_degrees, gt_path) per la run, dal manifest con override CLI."""
+    """(width, height, yaw_degrees, gt_path) for the run, from the manifest with CLI overrides."""
     manifest = _read_manifest(run_dir)
     render   = manifest.get("config", {}).get("render", {})
     scene    = manifest.get("scene", {})
@@ -81,15 +81,15 @@ def resolve_params(run_dir: Path, size_override, yaw_override) -> tuple[int, int
 
 
 # ---------------------------------------------------------------------------
-# Passi per-run
+# Per-run steps
 # ---------------------------------------------------------------------------
 
 def bake_one(run_dir: Path, width: int, height: int, yaw: float) -> None:
-    """Scrive <run_dir>/skybox_nerf_baked.exr riusando il bake della pipeline."""
+    """Write <run_dir>/skybox_nerf_baked.exr, reusing the pipeline's bake."""
     from images_generator import RenderConfig, _bake_skybox_from_nerf
 
     rc = RenderConfig(
-        transforms_path    = "",          # non letti sul percorso di bake
+        transforms_path    = "",          # not read on the bake path
         model_path         = "",
         output_dir         = str(run_dir),
         skybox_source      = "nerf",
@@ -123,18 +123,18 @@ def compare_one(run_dir: Path, gt_path: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Bake della skybox NeRF per tutte le run di uno sweep (solo checkpoint, niente Step 3).")
+        description="Bake the NeRF skybox for every run of a sweep (checkpoint only, no Step 3).")
     parser.add_argument("root", type=Path, help="root dello sweep o singola run dir")
     parser.add_argument("--gt", type=Path, default=None,
-                        help="HDR ground-truth per la heatmap di confronto")
+                        help="ground-truth HDR for the comparison heatmap")
     parser.add_argument("--force", action="store_true",
-                        help="rifà bake e heatmap anche se i file esistono")
+                        help="redo bake and heatmap even when the files exist")
     parser.add_argument("--size", type=int, nargs=2, metavar=("W", "H"), default=None,
                         help="override di skybox_size (default: dal run_manifest.json)")
     parser.add_argument("--yaw", type=float, default=None,
                         help="override di skybox_yaw_degrees (default: dal run_manifest.json)")
     parser.add_argument("--dry-run", action="store_true",
-                        help="elenca cosa verrebbe fatto senza caricare torch")
+                        help="list what would be done without importing torch")
     args = parser.parse_args()
 
     root = args.root.resolve()
@@ -153,7 +153,7 @@ def main() -> int:
 
     print(f"[bake] {len(run_dirs)} run trovate sotto {root}", flush=True)
 
-    # Le funzioni della pipeline stanno accanto a questo file.
+    # The pipeline functions live next to this file.
     import _paths  # noqa: F401
 
     n_baked = n_skipped = n_failed = 0

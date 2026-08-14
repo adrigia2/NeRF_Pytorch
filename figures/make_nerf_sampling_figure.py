@@ -1,23 +1,23 @@
 #!/usr/bin/env python
-"""make_nerf_sampling_figure.py -- Le due strategie di campionamento (figura 3.14).
+"""make_nerf_sampling_figure.py -- the two sampling strategies (figure 3.14).
 
     python make_nerf_sampling_figure.py --out ../Doc/images/diagrams
 
-Scrive due PNG, uno per sottofigura:
+Writes two PNGs, one per subfigure:
 
-  sampling_traditional.png   NeRF classico: coarse uniforme + fine per importance
-  sampling_depth_guided.png  il nostro: pochi campioni in una fetta attorno alla depth
+  sampling_traditional.png   classic NeRF: uniform coarse + importance-driven fine
+  sampling_depth_guided.png  ours: a few samples in a slab around the depth
 
-Il pannello di sinistra riproduce il campionamento gerarchico del NeRF originale, non un
-generico "tanti punti": prima una passata coarse stratificata su tutto l'intervallo
-[t_near, t_far], poi una fine ridistribuita secondo i pesi della coarse, che si addensa
-dove la densita' e' alta.  Disegnarne solo una delle due darebbe l'idea sbagliata, cioe'
-che il NeRF sprechi campioni per ingenuita' invece che per non sapere dove sia la
-superficie.
+The left panel reproduces the hierarchical sampling of the original NeRF, not a generic
+"lots of points": first a coarse pass stratified over the whole interval [t_near, t_far],
+then a fine one redistributed according to the coarse weights, which concentrates where
+the density is high.  Drawing only one of the two would give the wrong impression, namely
+that the NeRF wastes samples out of naivety rather than out of not knowing where the
+surface is.
 
-Il pannello di destra usa i numeri veri della configurazione operativa: finestra
-`depth_window` = 0.05 attorno alla distanza restituita dal pass di depth, e 5 campioni
-per raggio, gli stessi che finiscono in `tab:results-config`.
+The right panel uses the real numbers of the operational configuration: a `depth_window`
+of 0.05 around the distance returned by the depth pass, and 5 samples per ray, the same
+ones that end up in `tab:results-config`.
 """
 from __future__ import annotations
 
@@ -35,13 +35,13 @@ plt.rcParams.update({"font.size": 13})
 
 DPI = 190
 
-# ── Parametri ────────────────────────────────────────────────────────────────
-T_NEAR, T_FAR = 0.0, 1.0       # intervallo del raggio, in unita' arbitrarie
-T_SURF = 0.62                  # dove sta la superficie
-N_COARSE, N_FINE = 32, 24      # NeRF originale: due passate
-DEPTH_WINDOW = 0.05            # RenderConfig / NerfConfig: +- attorno alla depth
-N_GUIDED = 5                   # campioni per raggio della nostra pipeline
-SIGMA_FINE = 0.055             # larghezza della gaussiana dei pesi della coarse
+# ── Parameters ───────────────────────────────────────────────────────────────
+T_NEAR, T_FAR = 0.0, 1.0       # the ray's interval, in arbitrary units
+T_SURF = 0.62                  # where the surface sits
+N_COARSE, N_FINE = 32, 24      # original NeRF: two passes
+DEPTH_WINDOW = 0.05            # RenderConfig / NerfConfig: +- around the depth
+N_GUIDED = 5                   # samples per ray in our pipeline
+SIGMA_FINE = 0.055             # width of the Gaussian of the coarse weights
 
 C_RAY   = "#33404d"
 C_CO    = "#5b9bd5"
@@ -59,7 +59,7 @@ def ray_axis(ax, y=0.0, label_surface=True):
     ax.text(T_NEAR - 0.09, y + 0.10, r"$\mathbf{o}$", ha="center", va="bottom",
             fontsize=15, fontweight="bold", color=C_RAY)
     ax.text(T_FAR + 0.10, y, r"$t$", ha="left", va="center", fontsize=15, color=C_RAY)
-    # La superficie: una banda, non una linea, perche' e' spessa quanto la geometria
+    # The surface: a band, not a line, because it is as thick as the geometry
     ax.axvspan(T_SURF, T_SURF + 0.035, color=C_SURF, zorder=1)
     if label_surface:
         ax.text(T_SURF + 0.018, -0.88, "surface", ha="center", va="bottom",
@@ -77,7 +77,7 @@ def fig_traditional(out: Path) -> None:
     fig, ax = plt.subplots(figsize=(5.6, 2.9))
     ray_axis(ax)
 
-    # Coarse: stratificato uniforme su tutto l'intervallo
+    # Coarse: uniformly stratified over the whole interval
     edges = np.linspace(T_NEAR, T_FAR, N_COARSE + 1)
     t_coarse = 0.5 * (edges[:-1] + edges[1:])
     ax.scatter(t_coarse, np.full_like(t_coarse, 0.44), s=26, color=C_CO,
@@ -85,9 +85,9 @@ def fig_traditional(out: Path) -> None:
     ax.text(T_NEAR - 0.16, 0.44, "coarse", ha="right", va="center",
             fontsize=11, color=C_CO)
 
-    # Fine: ridistribuita sui pesi della coarse, quindi addensata sulla superficie.
-    # Si campiona la CDF di una gaussiana centrata sulla superficie: e' la forma che i
-    # pesi assumono una volta che la coarse ha trovato dove sta la densita'.
+    # Fine: redistributed over the coarse weights, hence concentrated on the surface.
+    # The CDF of a Gaussian centred on the surface is sampled: that is the shape the
+    # weights take once the coarse pass has found where the density is.
     q = (np.arange(N_FINE) + 0.5) / N_FINE
     t_fine = np.clip(T_SURF + SIGMA_FINE * np.sqrt(2) * _erfinv(2 * q - 1),
                      T_NEAR, T_FAR)
@@ -99,11 +99,11 @@ def fig_traditional(out: Path) -> None:
     frame(ax, f"{N_COARSE} coarse over the whole ray, then {N_FINE} fine")
     fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
-    print(f"  {out.name}  ({N_COARSE}+{N_FINE} campioni)")
+    print(f"  {out.name}  ({N_COARSE}+{N_FINE} samples)")
 
 
 def _erfinv(y):
-    """Inversa della erf, senza tirarsi dietro scipy per due dozzine di punti."""
+    """Inverse erf, without dragging in scipy for two dozen points."""
     a = 0.147
     ln = np.log(1 - y * y)
     tt1 = 2 / (np.pi * a) + ln / 2
@@ -136,7 +136,7 @@ def fig_depth_guided(out: Path) -> None:
     frame(ax, f"{N_GUIDED} samples in a slab around the surface")
     fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
-    print(f"  {out.name}  ({N_GUIDED} campioni, finestra ±{DEPTH_WINDOW})")
+    print(f"  {out.name}  ({N_GUIDED} samples, window ±{DEPTH_WINDOW})")
 
 
 def main() -> int:
@@ -146,7 +146,7 @@ def main() -> int:
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    print(f"Campionamento NeRF → {out.resolve()}")
+    print(f"NeRF sampling → {out.resolve()}")
     fig_traditional(out / "sampling_traditional.png")
     fig_depth_guided(out / "sampling_depth_guided.png")
     return 0

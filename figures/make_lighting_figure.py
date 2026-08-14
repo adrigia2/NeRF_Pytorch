@@ -1,29 +1,29 @@
 #!/usr/bin/env python
-"""make_lighting_figure.py -- Le due condizioni di luce del capitolo Results.
+"""make_lighting_figure.py -- the two lighting conditions of the Results chapter.
 
     python make_lighting_figure.py --out ../Doc/images/lighting
 
-Scrive quattro PNG:
+Writes four PNGs:
 
-  skybox_studio.png / skybox_night.png     le due environment map, tonemappate
-  heat_studio.png   / heat_night.png       la norma ||c|| di ogni pixel, in falsi colori
+  skybox_studio.png / skybox_night.png     the two environment maps, tonemapped
+  heat_studio.png   / heat_night.png       the norm ||c|| of every pixel, in false colour
 
-Due convenzioni, ognuna scelta per una ragione precisa.
+Two conventions, each chosen for a definite reason.
 
-**I due pannelli tonemappati NON condividono l'esposizione.**  Sono due ambienti diversi,
-non due versioni della stessa scena: una esposizione comune renderebbe la notturna un
-rettangolo nero e non direbbe nulla su come e' fatta.  Ognuna porta la propria mediana al
-livello di riferimento, esattamente come fa il resto del capitolo.
+**The two tonemapped panels do NOT share an exposure.**  They are two different
+environments, not two versions of the same scene: a common exposure would turn the night
+one into a black rectangle and say nothing about what it looks like.  Each brings its own
+median to the reference level, exactly as the rest of the chapter does.
 
-**Le due heatmap la condividono, ed e' logaritmica.**  Qui il soggetto e' il confronto: e'
-guardando la stessa scala che si vede che la notturna e' complessivamente piu' fioca e
-molto piu' concentrata.  La scala e' logaritmica perche' la dinamica di questi envmap
-copre parecchi ordini di grandezza; in lineare la heatmap sarebbe nera con qualche punto
-bianco, cioe' l'informazione che serve, dove sta l'energia, andrebbe persa proprio dove e'
-interessante.
+**The two heatmaps do share one, and it is logarithmic.**  Here the subject is the
+comparison: it is by looking at the same scale that one sees the night map is overall
+dimmer and far more concentrated.  The scale is logarithmic because the dynamic range of
+these envmaps spans several orders of magnitude; in linear the heatmap would be black with
+a few white dots, so the information that matters — where the energy is — would be lost
+exactly where it is interesting.
 
-Il valore mappato e' la norma euclidea del pixel, non la luminanza: qui interessa quanta
-radianza arriva da quella direzione, non come la percepirebbe un occhio.
+The mapped value is the pixel's Euclidean norm, not its luminance: what matters here is
+how much radiance arrives from that direction, not how an eye would perceive it.
 """
 from __future__ import annotations
 
@@ -45,9 +45,9 @@ from make_skybox_figure import LUMA_COEFF, block_mean, load_exr, tonemap  # noqa
 plt.rcParams.update({"font.size": 13})
 
 DPI = 190
-DOWNSAMPLE = 2          # le sorgenti sono 4k equirettangolari
-KEY = 0.5               # livello a cui portare la mediana prima del Reinhard
-FLOOR_PCTL = 1.0        # percentile che fissa il fondo della scala condivisa
+DOWNSAMPLE = 2          # the sources are 4k equirectangular
+KEY = 0.5               # level the median is brought to before the Reinhard
+FLOOR_PCTL = 1.0        # percentile that sets the floor of the shared scale
 CMAP = "inferno"
 
 HDR_DIR = Path("C:/Users/adria/Documents/GitHub/Tesi/OptixProjectCMake/Scenes/"
@@ -57,8 +57,8 @@ MAPS = [("studio", HDR_DIR / "wooden_studio_13_4k.exr"),
 
 
 def own_exposure(img: np.ndarray) -> float:
-    """Esposizione che porta la mediana della luminanza a KEY.  La mediana e non il
-    massimo: in una envmap il picco sta sulle sorgenti e detterebbe da solo il tonemap."""
+    """Exposure that brings the median luminance to KEY.  The median and not the maximum:
+    in an envmap the peak sits on the light sources and would dictate the tonemap alone."""
     med = max(float(np.median((img * LUMA_COEFF).sum(-1))), 1e-6)
     return KEY / med
 
@@ -88,33 +88,33 @@ def main() -> int:
     imgs, norms = {}, {}
     for name, p in MAPS:
         if not p.exists():
-            raise SystemExit(f"✗ non trovata: {p}")
+            raise SystemExit(f"✗ not found: {p}")
         a = block_mean(load_exr(p), args.downsample)
         imgs[name] = a
         norms[name] = np.linalg.norm(a, axis=-1)
         n = norms[name]
         print(f"{name:7s} {a.shape[1]}x{a.shape[0]}  ||c||: p50={np.median(n):.4f}  "
               f"p99.9={np.percentile(n, 99.9):9.3f}  max={n.max():10.3f}  "
-              f"media={n.mean():.4f}")
+              f"mean={n.mean():.4f}")
 
-    # Scala condivisa.  Il tetto e' il massimo fra le due, perche' il picco della
-    # notturna e' proprio il fenomeno da mostrare; il fondo e' un percentile basso e non
-    # un numero fisso di decadi sotto il tetto.  Con le decadi fisse quel picco
-    # (~7·10^4, duecento volte il massimo dello studio) trascinerebbe il fondo scala
-    # sopra la mediana di entrambe le mappe, appiattendo tutto il resto in un colore
-    # solo: la barra coprirebbe un intervallo in cui i dati quasi non stanno.
+    # Shared scale.  The ceiling is the maximum of the two, because the night map's peak
+    # is precisely the phenomenon to show; the floor is a low percentile and not a fixed
+    # number of decades below the ceiling.  With fixed decades that peak (~7·10^4, two
+    # hundred times the studio maximum) would drag the bottom of the scale above the
+    # median of both maps, flattening everything else into a single colour: the bar would
+    # cover a range the data is almost never in.
     allv = np.concatenate([norms[n].ravel() for n, _ in MAPS])
     vmax = float(allv.max())
     vmin = max(float(np.percentile(allv, FLOOR_PCTL)), vmax * 1e-9)
-    print(f"\nscala condivisa delle heatmap: [{vmin:.3e}, {vmax:.3e}]  "
-          f"({np.log10(vmax / vmin):.1f} decadi, logaritmica, "
-          f"fondo al p{FLOOR_PCTL} congiunto)")
+    print(f"\nshared heatmap scale: [{vmin:.3e}, {vmax:.3e}]  "
+          f"({np.log10(vmax / vmin):.1f} decades, logarithmic, "
+          f"floor at the joint p{FLOOR_PCTL})")
 
     for name, _ in MAPS:
         save = out / f"skybox_{name}.png"
         expo = own_exposure(imgs[name])
         plt.imsave(save, np.clip(tonemap(imgs[name], expo), 0.0, 1.0))
-        print(f"  + {save.name}  (esposizione propria {expo:.4g})")
+        print(f"  + {save.name}  (own exposure {expo:.4g})")
         heat_png(norms[name], vmin, vmax, out / f"heat_{name}.png",
                  r"$\|\mathbf{c}\|$  (log scale, shared)")
     return 0

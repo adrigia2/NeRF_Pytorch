@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""regen_heatmaps.py — Rigenera le heatmap PNG dagli EXR già su disco.
+"""regen_heatmaps.py — regenerate the PNG heatmaps from the EXRs already on disk.
 
-Non richiede GPU, training o OptiX. Legge direttamente i file EXR prodotti da una
-run precedente (nerf_render_images/iter_*/ per le prospettive NeRF, skybox_nerf_baked.exr
-per il confronto skybox) e riscrive i PNG con le funzioni di nerf.metrics aggiornate.
+No GPU, training or OptiX needed. It reads the EXR files produced by an earlier run
+directly (nerf_render_images/iter_*/ for the NeRF views, skybox_nerf_baked.exr for the
+skybox comparison) and rewrites the PNGs with the current nerf.metrics functions.
 
 Uso:
   python regen_heatmaps.py <run_dir> [gt_skybox.exr]
 
-  <run_dir>      : cartella di una scena, es.
+  <run_dir>      : a scene folder, e.g.
                    D:/tesi_output/heatmap_norm_diff/TableAndOtherInterior
-  gt_skybox.exr  : (opzionale) path all'HDR GT per il confronto skybox; se omesso,
-                   il confronto skybox viene saltato.
+  gt_skybox.exr  : (optional) path to the GT HDR for the skybox comparison; when
+                   omitted, the skybox comparison is skipped.
 
 Esempi:
   conda run --no-capture-output -n nerfpytorch python -u regen_heatmaps.py ^
       D:/tesi_output/heatmap_norm_diff/TableAndOtherInterior ^
       C:/Users/adria/Documents/GitHub/Tesi/OptixProjectCMake/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr
 
-  # Solo per-vista (senza skybox):
+  # Per-view only (no skybox):
   conda run --no-capture-output -n nerfpytorch python -u regen_heatmaps.py ^
       D:/tesi_output/heatmap_norm_diff/TableAndOtherInterior
 """
@@ -31,12 +31,12 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# Loader EXR locale — replica _load_image_hw3_native senza dipendere da
-# images_generator (che a import-time inizializza OptiX).
+# Local EXR loader — replicates _load_image_hw3_native without depending on
+# images_generator (which initialises OptiX at import time).
 # ---------------------------------------------------------------------------
 
 def _load_exr_hw3(path: str) -> np.ndarray:
-    """Carica un EXR come (H, W, 3) float32, leggendo i canali R/G/B per nome."""
+    """Load an EXR as (H, W, 3) float32, reading the R/G/B channels by name."""
     import OpenEXR
     import Imath
 
@@ -75,16 +75,16 @@ def main() -> None:
         print(f"Errore: {run_dir} non esiste o non è una directory.", flush=True)
         sys.exit(1)
 
-    # Importa le funzioni di plot da nerf.metrics (non da images_generator)
+    # Import the plotting functions from nerf.metrics (not from images_generator)
     import _paths  # noqa: F401
     from nerf.metrics import plot_error_heatmap, plot_skybox_compare
 
-    # ── Per-vista: ultima iter_* ─────────────────────────────────────────────
+    # ── Per view: the latest iter_* ──────────────────────────────────────────
     render_root = run_dir / "nerf_render_images"
     if render_root.is_dir():
         iter_dirs = sorted(render_root.glob("iter_*"))
         if iter_dirs:
-            iter_dir = iter_dirs[-1]   # usa solo l'ultima iterazione
+            iter_dir = iter_dirs[-1]   # use the latest iteration only
             gt_files = sorted(iter_dir.glob("frame_*_gt.exr"))
             print(f"[regen] Per-vista: {len(gt_files)} frame in {iter_dir.name}", flush=True)
 
@@ -110,7 +110,7 @@ def main() -> None:
     if not baked_path.exists():
         print(f"[regen] skybox_nerf_baked.exr non trovato — skip skybox compare", flush=True)
     elif gt_skybox_path is None:
-        print("[regen] GT skybox non specificato (argomento 2) — skip skybox compare", flush=True)
+        print("[regen] no GT skybox given (argument 2) — skipping the skybox compare", flush=True)
     elif not gt_skybox_path.exists():
         print(f"[regen] GT skybox non trovato: {gt_skybox_path} — skip", flush=True)
     else:
@@ -127,7 +127,7 @@ def main() -> None:
         plot_skybox_compare(gt_sky, baked_sky, out_png, title=sky_title)
         print(f"  ✓  skybox_compare/skybox_heatmap.png", flush=True)
 
-    print("[regen] Fatto.", flush=True)
+    print("[regen] Done.", flush=True)
 
 
 if __name__ == "__main__":

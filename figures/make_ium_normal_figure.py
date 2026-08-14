@@ -1,25 +1,25 @@
 #!/usr/bin/env python
-"""make_ium_normal_figure.py -- Recupera la normale geometrica del pass IUM (figura 3.7b).
+"""make_ium_normal_figure.py -- recover the geometric normal of the IUM pass (figure 3.7b).
 
     python make_ium_normal_figure.py <run_dir> --out ../Doc/images/ium
 
-Scrive `ium_normal.png`: la normale di faccia che `IUM_Generator` calcola sulla GPU.
+Writes `ium_normal.png`: the face normal `IUM_Generator` computes on the GPU.
 
-**Perche' serve uno script apposta.**  `ium_normals.exr` su disco NON contiene questa
-mappa.  Quando la run dichiara una normal map esterna, `_apply_external_normal`
-(images_generator.py:638, chiamata a :3098) la sovrascrive host-side *dopo* il render:
-il file finale porta la mappa fornita, non quella calcolata dal tracer.  La normale
-geometrica esiste quindi solo per il tempo di una chiamata e viene scartata.  Qui si
-rifa' il solo pass IUM, senza NeRF e senza mappa esterna, e la si legge prima che
-qualcuno la sovrascriva.
+**Why this needs a script of its own.**  `ium_normals.exr` on disk does NOT hold that
+map.  When the run declares an external normal map, `_apply_external_normal`
+(images_generator.py:638, called at :3098) overwrites it host-side *after* the render:
+the final file carries the supplied map, not the one the tracer computed.  The geometric
+normal therefore exists only for the duration of one call and is then discarded.  Here
+the IUM pass alone is re-run, with no NeRF and no external map, and read before anything
+overwrites it.
 
-Mesh e risoluzione dell'atlante vengono dal `run_manifest.json` della run indicata, non
-trascritte a mano: se non coincidessero con quelle della run, il pannello non sarebbe
-allineato agli altri due della stessa figura e il confronto sarebbe falso.
+Mesh and atlas resolution come from the `run_manifest.json` of the given run, not
+transcribed by hand: if they did not match the run's, the panel would not be aligned with
+the other two of the same figure and the comparison would be false.
 
-Come riconoscere che il risultato e' davvero quello geometrico: il pass calcola normali
-di FACCIA, quindi il cubo deve mostrare tinte piatte e nette e la sfera una sfaccettatura
-visibile.  La mappa esterna e' bakeata smooth e darebbe gradienti continui ovunque.
+How to tell the result really is the geometric one: the pass computes FACE normals, so
+the cube must show flat, sharp tints and the sphere a visible faceting.  The external map
+is baked smooth and would give continuous gradients everywhere.
 """
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ from make_skybox_figure import load_exr                # noqa: E402
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("run_dir", help="run da cui leggere mesh e risoluzione dell'atlante")
+    ap.add_argument("run_dir", help="run to read the mesh and atlas resolution from")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -52,8 +52,8 @@ def main() -> int:
     ium_w, ium_h = manifest["config"]["render"]["ium_texture_size"]
     ext = manifest["scene"].get("external_normal_path")
     print(f"mesh      : {model_path}")
-    print(f"atlante   : {ium_w}x{ium_h}")
-    print(f"mappa esterna della run (qui NON applicata): {ext}")
+    print(f"atlas     : {ium_w}x{ium_h}")
+    print(f"run's external map (NOT applied here): {ext}")
 
     import OptixProgrammablePasses as optix
 
@@ -64,27 +64,27 @@ def main() -> int:
     gen.set_traversable(model)
     gen.set_texture_size([ium_w, ium_h])
     gen.render()
-    res = gen.get_result()          # tenere vivo: le viste *_np sono zero-copy
+    res = gen.get_result()          # keep it alive: the *_np views are zero-copy
 
     nrm = np.array(res.normals_np, dtype=np.float32).reshape(ium_h, ium_w, 3)
     mask = load_exr(run / "ium" / "ium_masks.exr")[..., 0] > 0.5
-    print(f"copertura : {100.0 * mask.mean():.2f}% dei texel")
+    print(f"coverage  : {100.0 * mask.mean():.2f}% of the texels")
 
     save_png(normal_rgb(nrm, mask), out / "ium_normal.png")
 
-    # La mappa esterna, cioe' quella che sovrascrive la geometrica e che ogni consumatore
-    # legge davvero.  Sul disco e' gia' decodificata (per canale in [-1,1], |n| = 1 sulla
-    # maschera), quindi passa per la stessa `normal_rgb` e i due pannelli sono confrontabili.
-    # E' anche la versione che la pipeline usa, dopo ricampionamento e conversione di
-    # range, non il file sorgente nella cartella della scena.
+    # The external map, i.e. the one that overwrites the geometric normal and that every
+    # consumer actually reads.  On disk it is already decoded (per channel in [-1,1],
+    # |n| = 1 on the mask), so it goes through the same `normal_rgb` and the two panels
+    # are comparable.  It is also the version the pipeline uses, after resampling and
+    # range conversion, not the source file in the scene folder.
     disk = load_exr(run / "ium" / "ium_normals.exr")
     save_png(normal_rgb(disk, mask), out / "ium_normal_external.png")
 
-    # Che i due pannelli non siano lo stesso file non e' un dettaglio: confonderli
-    # renderebbe la figura una bugia difficile da individuare.
+    # That the two panels are not the same file is not a detail: confusing them would
+    # make the figure a lie that is hard to spot.
     d = np.abs(disk - nrm)[mask]
-    print(f"scarto fra geometrica ed esterna: max {d.max():.4f}, media {d.mean():.4f}  "
-          f"→ {'DIVERSE (atteso)' if d.max() > 1e-3 else 'UGUALI (sospetto)'}")
+    print(f"gap between geometric and external: max {d.max():.4f}, mean {d.mean():.4f}  "
+          f"→ {'DIFFERENT (expected)' if d.max() > 1e-3 else 'IDENTICAL (suspicious)'}")
     return 0
 
 
