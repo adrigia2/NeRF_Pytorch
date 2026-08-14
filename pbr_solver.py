@@ -1,87 +1,87 @@
-"""Fit PBR multi-vista con coni speculari a taglio netto (media pura sul cono):
+"""Multi-view PBR fit with hard-cutoff specular cones (a pure mean over the cone):
 
-    C_j = (a·x/π) · E + (1 − x) · L_j        (per canale c)
+    C_j = (a·x/π) · E + (1 − x) · L_j        (per channel c)
 
-    C_j   colore osservato dalla camera j    (sources/{source}/camera_texture/<stem>.exr)
-    E     irradianza emisferica vista-indipendente (irradiance/irradiance.exr
-          + irradiance_indirect.exr se presente; input condiviso, non per-source).
-          Serve SOLO per l'albedo: metallic e roughness non la richiedono.
-    a     albedo diffusa (incognita, RGB, in [0,1])
-    x     peso del termine DIFFUSO (x=1 → nessuna dipendenza dalla vista);
-          la specularità/metallic è 1−x
-    L_j   MEDIA PURA ad angolo solido della radianza ambiente sul cono attorno
-          al raggio riflesso (nessun peso cosθ_R). Il solver NON la ricostruisce:
-          la legge dal bake, che scrive un canale RGB per candidato in
-          spec_cone/cam_{j:03d}.exr (format "cones" di images_generator.py).
-          Candidati = specchio + un cono per apertura della griglia;
-          roughness = apertura/180. Essendo una media, L resta in unità di
-          radianza a OGNI apertura (specchio compreso): metallic = 1−x è una
-          frazione speculare omogenea tra i candidati.
+    C_j   colour observed by camera j        (sources/{source}/camera_texture/<stem>.exr)
+    E     view-independent hemispherical irradiance (irradiance/irradiance.exr
+          + irradiance_indirect.exr when present; a shared input, not per-source).
+          Needed ONLY for the albedo: metallic and roughness do not require it.
+    a     diffuse albedo (unknown, RGB, in [0,1])
+    x     weight of the DIFFUSE term (x=1 → no view dependence);
+          the specularity/metallic is 1−x
+    L_j   PURE solid-angle MEAN of the ambient radiance over the cone around the
+          reflected ray (no cosθ_R weight). The solver does NOT reconstruct it: it
+          reads it from the bake, which writes one RGB channel per candidate into
+          spec_cone/cam_{j:03d}.exr (the "cones" format of images_generator.py).
+          Candidates = mirror + one cone per aperture of the grid;
+          roughness = aperture/180. Being a mean, L stays in radiance units at
+          EVERY aperture (the mirror included): metallic = 1−x is a specular
+          fraction homogeneous across the candidates.
 
-La media sul cono la chiude il bake (images_generator._cones_from_rings_*):
-qui basta sapere che il canale di un livello (cone_045deg, dal nome si legge
-l'apertura) è la media dei soli raggi validi entro
-l'apertura k, pesata per angolo solido, e che `valid` = raggi sopra l'orizzonte
-del texel (0 → il texel non è utilizzabile per quella camera).
-Nota: la risoluzione sulla larghezza del cono è quantizzata dalla griglia di
-aperture del bake (spec_cone_apertures_deg) — scelta deliberata, niente
-raffinamento sub-griglia in questa versione.
+The mean over the cone is closed by the bake (images_generator._cones_from_rings_*):
+here it is enough to know that a level's channel (cone_045deg — the name carries
+the aperture) is the solid-angle-weighted mean of the valid rays alone within
+aperture k, and that `valid` = the rays above the texel's horizon (0 → the texel
+is unusable for that camera).
+Note: the resolution on the cone width is quantized by the bake's aperture grid
+(spec_cone_apertures_deg) — a deliberate choice, with no sub-grid refinement in
+this version.
 
-Per ogni candidato r il modello è una regressione lineare per texel:
-    C_jc = α_c + β·L_jc        α_c = x·a_c·E_c/π  (intercetta, per canale)
-                               β   = 1−x          (pendenza, condivisa sui canali)
-Il termine diffuso è identico per tutte le viste, quindi ogni variazione di C
-tra le camere è attribuibile solo a L: la centratura sulle medie tra camere
-elimina α (equivale a lavorare sulle differenze C_i − C_j) e dà β in forma
-chiusa. Statistiche sufficienti, accumulate in streaming camera per camera:
+For each candidate r the model is a per-texel linear regression:
+    C_jc = α_c + β·L_jc        α_c = x·a_c·E_c/π  (intercept, per channel)
+                               β   = 1−x          (slope, shared across channels)
+The diffuse term is identical for every view, so any variation of C between the
+cameras is attributable to L alone: centring on the per-camera means eliminates α
+(equivalent to working on the differences C_i − C_j) and gives β in closed form.
+Sufficient statistics, accumulated streaming, one camera at a time:
     Sw = Σ w_j     SC_c = Σ w_j·C     SCC = Σ_{j,c} w_j·C²
     SL_c(r) = Σ w_j·L     SLL(r) = Σ_{j,c} w_j·L²     SCL(r) = Σ_{j,c} w_j·C·L
     VLL = SLL − Σ_c SL²/Sw    VCL = SCL − Σ_c SC·SL/Sw    VCC = SCC − Σ_c SC²/Sw
     β*(r) = clip(VCL / VLL, 0, 1)
-    res(r) = (VCC − 2β·VCL + β²·VLL) / (3·n_views)   →   argmin su r
-Dal candidato vincente: x = 1−β,  α_c = (SC_c − β·SL_c)/Sw (≥ 0),
+    res(r) = (VCC − 2β·VCL + β²·VLL) / (3·n_views)   →   argmin over r
+From the winning candidate: x = 1−β,  α_c = (SC_c − β·SL_c)/Sw (≥ 0),
     a_c = clip(π·α_c / (max(E_c, albedo_eps)·x), 0, 1);  x < X_EPS → a = 0
-(convenzione metallo: un texel completamente speculare non ha albedo diffusa).
+(metal convention: a fully specular texel has no diffuse albedo).
 
-La RAM non scala né col numero di camere né con la risoluzione della texture: il
-loop esterno è sulle BANDE di texel (blocchi di scanline intere, `tile_texels`),
-quello interno sulle camere. Gli accumulatori vivono solo per la banda corrente e
-il fit — che è puramente per-texel, nessuna operazione mette in relazione texel
-diversi — viene chiuso banda per banda; a piena risoluzione restano solo le mappe
-di uscita, in float32. Ogni lettura EXR è una `channels()` su un intervallo di
-scanline: una sola decompressione per banda invece di una per canale (a 4096²
-con 14 aperture il file dei coni ha 43 canali, quindi 43 decompressioni
-dell'intero file per camera).
+RAM scales with neither the camera count nor the texture resolution: the outer
+loop is over BANDS of texels (blocks of whole scanlines, `tile_texels`) and the
+inner one over the cameras. The accumulators live only for the current band and
+the fit — which is purely per-texel, no operation relates different texels — is
+closed band by band; only the output maps stay at full resolution, in float32.
+Every EXR read is one `channels()` over a scanline range: a single decompression
+per band instead of one per channel (at 4096² with 14 apertures the cone file has
+43 channels, hence 43 decompressions of the whole file per camera).
 
-Validità:
-  - il lobo è attendibile solo dove la specularità supera spec_threshold:
-    sotto, roughness viene posta a 1.0 e il texel è marcato in pbr/r_valid.png.
 
-Mappe finali, per la sorgente `source` (chiamare una volta per ogni sorgente da
-processare: le uscite vivono sotto sources/{source}/, i nomi interni non sono
-suffissati):
-  <out>/sources/{source}/metallic/metallic.exr      = 1−x   (0=diffuso, 1=tutto speculare)
-  <out>/sources/{source}/roughness/roughness.exr    = apertura/180 del cono vincente
-    (0 = specchio), 1.0 altrove — indice di larghezza del cono, NON α GGX:
-    per texture Disney-compliant serve una calibrazione apertura→α a valle
-  <out>/sources/{source}/albedo_pbr/albedo_pbr.exr  = a dal fit (albedo diffusa
-    depurata dallo speculare per-vista; coesiste con l'albedo Lambertiana
-    classica in <out>/sources/{source}/albedo/). Richiede irradiance/irradiance.exr
-    su disco (irradiance_indirect.exr sommata se presente); se manca, la mappa
-    è saltata con warning. Sui texel non risolvibili si assume x=1 (diffuso,
-    α = media tra camere → a ≡ albedo Lambertiana classica).
-metallic e roughness vengono scritte anche come metallic_rgb.exr /
-roughness_rgb.exr accanto agli originali (stessi valori su tre canali R/G/B
-float32, convenzione dei bake di Blender) salvo blender_rgb=False.
-Diagnostica in <out>/sources/{source}/pbr/: diffuse_weight.exr (x),
-diffuse_term.exr (α, radianza diffusa stimata), lobe_param.exr (apertura del
-cono vincente in gradi, 0 = specchio), residual.exr, n_views.exr,
-r_valid.png + preview PNG a scala assoluta.
+Validity:
+  - the lobe is reliable only where the specularity exceeds spec_threshold: below
+    that, roughness is set to 1.0 and the texel is flagged in pbr/r_valid.png.
 
-Input condivisi (source-indipendenti, non sotto sources/{source}/): spec_cone/,
+Final maps, for the given `source` (call once per source to process: the outputs
+live under sources/{source}/ and the inner names are not suffixed):
+
+  <out>/sources/{source}/metallic/metallic.exr      = 1−x   (0=diffuse, 1=fully specular)
+  <out>/sources/{source}/roughness/roughness.exr    = aperture/180 of the winning cone
+    (0 = mirror), 1.0 elsewhere — a cone-width index, NOT a GGX α: a
+    Disney-compliant texture needs an aperture→α calibration downstream
+  <out>/sources/{source}/albedo_pbr/albedo_pbr.exr  = a from the fit (diffuse albedo
+    with the per-view specular removed; it coexists with the classic Lambertian
+    albedo in <out>/sources/{source}/albedo/). Requires irradiance/irradiance.exr
+    on disk (irradiance_indirect.exr is added when present); if it is missing the
+    map is skipped with a warning. On unsolvable texels x=1 is assumed (diffuse,
+    α = the mean across cameras → a ≡ the classic Lambertian albedo).
+metallic and roughness are also written as metallic_rgb.exr / roughness_rgb.exr
+next to the originals (the same values on three float32 R/G/B channels, the
+convention of Blender's bakes) unless blender_rgb=False.
+Diagnostics in <out>/sources/{source}/pbr/: diffuse_weight.exr (x),
+diffuse_term.exr (α, the estimated diffuse radiance), lobe_param.exr (aperture of
+the winning cone in degrees, 0 = mirror), residual.exr, n_views.exr,
+r_valid.png, plus absolute-scale PNG previews.
+
+Shared inputs (source-independent, not under sources/{source}/): spec_cone/,
 ium/ium_masks.exr, visibility/visibility.exr, irradiance/.
 
-Uso:
+Usage:
     python pbr_solver.py <output_dir> [--source gt] [--cv-gate 0.05]
                          [--spec-threshold 0.2] [--min-views 2] [--albedo-eps 1e-3]
                          [--tile-texels 1048576] [--no-blender-rgb]
@@ -102,8 +102,8 @@ from images_generator import (  # noqa: E402
 )
 from exr_to_blender_rgb import write_blender_rgb  # noqa: E402
 
-# Sotto questo x il texel è considerato completamente speculare: l'albedo
-# diffusa non è definita (α/x → 0/0) e viene scritta a 0 (convenzione metallo).
+# Below this x the texel counts as fully specular: the diffuse albedo is not
+# defined (α/x → 0/0) and is written as 0 (the metal convention).
 X_EPS = 1e-3
 
 
@@ -112,33 +112,33 @@ X_EPS = 1e-3
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _channel_order(names: "list[str]") -> "tuple[list[str], bool]":
-    """Ordine canonico dei canali di un EXR → (nomi, canale_singolo).
+    """Canonical channel order of an EXR → (names, single_channel).
 
-    Regola condivisa da _read_exr e _ExrBandReader: la colonna j di un array a
-    piena immagine e quella di una banda devono riferirsi allo stesso canale.
-    Non è banale perché ExrWriter (images_generator.py:100-106) nomina i canali
-    in base al loro numero: 1 → Z, 3 → R,G,B, 4 → R,G,B,A e solo da 5 in su
-    Cam0, Cam1, … — quindi una visibility con 3 o 4 camere NON ha canali Cam*.
+    A rule shared by _read_exr and _ExrBandReader: column j of a full-image array
+    and column j of a band have to refer to the same channel. It is not trivial,
+    because ExrWriter (images_generator.py:100-106) names channels by their count:
+    1 → Z, 3 → R,G,B, 4 → R,G,B,A and only from 5 upwards Cam0, Cam1, … — so a
+    visibility with 3 or 4 cameras has NO Cam* channels.
     """
     names = list(names)
     if names == ["Z"] or names == ["Y"]:
         return names, True
     if set("RGB").issubset(names):
         return ["R", "G", "B"] + (["A"] if "A" in names else []), False
-    return sorted(names, key=lambda n: (len(n), n)), False   # Cam0, Cam1, … in ordine numerico
+    return sorted(names, key=lambda n: (len(n), n)), False   # Cam0, Cam1, … in numeric order
 
 
 class _ExrBandReader:
-    """EXR letto per blocchi di scanline consecutive: la controparte in lettura
-    di images_generator.IncrementalExrWriter.
+    """EXR read in blocks of consecutive scanlines: the read-side counterpart of
+    images_generator.IncrementalExrWriter.
 
-    Serve al solver, che ha il loop sulle bande di texel all'esterno e quello
-    sulle camere all'interno: a piena risoluzione i coni di una camera sono già
-    2.6 GiB e gli accumulatori quasi 10, mentre una banda costa poche decine di MB.
+    The solver needs it: its outer loop is over bands of texels and the inner one
+    over cameras, and at full resolution one camera's cones are already 2.6 GiB
+    with the accumulators near 10, while a band costs a few tens of MB.
 
-    Una `channels()` sola per blocco e non una `channel()` per canale: il
-    framebuffer viene montato una volta e i blocchi ZIP si decomprimono una
-    volta sola. Con i 43 canali del file dei coni la differenza misurata è ~34x.
+    One `channels()` per block rather than one `channel()` per channel: the
+    framebuffer is mounted once and the ZIP blocks are decompressed once. With the
+    43 channels of the cone file the measured difference is ~34x.
     """
 
     def __init__(self, path: Path):
@@ -150,28 +150,28 @@ class _ExrBandReader:
         dw = header["dataWindow"]
         self.width  = dw.max.x - dw.min.x + 1
         self.height = dw.max.y - dw.min.y + 1
-        self._pt    = Imath.PixelType(Imath.PixelType.FLOAT)  # half convertito in lettura
+        self._pt    = Imath.PixelType(Imath.PixelType.FLOAT)  # half is converted on read
         self._avail = set(header["channels"].keys())
         self.names, self.single = _channel_order(list(header["channels"].keys()))
 
-    # ── lettura ──────────────────────────────────────────────────────────────
+    # ── reading ──────────────────────────────────────────────────────────────
     def read_raw(self, y0: int, rows: "int | None",
                  names: "list[str]") -> "list[bytes]":
-        """Buffer grezzi dei canali richiesti, nell'ordine richiesto."""
+        """Raw buffers of the requested channels, in the requested order."""
         rows = self.height - y0 if rows is None else rows
         if y0 < 0 or rows <= 0 or y0 + rows > self.height:
-            raise ValueError(f"{self.path}: banda [{y0}, {y0 + rows}) fuori "
-                             f"dalle {self.height} scanline del file")
+            raise ValueError(f"{self.path}: band [{y0}, {y0 + rows}) outside "
+                             f"the {self.height} scanlines of the file")
         missing = [n for n in names if n not in self._avail]
         if missing:
-            raise ValueError(f"{self.path}: canali mancanti {missing} "
-                             f"(disponibili: {sorted(self._avail)[:8]}…)")
+            raise ValueError(f"{self.path}: missing channels {missing} "
+                             f"(available: {sorted(self._avail)[:8]}…)")
         return self._exr.channels(names, self._pt, y0, y0 + rows - 1)
 
     def read(self, y0: int = 0, rows: "int | None" = None,
              names=None) -> np.ndarray:
-        """Banda → (rows·width, C) float32, oppure (rows·width,) se `names` è una
-        stringa o se il file ha un canale singolo (Z/Y) e `names` è None."""
+        """Band → (rows·width, C) float32, or (rows·width,) when `names` is a string
+        or the file has a single channel (Z/Y) and `names` is None."""
         squeeze = False
         if names is None:
             names, squeeze = self.names, self.single
@@ -183,7 +183,7 @@ class _ExrBandReader:
         bufs = self.read_raw(y0, rows, names)
         n = (self.height - y0 if rows is None else rows) * self.width
         if squeeze:
-            return np.frombuffer(bufs[0], dtype=np.float32).copy()   # scrivibile
+            return np.frombuffer(bufs[0], dtype=np.float32).copy()   # writable
         out = np.empty((n, len(names)), dtype=np.float32)
         for i, buf in enumerate(bufs):
             out[:, i] = np.frombuffer(buf, dtype=np.float32)
@@ -200,13 +200,13 @@ class _ExrBandReader:
 
 
 def _read_band(path: Path, y0: int, rows: "int | None" = None, names=None) -> np.ndarray:
-    """Una banda di scanline da `path` (apre, legge, chiude)."""
+    """One band of scanlines from `path` (open, read, close)."""
     with _ExrBandReader(path) as rd:
         return rd.read(y0, rows, names)
 
 
 def _read_exr(path: Path) -> np.ndarray:
-    """EXR → (H, W) float32 [canale Z] oppure (H, W, C) [R,G,B(,A) o Cam*]."""
+    """EXR → (H, W) float32 [Z channel] or (H, W, C) [R,G,B(,A) or Cam*]."""
     with _ExrBandReader(path) as rd:
         arr = rd.read()
         return arr.reshape(rd.height, rd.width) if arr.ndim == 1 else \
@@ -215,19 +215,19 @@ def _read_exr(path: Path) -> np.ndarray:
 
 def read_cones(path: Path, apertures_deg, y0: int = 0,
                rows: "int | None" = None) -> "tuple[np.ndarray, np.ndarray]":
-    """EXR dei coni di una camera → (L (n, K, 3), n_valid (n,)).
+    """A camera's cone EXR → (L (n, K, 3), n_valid (n,)).
 
-    Un canale RGB per livello, con la media pura sul cono già chiusa dal bake,
-    più `valid`, il numero di raggi validi del texel. I nomi dei livelli portano
-    l'apertura (`cone_045deg`) e vengono generati da spec_cone_level_name a
-    partire dalle aperture del meta: writer e reader usano la stessa funzione,
-    quindi non possono divergere. Un solo file per camera e non uno per
-    apertura: il bake condiviso ha il loop sui tile all'esterno, quindi i writer
-    di tutte le camere restano aperti insieme e K+1 file per camera
-    supererebbero il limite stdio di MSVC.
+    One RGB channel per level, with the pure mean over the cone already closed by
+    the bake, plus `valid`, the texel's number of valid rays. Level names carry the
+    aperture (`cone_045deg`) and are generated by spec_cone_level_name from the
+    apertures in the meta: writer and reader use the same function, so they cannot
+    diverge. One file per camera rather than one per aperture: the shared bake has
+    the tile loop on the outside, so the writers of every camera stay open together
+    and K+1 files per camera would exceed the MSVC stdio limit.
 
-    Con y0/rows si legge solo una banda di scanline (n = rows·W); il default
-    resta l'immagine intera (n = N).
+
+    With y0/rows only one band of scanlines is read (n = rows·W); the default is
+    still the whole image (n = N).
     """
     K = len(apertures_deg)
     want = [f"{spec_cone_level_name(apertures_deg, k)}.{c}"
@@ -237,11 +237,11 @@ def read_cones(path: Path, apertures_deg, y0: int = 0,
         try:
             bufs = rd.read_raw(y0, rows, want)
         except ValueError as err:
-            raise ValueError(f"{err} — bake incompleto o num_levels sbagliato "
-                             f"nel meta") from None
+            raise ValueError(f"{err} — incomplete bake, or the wrong num_levels "
+                             f"in the meta") from None
         n = (rd.height - y0 if rows is None else rows) * rd.width
-        # Riempita canale per canale: uno np.stack annidato terrebbe in vita le
-        # K fette (n,3) *e* il risultato, raddoppiando il picco a immagine piena.
+        # Filled channel by channel: a nested np.stack would keep the K (n,3) slices
+        # alive *and* the result, doubling the peak on a full image.
         cones = np.empty((n, K, 3), dtype=np.float32)
         for k in range(K):
             for ci in range(3):
@@ -262,31 +262,31 @@ def solve_pbr(output_dir: str,
               tile_texels: int = 1 << 20,
               eps: float = 1e-12) -> dict:
     out = Path(output_dir)
-    src_dir = out / "sources" / source     # artefatti source-dipendenti (camera_texture/, pixel_change/, uscite PBR)
-    spec_dir = out / "spec_cone"           # condiviso (source-indipendente)
+    src_dir = out / "sources" / source     # source-dependent artefacts (camera_texture/, pixel_change/, PBR outputs)
+    spec_dir = out / "spec_cone"           # shared (source-independent)
 
     with open(spec_dir / "spec_cone_meta.json", encoding="utf-8") as fh:
         meta = json.load(fh)
     with open(out / "transforms_extended.json", encoding="utf-8") as fh:
         tjson = json.load(fh)
 
-    # Il bake scrive i coni già chiusi (un canale RGB per candidato), quindi qui
-    # non si ricostruisce nulla: L_j(r) si legge e basta. I bake in formato
-    # "rings"/"rings_shared" (medie per anello) non sono più supportati.
+    # The bake writes the cones already closed (one RGB channel per candidate), so
+    # nothing is reconstructed here: L_j(r) is simply read. Bakes in the
+    # "rings"/"rings_shared" formats (per-ring means) are no longer supported.
     if meta.get("format") != "cones":
         raise ValueError(
-            f"spec_cone_meta.json in formato {meta.get('format')!r}: il solver "
-            f"richiede il formato 'cones' (L_j(r) già chiusa dal bake). "
-            f"Ri-eseguire il precompute spec_cone.")
+            f"spec_cone_meta.json is in format {meta.get('format')!r}: the solver "
+            f"requires the 'cones' format (L_j(r) already closed by the bake). "
+            f"Re-run the spec_cone precompute.")
 
     apertures = np.asarray(meta["apertures_deg"], dtype=np.float32)
     cams      = meta["cameras"]
     K         = meta["num_levels"]
     stems     = [Path(f["file_path"]).stem for f in tjson["frames"]]
 
-    # ── Candidati: [specchio] + un cono (media pura) per apertura ────────────
-    # Sono i K canali del bake nell'ordine in cui li ha scritti: l'indice del
-    # candidato È l'indice del canale. Tupla: (label, roughness, param).
+    # ── Candidates: [mirror] + one cone (pure mean) per aperture ─────────────
+    # These are the bake's K channels in the order it wrote them: the candidate
+    # index IS the channel index. Tuple: (label, roughness, param).
     candidates = [("mirror", 0.0, 0.0)]
     candidates += [(f"r={apertures[k]:g}°mean",
                     float(apertures[k]) / 180.0, float(apertures[k]))
@@ -296,10 +296,10 @@ def solve_pbr(output_dir: str,
     rough_vals = np.asarray([c[1] for c in candidates], dtype=np.float32)
     param_vals = np.asarray([c[2] for c in candidates], dtype=np.float32)
 
-    # ── Input: solo geometria dagli header, i pixel si leggono per banda ─────
-    # La risoluzione viene dal primo EXR dei coni: è un file che il solver deve
-    # comunque leggere per ogni camera, mentre la maschera IUM è opzionale e
-    # pixel_change non viene più aperta affatto.
+    # ── Input: geometry from the headers only, pixels are read band by band ──
+    # The resolution comes from the first cone EXR: a file the solver has to read
+    # for every camera anyway, whereas the IUM mask is optional and pixel_change is
+    # no longer opened at all.
     cone_paths = [spec_dir / meta["cam_file_pattern"].format(cam=j) for j in cams]
     with _ExrBandReader(cone_paths[0]) as rd:
         H, W = rd.height, rd.width
@@ -311,14 +311,14 @@ def solve_pbr(output_dir: str,
     vis_path = out / "visibility" / "visibility.exr"
     has_vis  = vis_path.exists()
     if has_vis:
-        # La colonna j dell'array che _read_exr costruirebbe è la camera j:
-        # l'ordine canonico dei canali dà il nome corrispondente, e leggere per
-        # nome evita di decomprimere i canali delle camere che non servono.
+        # Column j of the array _read_exr would build is camera j: the canonical
+        # channel order gives the matching name, and reading by name avoids
+        # decompressing the channels of cameras that are not needed.
         with _ExrBandReader(vis_path) as rd:
             vis_cols = [rd.names[j] for j in cams]
 
-    # Serve solo all'albedo: il controllo sta fuori dal loop così le bande non
-    # allocano nulla quando l'irradiance manca.
+    # Only the albedo needs this: the check sits outside the loop so the bands
+    # allocate nothing when the irradiance is missing.
     irr_path = out / "irradiance" / "irradiance.exr"
     ind_path = out / "irradiance" / "irradiance_indirect.exr"
     has_irr  = irr_path.exists()
@@ -326,24 +326,24 @@ def solve_pbr(output_dir: str,
 
     cam_paths  = [src_dir / "camera_texture" / f"{stems[j]}.exr" for j in cams]
 
-    # ── Partizione in bande di scanline intere ───────────────────────────────
-    # Il fit è puramente per-texel, quindi partizionare la texture non cambia il
-    # risultato di un bit; cambia solo il picco di RAM, che diventa
-    # ~tile_texels·n_cand·8B·20 invece di N·n_cand·8B·20.
+    # ── Partition into bands of whole scanlines ──────────────────────────────
+    # The fit is purely per-texel, so partitioning the texture does not change the
+    # result by a single bit; it changes only the peak RAM, which becomes
+    # ~tile_texels·n_cand·8B·20 instead of N·n_cand·8B·20.
     rows = max(1, int(tile_texels) // W)
     if rows >= 16:
-        rows = (rows // 16) * 16      # allineate al blocco ZIP: niente decompressioni doppie
+        rows = (rows // 16) * 16      # aligned to the ZIP block: no double decompressions
     rows = min(rows, H)
     n_tiles = (H + rows - 1) // rows
 
-    print(f"[pbr_solver] {N} texel, {len(cams)} camere, "
-          f"{n_cand} candidati ({K - 1} coni-media + specchio)")
-    print(f"             {n_tiles} bande da {rows} scanline ({rows * W} texel)")
+    print(f"[pbr_solver] {N} texels, {len(cams)} cameras, "
+          f"{n_cand} candidates ({K - 1} mean-cones + mirror)")
+    print(f"             {n_tiles} bands of {rows} scanlines ({rows * W} texels)")
 
-    # ── Uscite a piena risoluzione (float32/int32/bool: ~870 MiB a 4096²) ────
+    # ── Full-resolution outputs (float32/int32/bool: ~870 MiB at 4096²) ──────
     n_views    = np.zeros(N, dtype=np.int32)
     diffuse_w  = np.zeros(N, dtype=np.float32)     # x
-    metallic   = np.zeros(N, dtype=np.float32)     # β = 1−x (specularità)
+    metallic   = np.zeros(N, dtype=np.float32)     # β = 1−x (specularity)
     lobe_param = np.zeros(N, dtype=np.float32)
     roughness  = np.zeros(N, dtype=np.float32)
     residual   = np.zeros(N, dtype=np.float32)
@@ -364,26 +364,26 @@ def solve_pbr(output_dir: str,
         mask_t = (_read_band(mask_path, y0, r) > 0.5) if has_mask \
             else np.ones(T, dtype=bool)
 
-        # Banda interamente fuori dalla maschera IUM: senza texel validi ogni
-        # uscita della banda varrebbe zero, e gli array sono già zero-inizializzati,
-        # quindi saltarla è bit-identico. Evita le due letture di pixel_change e
-        # soprattutto il loop sulle camere, che è la parte cara (una banda di
-        # camera_texture + una di cam_XXX.exr per camera). Vale sempre — l'atlante
-        # UV ha zone vuote — ma è ciò che rende quasi gratis una ricostruzione
-        # ristretta a una ROI.
+        # Band entirely outside the IUM mask: with no valid texel every output of
+        # the band would be zero, and the arrays are already zero-initialised, so
+        # skipping it is bit-identical. It avoids the two pixel_change reads and,
+        # above all, the loop over cameras, which is the expensive part (one band of
+        # camera_texture plus one of cam_XXX.exr per camera). It always pays off —
+        # the UV atlas has empty regions — but it is what makes a reconstruction
+        # restricted to a ROI nearly free.
         if not mask_t.any():
             bar.update(1)
             continue
 
-        # Una sola lettura per banda invece di una per camera.
+        # A single read per band instead of one per camera.
         vis_t = (_read_band(vis_path, y0, r, vis_cols) > 0.5) if has_vis else None
 
-        # ── Scan streaming: una camera alla volta, statistiche sufficienti ───
-        SC  = np.zeros((T, 3))             # Σ w·C          (indip. dal candidato)
-        SCC = np.zeros(T)                  # Σ w·C² pooled  (indip. dal candidato)
-        SL  = np.zeros((T, n_cand, 3))     # Σ w·L          per candidato
-        SLL = np.zeros((T, n_cand))        # Σ w·L² pooled  per candidato
-        SCL = np.zeros((T, n_cand))        # Σ w·C·L pooled per candidato
+        # ── Streaming scan: one camera at a time, sufficient statistics ──────
+        SC  = np.zeros((T, 3))             # Σ w·C          (candidate-independent)
+        SCC = np.zeros(T)                  # Σ w·C² pooled  (candidate-independent)
+        SL  = np.zeros((T, n_cand, 3))     # Σ w·L          per candidate
+        SLL = np.zeros((T, n_cand))        # Σ w·L² pooled  per candidate
+        SCL = np.zeros((T, n_cand))        # Σ w·C·L pooled per candidate
         nv_t = np.zeros(T, dtype=np.int32)
 
         for jj in range(len(cams)):
@@ -394,8 +394,8 @@ def solve_pbr(output_dir: str,
 
             cones, n_valid = read_cones(cone_paths[jj], apertures, y0, r)
             cones = cones.astype(np.float64)                # (T, n_cand, 3)
-            # Un texel è valido per questa camera se almeno un raggio è finito sopra
-            # l'orizzonte: è la stessa maschera che il bake usa per azzerare i coni.
+            # A texel is valid for this camera if at least one ray landed above the
+            # horizon: the same mask the bake uses to zero the cones.
             w_j &= n_valid > 0
 
             nv_t += w_j
@@ -411,7 +411,7 @@ def solve_pbr(output_dir: str,
 
         solvable = mask_t & (nv_t >= min_views)
 
-        # ── Fit per candidato: regressione centrata in forma chiusa ─────────
+        # ── Fit per candidate: centred regression in closed form ────────────
         Sw  = np.maximum(nv_t.astype(np.float64), 1.0)
         VLL = np.maximum(SLL - (SL ** 2).sum(axis=-1) / Sw[:, None], 0.0)
         VCL = SCL - np.einsum("nc,nkc->nk", SC, SL) / Sw[:, None]
@@ -419,7 +419,7 @@ def solve_pbr(output_dir: str,
 
         beta_all = np.clip(VCL / np.maximum(VLL, eps), 0.0, 1.0)    # β = 1−x
         res_all  = VCC[:, None] - 2.0 * beta_all * VCL + beta_all ** 2 * VLL
-        res_all /= np.maximum(3.0 * nv_t, 1.0)[:, None]  # residuo medio per equazione
+        res_all /= np.maximum(3.0 * nv_t, 1.0)[:, None]  # mean residual per equation
 
         target    = solvable
         best_k    = np.argmin(res_all, axis=1).astype(np.int32)
@@ -427,7 +427,7 @@ def solve_pbr(output_dir: str,
         best_res  = res_all[_idx, best_k]
         best_beta = beta_all[_idx, best_k]
 
-        # ── Composizione output della banda ─────────────────────────────────
+        # ── Compose the band's outputs ──────────────────────────────────────
         fitted = target & np.isfinite(best_res)
 
         dw_t = np.zeros(T, dtype=np.float32)
@@ -439,7 +439,7 @@ def solve_pbr(output_dir: str,
         lobe_t = np.zeros(T, dtype=np.float32)
         lobe_t[fitted] = param_vals[best_k[fitted]]
 
-        # lobo attendibile solo con specularità sufficiente; altrove roughness=1
+        # the lobe is reliable only with enough specularity; elsewhere roughness=1
         rval_t = fitted & (met_t >= spec_threshold)
         rgh_t  = np.where(mask_t, 1.0, 0.0).astype(np.float32)
         rgh_t[rval_t] = rough_vals[best_k[rval_t]]
@@ -447,9 +447,9 @@ def solve_pbr(output_dir: str,
         res_t = np.zeros(T, dtype=np.float32)
         res_t[fitted] = best_res[fitted].astype(np.float32)
 
-        # ── Intercetta α = x·a·E/π (radianza diffusa stimata) ───────────────
-        # x e α completi su tutta la mask: texel gated/non fittabili → diffusi
-        # (x=1, α = media di C tra le camere ⇒ a ≡ albedo Lambertiana classica)
+        # ── Intercept α = x·a·E/π (the estimated diffuse radiance) ──────────
+        # x and α are complete over the whole mask: gated/unfittable texels are
+        # diffuse (x=1, α = mean of C across cameras ⇒ a ≡ classic Lambertian albedo)
         C_bar = SC / Sw[:, None]
         X_t   = np.ones(T)
         X_t[fitted] = 1.0 - best_beta[fitted]
@@ -469,9 +469,9 @@ def solve_pbr(output_dir: str,
         r_valid[sl]    = rval_t
         alpha[sl]      = alpha_t.astype(np.float32)
 
-        # ── Albedo PBR: a = π·α / (max(E_sky+E_ind, albedo_eps)·x) ──────────
-        # Calcolata qui dall'α/x in float64 della banda: rifarla a valle dall'α
-        # float32 salvata cambierebbe gli ultimi bit.
+        # ── PBR albedo: a = π·α / (max(E_sky+E_ind, albedo_eps)·x) ──────────
+        # Computed here from the band's float64 α/x: redoing it downstream from the
+        # saved float32 α would change the last bits.
         if has_irr:
             E = _read_band(irr_path, y0, r).astype(np.float64)
             if has_ind:
@@ -479,7 +479,7 @@ def solve_pbr(output_dir: str,
             denom = np.maximum(E, albedo_eps)
             x_col = np.maximum(X_t, X_EPS)[:, None]
             alb_t = np.clip(np.pi * alpha_t / (denom * x_col), 0.0, 1.0)
-            alb_t[X_t < X_EPS] = 0.0    # completamente speculare: albedo nulla
+            alb_t[X_t < X_EPS] = 0.0    # fully specular: zero albedo
             alb_t[~mask_t] = 0.0
             albedo_flat[sl] = alb_t.astype(np.float32)
 
@@ -489,13 +489,13 @@ def solve_pbr(output_dir: str,
         bar.update(1)
     bar.close()
 
-    print(f"  texel risolvibili: {tot_solvable}")
+    print(f"  solvable texels: {tot_solvable}")
     for c_idx, (label, rough, _param) in enumerate(candidates):
-        print(f"  candidato {label:>11} (roughness={rough:.3f}) → migliore per "
-              f"{int(best_counts[c_idx])} texel")
-    print(f"  texel con r attendibile (metallic≥{spec_threshold}): {tot_rvalid}")
+        print(f"  candidate {label:>11} (roughness={rough:.3f}) → best for "
+              f"{int(best_counts[c_idx])} texels")
+    print(f"  texels with a reliable r (metallic≥{spec_threshold}): {tot_rvalid}")
 
-    # ── Mappe finali (cartelle dedicate, come l'albedo) ───────────────────────
+    # ── Final maps (dedicated folders, like the albedo) ───────────────────────
     fmt = ImageFormat.OPENEXR
     met_dir = src_dir / "metallic";  met_dir.mkdir(parents=True, exist_ok=True)
     rgh_dir = src_dir / "roughness"; rgh_dir.mkdir(parents=True, exist_ok=True)
@@ -504,10 +504,10 @@ def solve_pbr(output_dir: str,
     _save_layer(metallic.reshape(H, W), metallic_path, fmt, DataLayer.METALLIC)
     _save_layer(roughness.reshape(H, W), roughness_path, fmt, DataLayer.ROUGHNESS)
 
-    # Variante R/G/B nella convenzione dei bake di Blender, accanto agli
-    # originali a canale singolo (che restano l'input dei lettori interni).
-    # force=True: le mappe sono appena state riscritte, una _rgb rimasta da un
-    # run precedente sarebbe stantia.
+    # R/G/B variant in the convention of Blender's bakes, next to the
+    # single-channel originals (which stay the input of the internal readers).
+    # force=True: the maps were just rewritten, so an _rgb left over from an
+    # earlier run would be stale.
     metallic_rgb_path = roughness_rgb_path = None
     if blender_rgb:
         metallic_rgb_path = write_blender_rgb(metallic_path, force=True, quiet=True)
@@ -515,7 +515,7 @@ def solve_pbr(output_dir: str,
         metallic_rgb_path = metallic_rgb_path and metallic_rgb_path.as_posix()
         roughness_rgb_path = roughness_rgb_path and roughness_rgb_path.as_posix()
 
-    # ── Diagnostica ───────────────────────────────────────────────────────────
+    # ── Diagnostics ───────────────────────────────────────────────────────────
     pbr_dir = src_dir / "pbr"
     pbr_dir.mkdir(parents=True, exist_ok=True)
     _save_layer(diffuse_w.reshape(H, W), (pbr_dir / "diffuse_weight.exr").as_posix(),
@@ -532,17 +532,17 @@ def solve_pbr(output_dir: str,
                 (pbr_dir / "r_valid.png").as_posix(), ImageFormat.PNG,
                 DataLayer.MASK)
 
-    # Preview PNG a scala assoluta
+    # Absolute-scale PNG previews
     from PIL import Image
     Image.fromarray((np.clip(metallic, 0, 1).reshape(H, W) * 255).astype(np.uint8)
                     ).save(pbr_dir / "metallic_preview.png")
     Image.fromarray((np.clip(roughness, 0, 1).reshape(H, W) * 255).astype(np.uint8)
                     ).save(pbr_dir / "roughness_preview.png")
 
-    # ── Albedo PBR: a = π·α / (max(E_sky+E_ind, albedo_eps)·x) ───────────────
-    # L'albedo esce direttamente dal fit, già depurata dallo speculare per-vista;
-    # coesiste con l'albedo Lambertiana classica in <out>/sources/{source}/albedo/.
-    # Il calcolo è già stato fatto banda per banda: qui si scrive soltanto.
+    # ── PBR albedo: a = π·α / (max(E_sky+E_ind, albedo_eps)·x) ───────────────
+    # The albedo comes straight out of the fit, with the per-view specular already
+    # removed; it coexists with the classic Lambertian albedo in
+    # <out>/sources/{source}/albedo/. It was computed band by band: here it is only written.
     albedo_pbr_path = None
     albedo_pbr = None
     if has_irr:
@@ -554,17 +554,17 @@ def solve_pbr(output_dir: str,
         Image.fromarray((albedo_pbr * 255).astype(np.uint8)
                         ).save(pbr_dir / "albedo_pbr_preview.png")
         print(f"✓ albedo_pbr: {albedo_pbr_path} (indirect: "
-              f"{'sì' if has_ind else 'no'})")
+              f"{'yes' if has_ind else 'no'})")
     else:
-        print(f"    ⚠  albedo_pbr saltata: {irr_path} non trovata "
-              "(serve il pass irradiance)")
+        print(f"    ⚠  albedo_pbr skipped: {irr_path} not found "
+              "(the irradiance pass is required)")
 
     print(f"✓ metallic:  {metallic_path}")
     print(f"✓ roughness: {roughness_path}")
     if metallic_rgb_path and roughness_rgb_path:
-        print(f"✓ variante RGB per Blender: {Path(metallic_rgb_path).name}, "
+        print(f"✓ Blender RGB variants: {Path(metallic_rgb_path).name}, "
               f"{Path(roughness_rgb_path).name}")
-    print(f"✓ diagnostica in {pbr_dir}")
+    print(f"✓ diagnostics in {pbr_dir}")
     return {
         "metallic_path": metallic_path,
         "roughness_path": roughness_path,
@@ -585,23 +585,23 @@ def solve_pbr(output_dir: str,
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
-        description="Fit PBR C_j = (a·x/π)·E + (1-x)·L_j(r) → "
+        description="PBR fit C_j = (a·x/π)·E + (1-x)·L_j(r) → "
                     "metallic/roughness/albedo_pbr")
-    ap.add_argument("output_dir", help="output_dir del pipeline (contiene spec_cone/, ...)")
+    ap.add_argument("output_dir", help="the pipeline output_dir (holds spec_cone/, ...)")
     ap.add_argument("--source", type=str, default="gt",
-                    help="sorgente da processare (sources/{source}/, es. gt o nerf)")
+                    help="source to process (sources/{source}/, e.g. gt or nerf)")
     ap.add_argument("--spec-threshold", type=float, default=0.2,
-                    help="metallic minimo perché r sia attendibile (sotto: roughness=1)")
+                    help="minimum metallic for r to be reliable (below it: roughness=1)")
     ap.add_argument("--min-views", type=int, default=2,
-                    help="minimo di camere valide per texel")
+                    help="minimum number of valid cameras per texel")
     ap.add_argument("--albedo-eps", type=float, default=1e-3,
-                    help="clamp minimo dell'irradiance nell'albedo_pbr")
+                    help="lower clamp on the irradiance in albedo_pbr")
     ap.add_argument("--tile-texels", type=int, default=1 << 20,
-                    help="texel per banda (arrotondati a scanline intere): il "
-                         "picco di RAM scala con questo, non con la risoluzione")
+                    help="texels per band (rounded to whole scanlines): the peak "
+                         "RAM scales with this, not with the resolution")
     ap.add_argument("--no-blender-rgb", action="store_true",
-                    help="non scrivere le varianti metallic_rgb/roughness_rgb "
-                         "(EXR R/G/B nella convenzione dei bake di Blender)")
+                    help="do not write the metallic_rgb/roughness_rgb variants "
+                         "(R/G/B EXRs in the convention of Blender's bakes)")
     args = ap.parse_args()
     solve_pbr(args.output_dir, source=args.source,
               spec_threshold=args.spec_threshold,
