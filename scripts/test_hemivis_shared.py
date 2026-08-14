@@ -1,42 +1,40 @@
-"""Test del pass HemiVis e della ricostruzione condivisa, envmap-only (niente NeRF).
+"""Test of the HemiVis pass and of the shared reconstruction, envmap-only (no NeRF).
 
-Lo schema condiviso traccia UN set Fibonacci per texel e lascia che ogni camera
-classifichi gli stessi raggi nel proprio anello. Il kernel restituisce solo i
-t_hit, indicizzati per posizione: le direzioni vivono lato Python. Le verifiche
-qui sotto coprono, in ordine di insidiosità:
+The shared scheme traces ONE Fibonacci set per texel and lets each camera bin the
+same rays into its own ring. The kernel returns only the t_hits, indexed by
+position: the directions live on the Python side. The checks below cover, in order
+of insidiousness:
 
-  1. PARITÀ kernel↔torch delle direzioni (condivise e specchio). È il fallimento
-     più pericoloso dell'intero schema: se le due formule divergono, ogni t_hit
-     viene appaiato alla direzione sbagliata e non c'è alcun sintomo se non una
-     L_j silenziosamente errata.
-  2. Proprietà del set condiviso: tutte le direzioni sopra l'orizzonte, cosθ
-     esattamente equispaziato (uniformità in angolo solido), rotazione azimutale
-     diversa da texel a texel.
-  3. Envmap costante: ogni media per anello e ogni L(k) ricostruita valgono
-     esattamente il valore dell'envmap, livello specchio compreso (unità di
-     radianza omogenee tra tutti i candidati).
-  4. Envmap 'gradient' con riferimento ANALITICO: sui coni interamente sopra
-     l'orizzonte L(k) = 0.5 + 0.5·R_z·(1+cos b_k)/2 in forma chiusa. È l'unico
-     check con potere discriminante sui pesi: su envmap costante ogni media di
-     anello vale 1, quindi qualsiasi combinazione convessa dà 1 e un peso
-     sbagliato resta invisibile.
-  5. Il livello specchio coincide con l'envmap valutata lungo R = reflect(v, n)
-     calcolato in NumPy.
-  6. Chiusura dei coni e formato su disco: somme grezze → _cones_from_rings_np →
-     IncrementalExrWriter → read_cones deve dare la stessa L della formula
-     pesata validata ai punti 3-4.
+  1. kernel↔torch PARITY of the directions (shared and mirror). It is the most
+     dangerous failure of the whole scheme: if the two formulas diverge, every
+     t_hit is paired with the wrong direction and there is no symptom other than a
+     silently wrong L_j.
+  2. Properties of the shared set: every direction above the horizon, cosθ exactly
+     equispaced (uniformity in solid angle), and an azimuthal rotation that differs
+     from texel to texel.
+  3. Constant envmap: every per-ring mean and every reconstructed L(k) is exactly
+     the envmap value, the mirror level included (homogeneous radiance units
+     across every candidate).
+  4. 'gradient' envmap with an ANALYTIC reference: on the cones entirely above the
+     horizon, L(k) = 0.5 + 0.5·R_z·(1+cos b_k)/2 in closed form. It is the only
+     check with power over the weights: on a constant envmap every ring mean is 1,
+     so any convex combination yields 1 and a wrong weight stays invisible.
+  5. The mirror level matches the envmap evaluated along R = reflect(v, n)
+     computed in NumPy.
+  6. Cone closing and the on-disk format: raw sums → _cones_from_rings_np →
+     IncrementalExrWriter → read_cones must give the same L as the weighted formula
+     validated in points 3-4.
 
-I test 3-5 girano su un quad planare generato al volo: sul modello reale, con
-migliaia di direzioni per texel, quasi ogni texel trova qualcosa da colpire e i
-raggi occlusi richiederebbero il NeRF, senza più un riferimento in forma chiusa.
-Sul quad le direzioni stanno tutte nell'emisfero sopra la normale, quindi nessun
-raggio può colpire il quad stesso.
+Tests 3-5 run on a flat quad generated on the fly: on the real model, with thousands
+of directions per texel, almost every texel finds something to hit and the occluded
+rays would need the NeRF, leaving no closed-form reference. Above a planar quad every
+direction lies in the hemisphere above the normal, so no ray can hit the quad itself.
 
-Nota: il processo esce con codice diverso da zero allo shutdown dell'interprete
-(problema di cleanup OptiX preesistente, non un fallimento del test — come in
-test_spec_cone_smoke.py). Fa fede la riga "✓ tutti i test HemiVis passati".
+Note: the process exits with a non-zero code at interpreter shutdown (a pre-existing
+OptiX cleanup issue, not a test failure — as in test_spec_cone_smoke.py). The line
+that counts is "✓ all HemiVis tests passed".
 
-Uso:  python test_hemivis_shared.py
+Usage:  python test_hemivis_shared.py
 """
 
 import sys
@@ -62,7 +60,7 @@ APERTURES = [0.0, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 80.0,
 K = len(APERTURES)
 COS_B = np.cos(np.radians(np.asarray(APERTURES)) * 0.5)
 
-S = 8192            # campioni condivisi per texel
+S = 8192            # shared samples per texel
 IUM_RES = 64
 TILE = 1024
 SKY_W, SKY_H = 256, 128
@@ -71,21 +69,21 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def make_envmap(mode: str) -> np.ndarray:
-    """Envmap equirettangolare (H*W, 3) float32, convenzione di sampleEnvmap."""
+    """Equirectangular envmap (H*W, 3) float32, sampleEnvmap convention."""
     if mode == "constant":
         return np.full((SKY_H * SKY_W, 3), 1.0, dtype=np.float32)
     v = (np.arange(SKY_H) + 0.5) / SKY_H
-    dz = np.sin((0.5 - v) * np.pi)                   # elevazione per riga
+    dz = np.sin((0.5 - v) * np.pi)                   # elevation per row
     rows = (0.5 + 0.5 * dz).astype(np.float32)
     env = np.repeat(rows[:, None], SKY_W, axis=1)
     return np.stack([env, env, env], axis=-1).reshape(-1, 3)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Setup scena
+# Scene setup
 # ──────────────────────────────────────────────────────────────────────────────
 
-print(f"Carico modello: {MODEL}")
+print(f"Loading model: {MODEL}")
 model = optix.TriangleMesh()
 model.add_from_obj_file(MODEL.as_posix())
 
@@ -99,7 +97,7 @@ pos_np = ium_res.positions_np.astype(np.float32)
 nrm_np = ium_res.normals_np.astype(np.float32)
 masks  = ium_res.masks_np.astype(bool)
 num_pix = pos_np.shape[0]
-print(f"IUM {IUM_RES}×{IUM_RES}: {masks.sum()} texel validi")
+print(f"IUM {IUM_RES}×{IUM_RES}: {masks.sum()} valid texels")
 
 center = pos_np[masks].mean(axis=0)
 diag = np.linalg.norm(pos_np[masks].max(0) - pos_np[masks].min(0))
@@ -116,7 +114,7 @@ n_tiles = gen.num_tiles()
 t_hit = np.zeros((num_pix, S), dtype=np.float32)
 t_mir = np.zeros((num_pix, 1), dtype=np.float32)
 
-# ── Test 1: parità kernel ↔ torch delle direzioni ────────────────────────────
+# ── Test 1: kernel ↔ torch parity of the directions ──────────────────────────
 max_err_shared = 0.0
 max_err_mirror = 0.0
 for t in range(n_tiles):
@@ -137,7 +135,7 @@ for t in range(n_tiles):
     max_err_shared = max(max_err_shared,
                          np.abs(dirs_torch - r.dirs_np[live]).max())
 
-    # Raggio specchio: stessa formula del kernel, in torch
+    # Mirror ray: the same formula as the kernel, in torch
     v = torch.as_tensor(cam_pos, device=device)[None, :] - pos_t
     v = v / torch.linalg.norm(v, dim=-1, keepdim=True)
     n_unit = nrm_t / torch.linalg.norm(nrm_t, dim=-1, keepdim=True)
@@ -150,45 +148,45 @@ for t in range(n_tiles):
                                     - r.dirs_mirror_np[live][front, 0]).max())
 
 assert max_err_shared < 1e-5, \
-    f"direzioni condivise divergono tra kernel e torch: {max_err_shared:.2e}"
+    f"shared directions diverge between kernel and torch: {max_err_shared:.2e}"
 assert max_err_mirror < 1e-5, \
-    f"direzioni specchio divergono tra kernel e torch: {max_err_mirror:.2e}"
-print(f"✓ parità direzioni kernel↔torch: max err condivise {max_err_shared:.2e}, "
-      f"specchio {max_err_mirror:.2e}")
+    f"mirror directions diverge between kernel and torch: {max_err_mirror:.2e}"
+print(f"✓ kernel↔torch direction parity: max err shared {max_err_shared:.2e}, "
+      f"mirror {max_err_mirror:.2e}")
 
-# ── Test 2: proprietà del set condiviso ──────────────────────────────────────
+# ── Test 2: properties of the shared set ────────────────────────────────────
 probe = np.flatnonzero(masks & (np.linalg.norm(nrm_np, axis=-1) > 1e-8))[:64]
 nrm_p = torch.as_tensor(nrm_np[probe], device=device)
 dirs_p = _hemivis_directions(nrm_p, probe, S)
 n_unit_p = nrm_p / torch.linalg.norm(nrm_p, dim=-1, keepdim=True)
 cos_n = (dirs_p * n_unit_p[:, None, :]).sum(-1).cpu().numpy()
 
-assert cos_n.min() > 0.0, "un campione condiviso cade sotto l'orizzonte"
+assert cos_n.min() > 0.0, "a shared sample falls below the horizon"
 expected_cos = 1.0 - (np.arange(S) + 0.5) / S
 assert np.abs(np.sort(cos_n, axis=1)[:, ::-1] - expected_cos).max() < 1e-5, \
-    "cosθ non equispaziato: il set non è uniforme in angolo solido"
+    "cosθ not equispaced: the set is not uniform in solid angle"
 norms = np.linalg.norm(dirs_p.cpu().numpy(), axis=-1)
-assert np.abs(norms - 1.0).max() < 1e-5, "direzioni non normalizzate"
+assert np.abs(norms - 1.0).max() < 1e-5, "directions not normalised"
 
 rots = _hemivis_rotation(probe)
-assert 0.0 <= rots.min() and rots.max() < 1.0, "rotazione fuori da [0,1)"
+assert 0.0 <= rots.min() and rots.max() < 1.0, "rotation outside [0,1)"
 assert len(np.unique(rots)) > len(probe) * 0.9, \
-    "la rotazione azimutale non decorrela i texel"
-print(f"✓ set condiviso uniforme in angolo solido, {len(np.unique(rots))} "
-      f"rotazioni distinte su {len(probe)} texel")
+    "the azimuthal rotation does not decorrelate the texels"
+print(f"✓ shared set uniform in solid angle, {len(np.unique(rots))} "
+      f"distinct rotations over {len(probe)} texels")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Ricostruzione dei coni dai raggi condivisi (la stessa che fa il bake)
+# Cone reconstruction from the shared rays (the same one the bake does)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def bin_shared(idx: np.ndarray, envmap: np.ndarray,
                pos_np, nrm_np, t_hit, t_mir, cam_pos):
-    """(means (n, K, 3), counts (n, K), R (n, 3)) per i texel `idx`, camera unica.
+    """(means (n, K, 3), counts (n, K), R (n, 3)) for the texels `idx`, single camera.
 
-    Replica il binning di _precompute_spec_cone_shared: i raggi miss prendono
-    l'envmap, il livello 0 è il raggio specchio, i campioni oltre il cono più
-    largo vengono scartati.
+    Replicates the binning of _precompute_spec_cone_shared: missed rays take the
+    envmap, level 0 is the mirror ray, and the samples beyond the widest cone are
+    discarded.
     """
     env_t = torch.as_tensor(envmap, device=device)
     nrm_t = torch.as_tensor(nrm_np[idx], device=device)
@@ -219,9 +217,9 @@ def bin_shared(idx: np.ndarray, envmap: np.ndarray,
     sums   = acc_s.view(n, K + 1, 3)[:, :K].clone()
     counts = acc_c.view(n, K + 1)[:, :K].clone()
 
-    # Livello 0: raggio specchio
+    # Level 0: mirror ray
     thm = torch.as_tensor(t_mir[idx, 0], device=device)
-    mir_ok = (thm == 0.0)                       # miss → envmap; hit → serve il NeRF
+    mir_ok = (thm == 0.0)                       # miss → envmap; hit → the NeRF is needed
     if bool(mir_ok.any()):
         sums[mir_ok, 0] = _sample_envmap_torch(R[mir_ok], env_t, [SKY_W, SKY_H], 0.0)
         counts[mir_ok, 0] = 1.0
@@ -231,7 +229,7 @@ def bin_shared(idx: np.ndarray, envmap: np.ndarray,
 
 
 def cone_mean(means, counts, k, ring_samples):
-    """L(k) come la calcola pbr_solver: media pesata degli anelli 1..k."""
+    """L(k) as pbr_solver computes it: weighted mean of rings 1..k."""
     w = ring_weights_mean(COS_B, k, ring_samples)          # (K-1,)
     wc = w[None, :] * counts[:, 1:]
     num = np.einsum("nk,nkc->nc", wc, means[:, 1:])
@@ -241,13 +239,13 @@ def cone_mean(means, counts, k, ring_samples):
 RING_NOMINAL = np.asarray(spec_cone_shared_ring_samples(APERTURES, S))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Scena piana per i test analitici
+# Flat scene for the analytic tests
 #
-# Sul modello reale, con S=8192 direzioni per texel, praticamente ogni texel
-# trova qualcosa da colpire: i raggi occlusi richiederebbero il NeRF e non c'è
-# più un riferimento in forma chiusa. Un quad planare risolve il problema alla
-# radice: le direzioni stanno tutte nell'emisfero sopra la normale, quindi NESSUN
-# raggio può colpire il quad stesso e ogni campione vede l'envmap.
+# On the real model, with S=8192 directions per texel, practically every texel finds
+# something to hit: the occluded rays would need the NeRF and there would be no
+# closed-form reference left. A planar quad solves the problem at the root: every
+# direction lies in the hemisphere above the normal, so NO ray can hit the quad
+# itself and every sample sees the envmap.
 # ──────────────────────────────────────────────────────────────────────────────
 
 import tempfile
@@ -271,8 +269,8 @@ ium_q_res = ium_q.get_result()
 qpos = ium_q_res.positions_np.astype(np.float32)
 qnrm = ium_q_res.normals_np.astype(np.float32)
 qmask = ium_q_res.masks_np.astype(bool)
-# camera a distanza finita e fuori asse: R_z varia tra i texel, altrimenti il
-# riferimento analitico sarebbe costante e non discriminerebbe nulla
+# camera at a finite distance and off axis: R_z varies between the texels, otherwise
+# the analytic reference would be constant and would discriminate nothing
 qcam = np.array([1.6, 1.1, 1.4], dtype=np.float32)
 
 gen_q = optix.HemiVisGenerator()
@@ -289,38 +287,38 @@ for t in range(gen_q.num_tiles()):
     q_t_mir[off:off + tt] = r.t_hit_mirror_np
 
 sky_only = np.flatnonzero(qmask & (q_t_hit <= 0.0).all(axis=1) & (q_t_mir[:, 0] == 0.0))
-print(f"quad planare: {qmask.sum()} texel, di cui {sky_only.size} senza occlusioni")
+print(f"planar quad: {qmask.sum()} texels, {sky_only.size} of them unoccluded")
 assert sky_only.size > 500, \
-    f"il quad dovrebbe essere privo di auto-occlusioni, trovati {sky_only.size} texel"
+    f"the quad should be free of self-occlusion, found {sky_only.size} texels"
 
-# ── Test 3: envmap costante ──────────────────────────────────────────────────
+# ── Test 3: constant envmap ──────────────────────────────────────────────────
 means_c, counts_c, _ = bin_shared(sky_only, make_envmap("constant"),
                                   qpos, qnrm, q_t_hit, q_t_mir, qcam)
 has = counts_c > 0
 assert np.abs(means_c[has] - 1.0).max() < 1e-3, \
-    "media di anello diversa dall'envmap costante"
+    "ring mean differs from the constant envmap"
 for k in range(1, K):
     L = cone_mean(means_c, counts_c, k, RING_NOMINAL)
     assert np.abs(L - 1.0).max() < 1e-3, \
-        f"L(k={k}) = {L.min():.4f}..{L.max():.4f} su envmap costante"
-assert np.abs(means_c[:, 0] - 1.0).max() < 1e-3, "livello specchio ≠ envmap"
-print("✓ envmap costante: ogni anello, ogni cono e lo specchio valgono 1.0")
+        f"L(k={k}) = {L.min():.4f}..{L.max():.4f} on a constant envmap"
+assert np.abs(means_c[:, 0] - 1.0).max() < 1e-3, "mirror level ≠ envmap"
+print("✓ constant envmap: every ring, every cone and the mirror are 1.0")
 
-# ── Test 4/5: envmap gradient, riferimento analitico ─────────────────────────
+# ── Tests 4/5: gradient envmap, analytic reference ───────────────────────────
 env_grad = make_envmap("gradient")
 means_g, counts_g, R_g = bin_shared(sky_only, env_grad,
                                     qpos, qnrm, q_t_hit, q_t_mir, qcam)
 
-# Test 5: livello specchio ≡ envmap lungo R (continua, f(dz) = 0.5 + 0.5·dz)
+# Test 5: mirror level ≡ envmap along R (continuous, f(dz) = 0.5 + 0.5·dz)
 mirror_ref = 0.5 + 0.5 * R_g[:, 2]
 err_mirror = np.abs(means_g[:, 0, 0] - mirror_ref).max()
-assert err_mirror < 2e-2, f"specchio ≠ envmap(R): err max {err_mirror:.4f}"
-print(f"✓ livello specchio ≡ envmap(reflect(v,n)): err max {err_mirror:.4f} "
-      f"(discretizzazione {SKY_W}×{SKY_H})")
+assert err_mirror < 2e-2, f"mirror ≠ envmap(R): max err {err_mirror:.4f}"
+print(f"✓ mirror level ≡ envmap(reflect(v,n)): max err {err_mirror:.4f} "
+      f"(discretization {SKY_W}×{SKY_H})")
 
-# Test 4: L(k) = 0.5 + 0.5·R_z·(1+cos b_k)/2 sui coni non tagliati dall'orizzonte.
-# Il taglio va escluso perché la formula chiusa vale sul cono intero; il bake
-# reale invece tronca all'orizzonte (ed è corretto che lo faccia).
+# Test 4: L(k) = 0.5 + 0.5·R_z·(1+cos b_k)/2 on the cones not cut by the horizon.
+# The truncation has to be excluded because the closed form holds on the whole cone;
+# the real bake truncates at the horizon instead (and is right to do so).
 n_unit_g = qnrm[sky_only] / np.linalg.norm(qnrm[sky_only], axis=-1, keepdims=True)
 cos_nr = (n_unit_g * R_g).sum(-1)
 theta_R = np.degrees(np.arccos(np.clip(cos_nr, -1, 1)))
@@ -329,53 +327,53 @@ checked = 0
 widest = None
 for k in range(1, K):
     b = APERTURES[k] / 2.0
-    unclipped = theta_R + b < 88.0                    # margine sul bordo
+    unclipped = theta_R + b < 88.0                    # margin at the edge
     if unclipped.sum() < 20:
         continue
     L = cone_mean(means_g, counts_g, k, RING_NOMINAL)[unclipped, 0]
     ref = 0.5 + 0.5 * R_g[unclipped, 2] * (1.0 + COS_B[k]) / 2.0
     err = np.abs(L - ref).max()
     n_samp = S * (1.0 - COS_B[k])
-    assert err < 0.05, (f"L(apertura {APERTURES[k]}°) devia dall'analitico: "
-                        f"err max {err:.4f} su {int(unclipped.sum())} texel")
-    print(f"    apertura {APERTURES[k]:5.0f}° (~{n_samp:5.0f} campioni): "
-          f"err max {err:.4f} su {int(unclipped.sum())} texel")
+    assert err < 0.05, (f"L(aperture {APERTURES[k]}°) deviates from the analytic: "
+                        f"max err {err:.4f} over {int(unclipped.sum())} texels")
+    print(f"    aperture {APERTURES[k]:5.0f}° (~{n_samp:5.0f} samples): "
+          f"max err {err:.4f} over {int(unclipped.sum())} texels")
     checked += 1
     widest = (k, unclipped, err)
 
-assert checked >= 4, f"solo {checked} aperture verificate contro l'analitico"
-print(f"✓ riferimento analitico verificato su {checked} aperture")
+assert checked >= 4, f"only {checked} apertures checked against the analytic reference"
+print(f"✓ analytic reference verified on {checked} apertures")
 
-# Controllo negativo: senza i conteggi nominali nel meta il solver userebbe
-# W_i = Ω_i, che con campioni GIÀ proporzionali a Ω_i pesa l'angolo solido due
-# volte. Il test analitico deve accorgersene, altrimenti non sta verificando i
-# pesi ma solo che la media di qualcosa fa qualcosa. La discriminazione cresce
-# con l'apertura, quindi si misura al troncamento più largo raggiunto.
+# Negative control: without the nominal counts in the meta the solver would use
+# W_i = Ω_i, which with samples ALREADY proportional to Ω_i weighs the solid angle
+# twice. The analytic test has to notice, otherwise it is not checking the weights
+# but merely that the mean of something does something. The discrimination grows
+# with the aperture, so it is measured at the widest truncation reached.
 k_w, unclipped_w, err_ok = widest
 L_bad = cone_mean(means_g, counts_g, k_w, None)[unclipped_w, 0]
 ref_w = 0.5 + 0.5 * R_g[unclipped_w, 2] * (1.0 + COS_B[k_w]) / 2.0
 err_bad = np.abs(L_bad - ref_w).max()
 assert err_bad > 20.0 * max(err_ok, 1e-6), (
-    f"pesi sbagliati indistinguibili a {APERTURES[k_w]}°: "
-    f"err corretto {err_ok:.5f} vs err sbagliato {err_bad:.5f}")
-print(f"✓ controllo negativo a {APERTURES[k_w]:.0f}°: pesi Ω_i (sbagliati) "
-      f"danno err {err_bad:.4f} contro {err_ok:.4f} → il test discrimina "
+    f"wrong weights indistinguishable at {APERTURES[k_w]}°: "
+    f"correct err {err_ok:.5f} vs wrong err {err_bad:.5f}")
+print(f"✓ negative control at {APERTURES[k_w]:.0f}°: Ω_i weights (wrong) "
+      f"give err {err_bad:.4f} against {err_ok:.4f} → the test discriminates "
       f"({err_bad / max(err_ok, 1e-6):.0f}×)")
 
-# ── Test 6: chiusura dei coni e round-trip del formato su disco ──────────────
-# Il bake non salva più gli anelli: chiude i coni e scrive un canale RGB per
-# candidato. Qui si verifica che quel percorso (somme grezze →
-# _cones_from_rings_np → IncrementalExrWriter → read_cones) dia la stessa L che
-# la formula pesata di cone_mean, cioè quella validata dai test analitici sopra.
+# ── Test 6: cone closing and round trip of the on-disk format ────────────────
+# The bake no longer saves the rings: it closes the cones and writes one RGB channel
+# per candidate. Here we check that this path (raw sums → _cones_from_rings_np →
+# IncrementalExrWriter → read_cones) gives the same L as cone_mean's weighted
+# formula, i.e. the one validated by the analytic tests above.
 with tempfile.TemporaryDirectory() as td:
     p = Path(td) / "cam_000.exr"
     rng = np.random.default_rng(0)
     n_tex = IUM_RES * IUM_RES
     ref_means  = rng.random((n_tex, K, 3), dtype=np.float32).astype(np.float64)
     ref_counts = rng.integers(0, 500, (n_tex, K)).astype(np.float64)
-    # il livello 0 è un raggio solo: 0 quando la camera è dietro la superficie
+    # level 0 is a single ray: 0 when the camera is behind the surface
     ref_counts[:, 0] = rng.integers(0, 2, n_tex).astype(np.float64)
-    ref_counts[:37] = 0.0                       # texel mai visti dalla camera
+    ref_counts[:37] = 0.0                       # texels never seen by the camera
     ref_sum = ref_means * ref_counts[..., None]
 
     cone_w = ring_weights_mean(COS_B, K - 1, RING_NOMINAL)
@@ -389,17 +387,17 @@ with tempfile.TemporaryDirectory() as td:
     cones_img = cones.reshape(IUM_RES, IUM_RES, K, 3)
     valid_img = n_valid.astype(np.float32).reshape(IUM_RES, IUM_RES)
     names = [spec_cone_level_name(APERTURES, k) for k in range(K)]
-    # I nomi dei livelli sono ciò che si legge nel viewer: devono portare
-    # l'apertura, non contenere punti (nei canali EXR il punto separa il layer
-    # dal canale) e stare in ordine alfabetico crescente, così tev elenca i
-    # layer in ordine di apertura invece che 10°, 100°, 120°, 15°…
-    assert all("." not in n for n in names), f"punto nei nomi dei livelli: {names}"
-    assert names == sorted(names), f"ordine alfabetico ≠ ordine angolare: {names}"
+    # The level names are what one reads in the viewer: they must carry the aperture,
+    # contain no dots (in EXR channels the dot separates the layer from the channel)
+    # and be in ascending alphabetical order, so that tev lists the layers in
+    # aperture order rather than 10°, 100°, 120°, 15°…
+    assert all("." not in n for n in names), f"dot in the level names: {names}"
+    assert names == sorted(names), f"alphabetical order ≠ angular order: {names}"
     for k in range(1, K):
         assert str(int(APERTURES[k])) in names[k], \
-            f"il livello {k} non porta la sua apertura: {names[k]}"
+            f"level {k} does not carry its aperture: {names[k]}"
     assert spec_cone_level_name([0.0, 7.5], 1) == "cone_007p5deg", \
-        "aperture frazionarie: serve 'p' al posto del punto decimale"
+        "fractional apertures: 'p' is needed instead of the decimal point"
     for r0 in range(0, IUM_RES, rows):
         block = {}
         for k in range(K):
@@ -411,22 +409,22 @@ with tempfile.TemporaryDirectory() as td:
 
     got_cones, got_valid = read_cones(p, APERTURES)
     assert np.array_equal(got_valid, n_valid.astype(np.float32)), \
-        "conteggi validi alterati dal round-trip"
+        "valid counts altered by the round trip"
     seen = n_valid > 0
-    # la cumsum del bake deve riprodurre la formula pesata, entro il half su disco
+    # the bake's cumsum must reproduce the weighted formula, within the on-disk half
     for k in range(1, K):
         ref = cone_mean(ref_means[seen], ref_counts[seen], k, RING_NOMINAL)
         err = np.abs(got_cones[seen][:, k] - ref).max()
-        assert err < 2e-3, f"cono {APERTURES[k]:g}°: scarto {err:.2e} da cone_mean"
-    # Lo specchio esiste solo dove il raggio è stato lanciato: dove non c'è, il
-    # livello 0 resta 0 (stessa convenzione del vecchio bake per anelli, che
-    # riempiva le medie solo sui livelli con almeno un campione).
+        assert err < 2e-3, f"cone {APERTURES[k]:g}°: gap of {err:.2e} from cone_mean"
+    # The mirror exists only where the ray was launched: where it was not, level 0
+    # stays 0 (the same convention as the old ring bake, which filled the means only
+    # on the levels with at least one sample).
     has_mirror = seen & (ref_counts[:, 0] > 0)
     assert np.abs(got_cones[has_mirror][:, 0] - ref_means[has_mirror][:, 0]).max() < 2e-3, \
-        "specchio alterato"
+        "mirror altered"
     assert (got_cones[seen & (ref_counts[:, 0] == 0)][:, 0] == 0).all(), \
-        "specchio non nullo senza raggio lanciato"
-    assert (got_cones[~seen] == 0).all(), "texel senza campioni non azzerati"
-print("✓ chiusura dei coni ≡ cone_mean + round-trip IncrementalExrWriter → read_cones")
+        "non-zero mirror with no ray launched"
+    assert (got_cones[~seen] == 0).all(), "texels with no samples not zeroed"
+print("✓ cone closing ≡ cone_mean + round trip IncrementalExrWriter → read_cones")
 
-print("\n✓ tutti i test HemiVis passati")
+print("\n✓ all HemiVis tests passed")
