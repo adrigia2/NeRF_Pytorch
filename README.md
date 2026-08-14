@@ -318,8 +318,15 @@ Step 4 touches neither OptiX nor the NeRF checkpoint — it reads the Step 3 cac
 disk. This is how you iterate on the solver. Equivalently, standalone:
 
 ```bash
-python pbr_solver.py "D:/tesi_output/<sweep>/<tag>/<scene>" --source gt
+python pbr_solver.py "D:/tesi_output/<sweep>/<tag>/<scene>" --source gt --spec-threshold 0
 ```
+
+> **Pass `--spec-threshold` explicitly.** The CLI defaults it to `0.2`, whereas the
+> pipeline's `__main__` sets `pbr_spec_threshold = 0.0`. Running the solver standalone
+> without the flag therefore rewrites `roughness.exr` with a *different* gate than the
+> one your run was produced with — every other map is threshold-independent and comes
+> out bit-identical, so the discrepancy is easy to miss. The same applies to
+> `--cv-gate`, whose neutral value is `0`.
 
 ### 6.2 Restrict to a region of the texture
 
