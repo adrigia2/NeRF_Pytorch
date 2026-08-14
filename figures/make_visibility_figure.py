@@ -1,33 +1,33 @@
 #!/usr/bin/env python
-"""make_visibility_figure.py -- Mappe in spazio texture per le figure 3.8 e 3.3.7.
+"""make_visibility_figure.py -- texture-space maps for figures 3.8 and 3.3.7.
 
     python make_visibility_figure.py <run_dir> --camera render_Camera_Shell21_38 \
         --out ../Doc/images/visibility
     python make_visibility_figure.py <run_dir> --irradiance --out ../Doc/images/irradiance
 
-Modalita' `--visibility` (default), figura 3.8:
+`--visibility` mode (the default), figure 3.8:
 
-  camera_mask.png    la maschera di UNA camera in spazio texel: i texel che quella
-                     camera vede davvero, cioe' occlusione AND frustum AND grazing
-  camera_count.png   quante camere coprono ogni texel, sommando i 60 canali di
-                     visibility.exr, su scala di colore con barra
+  camera_mask.png    the mask of ONE camera in texel space: the texels that camera
+                     really sees, i.e. occlusion AND frustum AND grazing
+  camera_count.png   how many cameras cover each texel, summing the 60 channels of
+                     visibility.exr, on a colour scale with a bar
 
-Modalita' `--irradiance`, sezione 3.3.7:
+`--irradiance` mode, section 3.3.7:
 
-  irradiance.png           la componente diretta dalla environment map
-  irradiance_indirect.png  la componente indiretta interrogata dal NeRF
+  irradiance.png           the direct component from the environment map
+  irradiance_indirect.png  the indirect component queried from the NeRF
 
-Le due componenti dell'irradiance sono HDR e hanno intervalli molto diversi (l'indiretta
-e' tipicamente un ordine di grandezza sotto), quindi si normalizzano **separatamente** e
-si scrive il fattore usato: una scala comune renderebbe l'indiretta un rettangolo nero e
-non direbbe niente.  La normalizzazione e' su un percentile, non sul massimo, perche' la
-coda HDR di una scena con sorgente concentrata schiaccerebbe tutto il resto.
+The two irradiance components are HDR and have very different ranges (the indirect one is
+typically an order of magnitude lower), so they are normalised **separately** and the
+factor used is printed: a common scale would turn the indirect one into a black rectangle
+and say nothing.  The normalization is on a percentile, not on the maximum, because the
+HDR tail of a scene with a concentrated source would crush everything else.
 
-ATTENZIONE alla sorgente: dopo il fix dell'azimut in `deviceProgramsIrradiance.cu`
-(13/08/2026) le `irradiance.exr` di `test_sword_shield` sono stale.  Per la figura della
-tesi va usato l'albero rigenerato `test_sword_shield_after_fix_irradiance`.  Le mappe di
-visibilita' e le maschere per-camera invece non dipendono dall'irradiance e sono
-bit-identiche fra i due alberi, quindi per la 3.8 va bene entrambi.
+MIND THE SOURCE: after the azimuth fix in `deviceProgramsIrradiance.cu` (2026-08-13) the
+`irradiance.exr` files of `test_sword_shield` are stale.  The thesis figure must use the
+regenerated tree `test_sword_shield_after_fix_irradiance`.  The visibility maps and the
+per-camera masks do not depend on the irradiance and are bit-identical between the two
+trees, so either works for figure 3.8.
 """
 from __future__ import annotations
 
@@ -49,13 +49,13 @@ from make_skybox_figure import load_exr                   # noqa: E402
 plt.rcParams.update({"font.size": 13})
 
 DPI = 190
-PCTL = 99.5          # percentile per la normalizzazione delle mappe HDR
-MARGIN = 0.02        # margine del ritaglio sull'area utile dell'atlante
+PCTL = 99.5          # percentile for the normalization of the HDR maps
+MARGIN = 0.02        # crop margin around the used area of the atlas
 
 
 def read_channels(path: Path) -> dict:
-    """Tutti i canali di un EXR come float32.  `load_exr` assume RGB e visibility.exr
-    ha un canale per camera, quindi qui si legge l'header e si prende tutto."""
+    """Every channel of an EXR as float32.  `load_exr` assumes RGB and visibility.exr has
+    one channel per camera, so here the header is read and everything is taken."""
     import OpenEXR
     import Imath
     fh = OpenEXR.InputFile(str(path))
@@ -68,15 +68,15 @@ def read_channels(path: Path) -> dict:
 
 
 def crop_to_atlas(run: Path):
-    """Il riquadro utile dell'atlante, dalla maschera IUM.  Lo stesso `content_box` che
-    usa make_depth_figure, cosi' i ritagli delle figure sono confrontabili fra loro."""
+    """The used box of the atlas, from the IUM mask.  The same `content_box`
+    make_depth_figure uses, so the crops of the figures are comparable."""
     mask = load_exr(run / "ium" / "ium_masks.exr")[..., 0] > 0.5
     return content_box(mask, MARGIN), mask
 
 
 def heat_png(data: np.ndarray, mask: np.ndarray, out: Path, label: str,
              vmax: float | None = None, cmap: str = "magma") -> None:
-    """Mappa in falsi colori con barra, fuori maschera in grigio neutro."""
+    """False-colour map with a bar, neutral grey outside the mask."""
     fig, ax = plt.subplots(figsize=(6.0, 5.6))
     shown = np.where(mask, data, np.nan)
     im = ax.imshow(shown, cmap=cmap, vmin=0.0, vmax=vmax, interpolation="nearest")
@@ -94,12 +94,12 @@ def do_visibility(run: Path, camera: str, out: Path) -> None:
 
     cam_path = run / "camera_mask" / f"{camera}.exr"
     if not cam_path.exists():
-        raise SystemExit(f"✗ maschera per-camera non trovata: {cam_path}")
+        raise SystemExit(f"✗ per-camera mask not found: {cam_path}")
     cam = load_exr(cam_path)[..., 0] > 0.5
     save_png(np.repeat(cam[ys, xs, None].astype(np.float32), 3, axis=-1),
              out / "camera_mask.png")
-    print(f"  camera_mask.png       {camera}: {100 * cam[mask].mean():.1f}% dei texel "
-          f"della mesh visti da questa camera")
+    print(f"  camera_mask.png       {camera}: {100 * cam[mask].mean():.1f}% of the mesh "
+          f"texels seen by this camera")
 
     vis = read_channels(run / "visibility" / "visibility.exr")
     cams = sorted(vis, key=lambda c: int(c.replace("Cam", "")))
@@ -110,15 +110,15 @@ def do_visibility(run: Path, camera: str, out: Path) -> None:
              f"cameras covering the texel (out of {len(cams)})",
              vmax=float(np.percentile(count[mask], 99.9)), cmap="viridis")
     v = count[mask]
-    print(f"  camera_count.png      {len(cams)} camere; per texel: "
-          f"media {v.mean():.1f}, mediana {np.median(v):.0f}, "
+    print(f"  camera_count.png      {len(cams)} cameras; per texel: "
+          f"mean {v.mean():.1f}, median {np.median(v):.0f}, "
           f"p10 {np.percentile(v, 10):.0f}, p90 {np.percentile(v, 90):.0f}, "
-          f"mai visti {100 * (v == 0).mean():.2f}%")
+          f"never seen {100 * (v == 0).mean():.2f}%")
 
 
 def tonemap(img: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, float]:
-    """Normalizza su un percentile della luminanza e applica una gamma 1/2.2.
-    Restituisce anche il fattore, che va dichiarato in didascalia."""
+    """Normalise on a percentile of the luminance and apply a 1/2.2 gamma.
+    Also returns the factor, which has to be stated in the caption."""
     lum = img @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
     k = float(np.percentile(lum[mask], PCTL))
     k = k if k > 1e-8 else 1.0
@@ -134,26 +134,26 @@ def do_irradiance(run: Path, out: Path) -> None:
                         ("irradiance_indirect", "irradiance_indirect.exr")):
         p = run / "irradiance" / fname
         if not p.exists():
-            print(f"  ⚠  manca {p}, salto")
+            print(f"  ⚠  {p} missing, skipped")
             continue
         img = load_exr(p)
         rgb, k = tonemap(img, mask)
         save_png(rgb[ys, xs], out / f"{name}.png")
         lum = img @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
-        print(f"  {name + '.png':24s} normalizzata su p{PCTL} = {k:.4f}; "
-              f"media {lum[mask].mean():.4f}, max {lum[mask].max():.3f}")
+        print(f"  {name + '.png':24s} normalised on p{PCTL} = {k:.4f}; "
+              f"mean {lum[mask].mean():.4f}, max {lum[mask].max():.3f}")
 
 
 def do_pixel_change(run: Path, source: str, out: Path) -> None:
-    """Le quattro statistiche del pass di color texture, su UNA esposizione condivisa.
+    """The four statistics of the colour-texture pass, on ONE shared exposure.
 
-    Condivisa perche' e' il punto della figura: `range` e' `max - min`, e con quattro
-    normalizzazioni diverse quella relazione sparisce.  Il fattore si prende da un
-    percentile di `color_max`, che e' la piu' luminosa delle quattro.
+    Shared because that is the point of the figure: `range` is `max - min`, and with four
+    different normalizations that relation disappears.  The factor comes from a percentile
+    of `color_max`, the brightest of the four.
 
-    La varianza viene mostrata come la sua RADICE: e' in radianza al quadrato, e sulla
-    scala condivisa sarebbe un rettangolo nero.  La radice la riporta in unita' di
-    radianza e la rende confrontabile con il range.
+    The variance is shown as its SQUARE ROOT: it is in radiance squared, and on the shared
+    scale it would be a black rectangle.  The root brings it back into radiance units and
+    makes it comparable with the range.
     """
     box, mask = crop_to_atlas(run)
     ys, xs = box
@@ -163,37 +163,37 @@ def do_pixel_change(run: Path, source: str, out: Path) -> None:
     cmax = load_exr(pc / "color_max.exr")
     k = float(np.percentile((cmax @ lum_w)[mask], PCTL))
     k = k if k > 1e-8 else 1.0
-    print(f"  esposizione condivisa: p{PCTL} di color_max = {k:.4f}")
+    print(f"  shared exposure: p{PCTL} of color_max = {k:.4f}")
 
     for name in ("color_min", "color_max", "color_range", "color_variance"):
         p = pc / f"{name}.exr"
         if not p.exists():
-            print(f"  ⚠  manca {p}, salto")
+            print(f"  ⚠  {p} missing, skipped")
             continue
         img = load_exr(p)
         if name == "color_variance":
-            img = np.sqrt(np.maximum(img, 0.0))     # -> unita' di radianza
+            img = np.sqrt(np.maximum(img, 0.0))     # -> radiance units
         rgb = np.clip(img / k, 0.0, 1.0) ** (1.0 / 2.2)
         rgb[~mask] = 0.0
         save_png(rgb[ys, xs].astype(np.float32), out / f"{name}.png")
         L = (img @ lum_w)[mask]
         print(f"  {name + '.png':22s} p50={np.median(L):8.4f}  p99={np.percentile(L, 99):9.4f}"
-              f"  saturati {100.0 * (L > k).mean():5.2f}%")
+              f"  saturated {100.0 * (L > k).mean():5.2f}%")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("run_dir", help="cartella della run (contiene ium/, visibility/, ...)")
+    ap.add_argument("run_dir", help="the run folder (holds ium/, visibility/, ...)")
     ap.add_argument("--camera", default="render_Camera_Shell21_38",
-                    help="stem della camera di riferimento per la maschera")
+                    help="stem of the reference camera for the mask")
     ap.add_argument("--irradiance", action="store_true",
-                    help="genera le mappe di irradiance invece di quelle di visibilita'")
+                    help="produce the irradiance maps instead of the visibility ones")
     ap.add_argument("--pixel-change", action="store_true",
-                    help="genera le quattro statistiche di color texture")
+                    help="produce the four colour-texture statistics")
     ap.add_argument("--source", default="gt",
-                    help="sorgente per --pixel-change (sources/{source}/)")
-    ap.add_argument("--out", required=True, help="cartella di destinazione dei PNG")
+                    help="source for --pixel-change (sources/{source}/)")
+    ap.add_argument("--out", required=True, help="destination folder for the PNGs")
     args = ap.parse_args()
 
     run, out = Path(args.run_dir), Path(args.out)

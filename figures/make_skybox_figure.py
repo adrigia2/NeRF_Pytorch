@@ -1,34 +1,34 @@
 #!/usr/bin/env python
-"""make_skybox_figure.py -- Figure di tesi sulle skybox bakate dai NeRF di uno sweep.
+"""make_skybox_figure.py -- thesis figures on the skyboxes baked from a sweep's NeRFs.
 
-Produce due PNG:
+Produces two PNGs:
 
-  skybox_grid.png    griglia con l'envmap originale e quella bakata da ogni run,
-                     tonemap ed ESPOSIZIONE IDENTICI in ogni pannello
-  skybox_detail.png  originale, bakata e mappa log2(baked/GT) per il solo modello scelto
+  skybox_grid.png    grid with the original envmap and the one baked by each run,
+                     with IDENTICAL tonemap and EXPOSURE in every panel
+  skybox_detail.png  original, baked and log2(baked/GT) map for the chosen model only
 
-Le `skybox_compare/skybox_heatmap.png` che bake_skyboxes.py produce per ogni run non
-servono a questo scopo: clippano a [0,1] senza tonemap ne' gamma, quindi la skybox
-appare quasi nera tranne le sorgenti.
+The `skybox_compare/skybox_heatmap.png` files bake_skyboxes.py produces per run do not
+serve this purpose: they clip to [0,1] with neither tonemap nor gamma, so the skybox comes
+out nearly black except for the light sources.
 
     python make_skybox_figure.py <sweep_root> --gt GT.exr --out DIR [--selected RUN]
 
-Tre scelte non sono negoziabili e sono il motivo per cui questo script esiste:
+Three choices are not negotiable, and are the reason this script exists:
 
-  1. Il downsample avviene in spazio LINEARE e per media di blocchi, prima del tonemap.
-     Ridimensionare dopo il tonemap, o con un filtro non conservativo, altera la
-     radianza media dei pixel piccoli e brillanti, che sono quelli che portano l'energia.
+  1. The downsample happens in LINEAR space, as a block mean, before the tonemap.
+     Resizing after the tonemap, or with a non-conservative filter, alters the mean
+     radiance of the small bright pixels, which are the ones carrying the energy.
 
-  2. L'esposizione e' UNA SOLA per tutti i pannelli, derivata dalla GT.  Se ogni
-     pannello avesse la sua, una differenza di luminosita' fra i modelli sparirebbe
-     dalla figura, che e' esattamente cio' che la figura deve mostrare.
+  2. There is ONE exposure for every panel, derived from the GT.  If each panel had its
+     own, a brightness difference between the models would vanish from the figure, which
+     is exactly what the figure is there to show.
 
-  3. La differenza e' un RAPPORTO in log2, non una sottrazione.  Lo scarto misurato e'
-     un fattore quasi uniforme di pochi punti percentuali: in scala lineare sarebbe
-     invisibile ovunque tranne che sulle sorgenti.
+  3. The difference is a RATIO in log2, not a subtraction.  The measured gap is a nearly
+     uniform factor of a few per cent: on a linear scale it would be invisible everywhere
+     except on the light sources.
 
-Lo script stampa anche il rapporto delle medie lineari pesate per angolo solido,
-<||baked||> / <||GT||>, che e' il numero che entra nell'integrale di irradianza.
+The script also prints the ratio of the solid-angle-weighted linear means,
+<||baked||> / <||GT||>, which is the number that enters the irradiance integral.
 """
 from __future__ import annotations
 
@@ -46,31 +46,31 @@ from matplotlib.colors import TwoSlopeNorm
 import _paths  # noqa: F401
 
 BAKED_NAME = "skybox_nerf_baked.exr"
-# Rec.709, identico a LUMA_COEFF di compare_runs.py
+# Rec.709, identical to LUMA_COEFF in compare_runs.py
 LUMA_COEFF = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 EPS = 1e-6
 
-# Etichette leggibili: il nome della cartella non e' presentabile in una figura
+# Readable labels: the folder name is not presentable in a figure
 LOSS_LABEL = {"l1": "L1", "mse": "sq.", "relmseraw": "rel. sq.",
               "rel_mse_raw": "rel. sq."}
 
 
 def load_exr(path: Path) -> np.ndarray:
-    """(H, W, 3) float32.  Stesso loader di bake_skyboxes.py, un solo lettore per le
-    skybox."""
+    """(H, W, 3) float32.  Same loader as bake_skyboxes.py, one reader for the
+    skyboxes."""
     from regen_heatmaps import _load_exr_hw3
     return _load_exr_hw3(str(path))
 
 
 def block_mean(img: np.ndarray, factor: int) -> np.ndarray:
-    """Downsample per media di blocchi factor x factor, in spazio lineare.
+    """Downsample by a factor x factor block mean, in linear space.
 
-    Conserva la radianza media, che un resampling per interpolazione non garantisce:
-    su un envmap con sorgenti piccole e molto brillanti la differenza non e' cosmetica.
+    It preserves the mean radiance, which interpolating resampling does not guarantee: on
+    an envmap with small, very bright sources the difference is not cosmetic.
 
-    Il numero di canali si legge dall'array invece di essere fissato a 3: le heatmap di
-    make_results_figures passano di qui a canale singolo, e con il 3 cablato la reshape
-    falliva.  Sugli RGB il comportamento e' identico.
+    The channel count is read from the array instead of being fixed at 3: the heatmaps of
+    make_results_figures come through here single-channel, and with 3 hard-coded the
+    reshape used to fail.  On RGB the behaviour is identical.
     """
     if factor <= 1:
         return img
@@ -83,21 +83,21 @@ def block_mean(img: np.ndarray, factor: int) -> np.ndarray:
 
 
 def tonemap(x: np.ndarray, exposure: float) -> np.ndarray:
-    """Reinhard piu' gamma 2.2.  Stessa formula di _tonemap_srgb in compare_runs.py."""
+    """Reinhard plus gamma 2.2.  Same formula as _tonemap_srgb in compare_runs.py."""
     y = x * exposure
     y = y / (1.0 + y)
     return np.clip(y, 0.0, 1.0) ** (1.0 / 2.2)
 
 
 def solid_angle_weights(h: int, w: int) -> np.ndarray:
-    """sin(theta) per riga di una equirettangolare.  Senza questo peso i poli, dove i
-    pixel coprono un angolo solido minuscolo, conterebbero quanto l'equatore."""
+    """sin(theta) per row of an equirectangular map.  Without this weight the poles, where
+    pixels cover a tiny solid angle, would count as much as the equator."""
     theta = np.pi * (np.arange(h, dtype=np.float64) + 0.5) / h
     return np.repeat(np.sin(theta)[:, None], w, axis=1)
 
 
 def discover(root: Path) -> list[tuple[str, Path]]:
-    """[(nome del run, percorso della skybox bakata)], ordinati per nome."""
+    """[(run name, path of the baked skybox)], sorted by name."""
     out = []
     for p in sorted(root.glob(f"*/*/{BAKED_NAME}")):
         out.append((p.parents[1].name, p))
@@ -125,8 +125,8 @@ def fig_grid(gt_tm: np.ndarray, baked_tm: dict[str, np.ndarray], selected: str |
                                            for k, v in baked_tm.items()]
     nrows = (len(items) + ncols - 1) // ncols
     h, w = gt_tm.shape[:2]
-    # ogni pannello e' 2:1; la figura segue quel rapporto, altrimenti matplotlib
-    # lascerebbe bande bianche fra le righe
+    # each panel is 2:1; the figure follows that ratio, otherwise matplotlib would leave
+    # white bands between the rows
     fig, axes = plt.subplots(nrows, ncols,
                              figsize=(5.6 * ncols, 5.6 * (h / w) * nrows))
     flat = np.atleast_1d(axes).ravel()
@@ -142,10 +142,10 @@ def fig_grid(gt_tm: np.ndarray, baked_tm: dict[str, np.ndarray], selected: str |
 
 def fig_detail(gt_lin: np.ndarray, baked_lin: np.ndarray, gt_tm: np.ndarray,
                baked_tm: np.ndarray, label: str, out: Path) -> tuple[float, float]:
-    """Pannello di dettaglio.  Restituisce (limite della colormap, mediana del log2)."""
+    """Detail panel.  Returns (colormap limit, median of the log2)."""
     ratio = np.log2((baked_lin.mean(-1) + EPS) / (gt_lin.mean(-1) + EPS))
-    # estremi simmetrici da un percentile: il massimo assoluto cade su qualche pixel
-    # isolato del bordo delle sorgenti e schiaccerebbe a grigio tutto il resto
+    # symmetric extremes from a percentile: the absolute maximum falls on a few isolated
+    # pixels at the edge of the sources and would crush everything else to grey
     lim = float(np.percentile(np.abs(ratio), 98.0))
     lim = max(lim, 0.05)
     med = float(np.median(ratio))
@@ -172,32 +172,32 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("sweep_root")
-    ap.add_argument("--gt", required=True, help="EXR equirettangolare originale")
-    ap.add_argument("--out", required=True, help="cartella di destinazione dei PNG")
+    ap.add_argument("--gt", required=True, help="the original equirectangular EXR")
+    ap.add_argument("--out", required=True, help="destination folder for the PNGs")
     ap.add_argument("--selected", default=None,
-                    help="run del pannello di dettaglio (default: il primo trovato)")
+                    help="run for the detail panel (default: the first one found)")
     ap.add_argument("--downsample", type=int, default=4,
-                    help="fattore di media di blocchi (default 4: 4096x2048 -> 1024x512)")
+                    help="block-mean factor (default 4: 4096x2048 -> 1024x512)")
     ap.add_argument("--key", type=float, default=0.5,
-                    help="livello a cui portare la mediana della GT nel tonemap")
+                    help="level the GT median is brought to in the tonemap")
     args = ap.parse_args()
 
     root, gt_path, out = Path(args.sweep_root), Path(args.gt), Path(args.out)
     if not root.is_dir():
-        print(f"ERRORE: {root} non e' una cartella")
+        print(f"ERROR: {root} is not a folder")
         return 2
     if not gt_path.exists():
-        print(f"ERRORE: {gt_path} non esiste")
+        print(f"ERROR: {gt_path} does not exist")
         return 2
     out.mkdir(parents=True, exist_ok=True)
 
     runs = discover(root)
     if not runs:
-        print(f"ERRORE: nessun {BAKED_NAME} sotto {root}")
+        print(f"ERROR: no {BAKED_NAME} under {root}")
         return 2
     selected = args.selected or runs[0][0]
     if selected not in dict(runs):
-        print(f"ERRORE: {selected} non e' fra i run trovati ({[k for k, _ in runs]})")
+        print(f"ERROR: {selected} is not among the runs found ({[k for k, _ in runs]})")
         return 2
 
     print(f"GT: {gt_path.name}")
@@ -205,11 +205,11 @@ def main() -> int:
     gt = block_mean(gt_full, args.downsample)
     print(f"  {gt_full.shape[1]}x{gt_full.shape[0]} -> {gt.shape[1]}x{gt.shape[0]}")
 
-    # Esposizione condivisa, dalla GT: la mediana della luminanza finisce a meta' scala,
-    # cosi' il tonemap non e' dettato dal picco HDR delle sorgenti
+    # Shared exposure, from the GT: the median luminance lands at mid scale, so the
+    # tonemap is not dictated by the HDR peak of the light sources
     lum = (gt * LUMA_COEFF).sum(-1)
     expo = args.key / max(float(np.median(lum)), 1e-4)
-    print(f"  esposizione condivisa = {expo:.4f} (mediana luminanza GT "
+    print(f"  shared exposure = {expo:.4f} (GT median luminance "
           f"{float(np.median(lum)):.4f})")
 
     wts = solid_angle_weights(*gt.shape[:2])
@@ -219,7 +219,7 @@ def main() -> int:
     gt_tm = tonemap(gt, expo)
     baked_lin: dict[str, np.ndarray] = {}
     baked_tm: dict[str, np.ndarray] = {}
-    print("\nrapporto delle medie lineari pesate per angolo solido, "
+    print("\nratio of the solid-angle-weighted linear means, "
           "<||baked||> / <||GT||>:")
     for key, path in runs:
         a = block_mean(load_exr(path), args.downsample)
@@ -230,15 +230,15 @@ def main() -> int:
         baked_tm[key] = tonemap(a, expo)
         n = np.sqrt((a.astype(np.float64) ** 2).sum(-1))
         ratio = float((n * wts).sum() / wts.sum()) / gt_mean
-        mark = "  <- selezionato" if key == selected else ""
+        mark = "  <- selected" if key == selected else ""
         print(f"  {pretty(key):22s} {ratio:7.4f}   ({100 * (ratio - 1):+.2f}%){mark}")
 
     print()
     fig_grid(gt_tm, baked_tm, selected, out / "skybox_grid.png")
     lim, med = fig_detail(gt, baked_lin[selected], gt_tm, baked_tm[selected],
                           pretty(selected), out / "skybox_detail.png")
-    print(f"\ndettaglio ({pretty(selected)}): mediana log2(baked/GT) = {med:+.4f} stop "
-          f"({100 * (2.0 ** med - 1):+.2f}%), estremi colormap +/-{lim:.3f} stop")
+    print(f"\ndetail ({pretty(selected)}): median log2(baked/GT) = {med:+.4f} stops "
+          f"({100 * (2.0 ** med - 1):+.2f}%), colormap extremes +/-{lim:.3f} stops")
     return 0
 
 

@@ -1,26 +1,26 @@
 #!/usr/bin/env python
-"""make_depth_figure.py -- I layer geometrici di una run, come PNG per la tesi.
+"""make_depth_figure.py -- the geometric layers of a run, as PNGs for the thesis.
 
     python make_depth_figure.py <run_dir> --camera render_Camera_Shell21_38 --out DIR
     python make_depth_figure.py <run_dir> --ium --out DIR
 
-Nel primo modo scrive i tre pannelli per camera del depth pass: depth.png (falsi colori),
-position.png, mask.png.  Nel secondo i due pannelli in spazio texture del pass IUM:
-ium_position.png e ium_mask.png.
+The first form writes the three per-camera panels of the depth pass: depth.png (false
+colour), position.png, mask.png.  The second writes the two texture-space panels of the
+IUM pass: ium_position.png and ium_mask.png.
 
-Due scelte non sono di gusto:
+Two choices are not a matter of taste:
 
-  1. La normalizzazione del depth usa la MASCHERA, non una soglia sul valore.  Sullo
-     sfondo il file porta 1e20, il valore di miss del tracer: un min/max sull'immagine
-     intera manderebbe tutto il primo piano nello stesso colore.
+  1. The depth normalization uses the MASK, not a threshold on the value.  On the
+     background the file carries 1e20, the tracer's miss value: a min/max over the whole
+     image would push the entire foreground into a single colour.
 
-  2. Lo sfondo del pannello depth non e' un valore di profondita' e non deve sembrarlo.
-     Va reso con un grigio neutro, distinguibile dai due estremi della rampa e dal bianco
-     della pagina, invece di essere schiacciato su un capo della colormap.
+  2. The background of the depth panel is not a depth value and must not look like one.
+     It is rendered in a neutral grey, distinguishable from both ends of the ramp and
+     from the white of the page, rather than crushed onto one end of the colormap.
 
-La colormap e' viridis: percettivamente uniforme, quindi una differenza di colore uguale
-corrisponde a una differenza di profondita' uguale, che su una mappa di profondita' e'
-esattamente cio' che si vuole leggere.
+The colormap is viridis: perceptually uniform, so an equal colour difference corresponds
+to an equal depth difference, which on a depth map is exactly what one wants to read.
+
 """
 from __future__ import annotations
 
@@ -39,8 +39,8 @@ import _paths  # noqa: F401
 
 from make_skybox_figure import load_exr
 
-# Grigio dello sfondo nel pannello depth: piu' chiaro dell'estremo giallo di viridis
-# sarebbe illeggibile, piu' scuro si confonderebbe con l'estremo viola.
+# Background grey of the depth panel: lighter than viridis' yellow end would be
+# unreadable, darker would be confused with the purple end.
 BG_GREY = 0.75
 
 
@@ -50,11 +50,11 @@ def save_png(rgb: np.ndarray, out: Path) -> None:
 
 
 def content_box(mask: np.ndarray, margin: float) -> tuple[slice, slice]:
-    """Riquadro del primo piano piu' un margine, UNO SOLO per tutti i pannelli.
+    """Bounding box of the foreground plus a margin, ONE for all the panels.
 
-    Stampati a un terzo di riga, i tre pannelli a pieno fotogramma mostrano il soggetto
-    su un quarto dell'altezza.  Il ritaglio dev'essere identico nei tre, altrimenti non
-    sono piu' confrontabili pixel a pixel, che e' il motivo per cui stanno accanto.
+    Printed at a third of a line, the three full-frame panels show the subject over a
+    quarter of the height.  The crop has to be identical in all three, otherwise they are
+    no longer comparable pixel by pixel, which is the whole reason they sit side by side.
     """
     ys, xs = np.where(mask)
     h, w = mask.shape
@@ -65,26 +65,26 @@ def content_box(mask: np.ndarray, margin: float) -> tuple[slice, slice]:
 
 
 def position_rgb(pos: np.ndarray, mask: "np.ndarray | None" = None) -> np.ndarray:
-    """Posizione mappata su RGB con l'IDENTITA', sfondo nero.
+    """Position mapped to RGB by the IDENTITY, black background.
 
-    Nessuna riscalatura e nessuna gamma: il valore finisce sul pixel com'e', i negativi
-    vengono portati a zero e quello che supera uno satura.  Prima questa funzione
-    riscalava per canale sull'estensione della geometria: rendeva ogni pannello
-    leggibile per conto suo, ma con un fattore diverso da quello di ogni altro, per cui
-    due figure che mostrano la stessa scena non erano confrontabili e lo stesso colore
-    non significava lo stesso punto.  Con l'identita' il colore e' la coordinata, che e'
-    l'unica lettura che serva a chi guarda una mappa di posizioni.
+    No rescaling and no gamma: the value goes to the pixel as it is, negatives are brought
+    to zero and anything above one saturates.  This function used to rescale per channel
+    over the extent of the geometry: that made each panel readable on its own, but with a
+    different factor from every other, so two figures showing the same scene were not
+    comparable and the same colour did not mean the same point.  With the identity the
+    colour is the coordinate, which is the only reading anyone looking at a position map
+    needs.
 
-    `mask` e' opzionale: senza, si mappa tutto il fotogramma (il pannello in world space
-    non ha una maschera da applicare).  Stampa gli estremi e quanto viene tagliato:
-    sono i numeri che la didascalia deve riportare.
+    `mask` is optional: without it the whole frame is mapped (the world-space panel has no
+    mask to apply).  It prints the extremes and how much gets clipped: those are the
+    numbers the caption has to quote.
     """
     sel = mask if mask is not None else np.ones(pos.shape[:2], bool)
     lo, hi = pos[sel].min(axis=0), pos[sel].max(axis=0)
     print("  position " + "  ".join(f"{a}[{lo[i]:.2f}, {hi[i]:.2f}]"
                                     for i, a in enumerate("xyz")))
-    print(f"  clamp: portati a 0 {100.0 * (pos[sel] < 0).mean():.2f}%, "
-          f"saturati a 1 {100.0 * (pos[sel] > 1).mean():.2f}%")
+    print(f"  clamp: brought to 0 {100.0 * (pos[sel] < 0).mean():.2f}%, "
+          f"saturated at 1 {100.0 * (pos[sel] > 1).mean():.2f}%")
     rgb = np.clip(pos, 0.0, 1.0).astype(np.float32)
     if mask is not None:
         rgb[~mask] = 0.0
@@ -92,25 +92,25 @@ def position_rgb(pos: np.ndarray, mask: "np.ndarray | None" = None) -> np.ndarra
 
 
 def normal_rgb(nrm: np.ndarray, mask: "np.ndarray | None" = None) -> np.ndarray:
-    """Normale mappata su RGB con la codifica delle normal map, sfondo nero.
+    """Normal mapped to RGB with the normal-map encoding, black background.
 
-    Porta $[-1, 1]$ in $[0, 1]$ con 0.5 + 0.5*n, che e' come le normal map sono scritte e
-    come questa pipeline legge quella esterna (`external_normal_range="0_1"`), quindi il
-    pannello e' confrontabile con la mappa che lo sostituisce.  NON si usa il clamp delle
-    posizioni: azzererebbe ogni componente negativa e farebbe sparire tutte le facce
-    rivolte verso -x, -y o -z, cioe' meta' della geometria.
+    It takes $[-1, 1]$ to $[0, 1]$ with 0.5 + 0.5*n, which is how normal maps are written
+    and how this pipeline reads the external one (`external_normal_range="0_1"`), so the
+    panel is comparable with the map that replaces it.  The position clamp is NOT used:
+    it would zero every negative component and make every face pointing towards -x, -y or
+    -z disappear, i.e. half the geometry.
 
-    Normalizza prima di codificare.  Il kernel costruisce la normale come prodotto
-    vettoriale degli spigoli del triangolo e i consumatori la normalizzano al momento
-    dell'uso (deviceProgramsIrradiance.cu lo fa esplicitamente), quindi il buffer non e'
-    garantito unitario: senza normalizzare il colore direbbe l'area del triangolo invece
-    della direzione.
+    It normalises before encoding.  The kernel builds the normal as the cross product of
+    the triangle edges and the consumers normalise it at the point of use
+    (deviceProgramsIrradiance.cu does so explicitly), so the buffer is not guaranteed to
+    be unit length: without normalising, the colour would say the triangle's area instead
+    of its direction.
     """
     n = np.linalg.norm(nrm, axis=-1, keepdims=True)
     unit = np.divide(nrm, n, out=np.zeros_like(nrm), where=n > 1e-8)
     degenerate = float((n[..., 0] <= 1e-8).mean())
     print(f"  normal   |n| in [{n.min():.3f}, {n.max():.3f}], "
-          f"degeneri {100.0 * degenerate:.2f}%")
+          f"degenerate {100.0 * degenerate:.2f}%")
     rgb = np.clip(0.5 + 0.5 * unit, 0.0, 1.0).astype(np.float32)
     if mask is not None:
         rgb[~mask] = 0.0
@@ -118,23 +118,23 @@ def normal_rgb(nrm: np.ndarray, mask: "np.ndarray | None" = None) -> np.ndarray:
 
 
 def ium_panels(run: Path, out: Path) -> int:
-    """I layer in spazio texture: posizione per texel e maschera di copertura.
+    """The texture-space layers: per-texel position and coverage mask.
 
-    La normale NON viene scritta: quando la pipeline riceve una normal map esterna, questa
-    sovrascrive la normale geometrica dentro il buffer del pass prima del salvataggio, e
-    ium_normals.exr contiene quindi la mappa fornita, non quella calcolata.
+    The normal is NOT written: when the pipeline is given an external normal map, that map
+    overwrites the geometric normal inside the pass buffer before saving, so
+    ium_normals.exr holds the supplied map, not the computed one.
     """
     paths = {"position": run / "ium" / "ium_positions.exr",
              "mask":     run / "ium" / "ium_masks.exr"}
     for p in paths.values():
         if not p.exists():
-            print(f"ERRORE: {p} non esiste")
+            print(f"ERROR: {p} does not exist")
             return 2
 
     pos = load_exr(paths["position"])
     mask = load_exr(paths["mask"])[..., 0] > 0.5
-    print(f"atlante {mask.shape[1]}x{mask.shape[0]}, copertura {100 * mask.mean():.2f}% "
-          f"({mask.sum():,} texel)")
+    print(f"atlas {mask.shape[1]}x{mask.shape[0]}, coverage {100 * mask.mean():.2f}% "
+          f"({mask.sum():,} texels)")
 
     save_png(position_rgb(pos, mask), out / "ium_position.png")
     save_png(np.repeat(mask[..., None].astype(np.float32), 3, axis=-1),
@@ -145,15 +145,15 @@ def ium_panels(run: Path, out: Path) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("run_dir", help="cartella della run (contiene depth/, position/, mask/)")
-    ap.add_argument("--camera", default=None, help="nome del frame, senza suffisso")
-    ap.add_argument("--out", required=True, help="cartella di destinazione dei PNG")
+    ap.add_argument("run_dir", help="the run folder (holds depth/, position/, mask/)")
+    ap.add_argument("--camera", default=None, help="frame name, without the suffix")
+    ap.add_argument("--out", required=True, help="destination folder for the PNGs")
     ap.add_argument("--ium", action="store_true",
-                    help="scrive i layer in spazio texture invece di quelli per camera")
+                    help="write the texture-space layers instead of the per-camera ones")
     ap.add_argument("--cmap", default="viridis")
     ap.add_argument("--margin", type=float, default=0.06,
-                    help="margine attorno al primo piano, in frazione del riquadro "
-                         "(default 0.06; 0 disattiva il ritaglio)")
+                    help="margin around the foreground, as a fraction of the box "
+                         "(default 0.06; 0 disables the crop)")
     args = ap.parse_args()
 
     run, out, cam = Path(args.run_dir), Path(args.out), args.camera
@@ -162,7 +162,7 @@ def main() -> int:
     if args.ium:
         return ium_panels(run, out)
     if not cam:
-        print("ERRORE: serve --camera per i layer per camera")
+        print("ERROR: --camera is required for the per-camera layers")
         return 2
 
     paths = {
@@ -172,7 +172,7 @@ def main() -> int:
     }
     for k, p in paths.items():
         if not p.exists():
-            print(f"ERRORE: {p} non esiste")
+            print(f"ERROR: {p} does not exist")
             return 2
 
     depth = load_exr(paths["depth"])[..., 0]
@@ -180,18 +180,18 @@ def main() -> int:
     mask_raw = mpimg.imread(paths["mask"])
     mask = (mask_raw if mask_raw.ndim == 2 else mask_raw[..., 0]) > 0.5
 
-    print(f"{cam}: {mask.shape[1]}x{mask.shape[0]}, primo piano {100 * mask.mean():.1f}%")
+    print(f"{cam}: {mask.shape[1]}x{mask.shape[0]}, foreground {100 * mask.mean():.1f}%")
 
     d0, d1 = float(depth[mask].min()), float(depth[mask].max())
-    # Estremi e ritaglio si calcolano sul fotogramma intero: il ritaglio decide solo cosa
-    # si vede, non come i valori vengono mappati.
+    # Extremes and crop are computed on the whole frame: the crop only decides what is
+    # visible, not how the values are mapped.
     if args.margin > 0:
         rows, cols = content_box(mask, args.margin)
-        print(f"  ritaglio [{cols.start}:{cols.stop}, {rows.start}:{rows.stop}] "
+        print(f"  crop [{cols.start}:{cols.stop}, {rows.start}:{rows.stop}] "
               f"= {cols.stop - cols.start}x{rows.stop - rows.start}")
         depth, pos, mask = depth[rows, cols], pos[rows, cols], mask[rows, cols]
 
-    print(f"  depth  [{d0:.3f}, {d1:.3f}]  mediana {float(np.median(depth[mask])):.3f}")
+    print(f"  depth  [{d0:.3f}, {d1:.3f}]  median {float(np.median(depth[mask])):.3f}")
     norm = np.clip((depth - d0) / max(d1 - d0, 1e-9), 0.0, 1.0)
     rgb = matplotlib.colormaps[args.cmap](norm)[..., :3]
     rgb[~mask] = BG_GREY
