@@ -12,12 +12,12 @@ order); this script is for when one wants:
   - the cones unpacked into one EXR per aperture (`--unpack`), to open them with tools
     that do not handle multiple channels.
 
-Uso:
+Usage:
     python inspect_spec_cone.py <output_dir> [--cams 0,3,7] [--unpack]
                                 [--no-preview] [--preview-size 1024]
                                 [--preview-percentile 95]
 
-Uscite in <output_dir>/spec_cone_view/cam_{j:03d}/:
+Outputs in <output_dir>/spec_cone_view/cam_{j:03d}/:
     contact_sheet.png            grid of every aperture
     cone_000_mirror.exr,         only with --unpack, one file per aperture,
     cone_005deg.exr, …           with the same name as the channel in the bake
@@ -77,10 +77,10 @@ def save_contact_sheet(cones: np.ndarray, valid: np.ndarray, apertures: np.ndarr
             ax.axis("off")
             continue
         ax.imshow(np.clip(imgs[k] / scale, 0.0, 1.0) ** (1 / 2.2))
-        ax.set_title("specchio" if k == 0 else f"{apertures[k]:g}°", fontsize=10)
+        ax.set_title("mirror" if k == 0 else f"{apertures[k]:g}°", fontsize=10)
         ax.axis("off")
-    fig.suptitle(f"cam {cam:03d} — L_j(r), esposizione condivisa "
-                 f"(p{percentile:g} specchio = {scale:.4g})", fontsize=12)
+    fig.suptitle(f"cam {cam:03d} — L_j(r), shared exposure "
+                 f"(p{percentile:g} mirror = {scale:.4g})", fontsize=12)
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=100)
@@ -106,8 +106,8 @@ def main() -> None:
     spec_dir = out / "spec_cone"
     meta_path = spec_dir / "spec_cone_meta.json"
     if not meta_path.exists():
-        sys.exit(f"{meta_path} non trovato: il bake spec_cone non è finito "
-                 f"(il meta viene scritto solo alla fine) oppure output_dir è sbagliata.")
+        sys.exit(f"{meta_path} not found: the spec_cone bake did not finish "
+                 f"(the meta is written only at the end), or output_dir is wrong.")
 
     with open(meta_path, encoding="utf-8") as fh:
         meta = json.load(fh)
@@ -121,7 +121,7 @@ def main() -> None:
             if args.cams else list(meta["cameras"]))
     unknown = set(cams) - set(meta["cameras"])
     if unknown:
-        sys.exit(f"camere non presenti nel bake: {sorted(unknown)}")
+        sys.exit(f"cameras not present in the bake: {sorted(unknown)}")
 
     K = int(meta["num_levels"])
     apertures = np.asarray(meta["apertures_deg"], dtype=np.float64)
@@ -132,16 +132,16 @@ def main() -> None:
     # the texture resolution comes from the IUM: the bake writes into it
     ium_mask = out / "ium" / "ium_masks.exr"
     if not ium_mask.exists():
-        sys.exit(f"{ium_mask} non trovato: serve per conoscere la risoluzione IUM.")
+        sys.exit(f"{ium_mask} not found: it is needed to know the IUM resolution.")
     from pbr_solver import _read_exr
     H, W = _read_exr(ium_mask).shape[:2]
 
     print(f"[spec_cone] scheme={meta.get('scheme')}, {K} levels "
-          f"(specchio + {K - 1} coni), aperture {apertures[1:].tolist()}°")
-    print(f"[spec_cone] {len(cams)} camere, texture {W}×{H} → {view_root}")
+          f"(mirror + {K - 1} cones), apertures {apertures[1:].tolist()}°")
+    print(f"[spec_cone] {len(cams)} cameras, texture {W}×{H} → {view_root}")
 
     from tqdm import tqdm
-    for cam in tqdm(cams, unit="cam", desc="coni"):
+    for cam in tqdm(cams, unit="cam", desc="cones"):
         cones, n_valid = read_cones(
             spec_dir / meta["cam_file_pattern"].format(cam=cam), apertures)
         valid = n_valid > 0
@@ -158,7 +158,7 @@ def main() -> None:
                                size=args.preview_size,
                                percentile=args.preview_percentile)
 
-    print(f"✓ fatto: {view_root}")
+    print(f"✓ done: {view_root}")
 
 
 if __name__ == "__main__":

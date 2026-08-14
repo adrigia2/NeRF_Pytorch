@@ -118,10 +118,10 @@ def check_against_manifest(cfg: PipelineConfig, manifest: dict,
     def walk(a: dict, b: dict, prefix: str) -> None:
         for k in sorted(set(a) | set(b)):
             key = f"{prefix}{k}"
-            va, vb = a.get(k, "<assente>"), b.get(k, "<assente>")
+            va, vb = a.get(k, "<absent>"), b.get(k, "<absent>")
             if isinstance(va, dict) and isinstance(vb, dict):
                 walk(va, vb, f"{key}.")
-            elif vb == "<assente>":
+            elif vb == "<absent>":
                 # A field added to the dataclass AFTER that run: the manifest cannot
                 # contain it and the rebuild uses the default, which `_build` has already
                 # reported among the notes. Counting it as a divergence would make the
@@ -129,7 +129,7 @@ def check_against_manifest(cfg: PipelineConfig, manifest: dict,
                 # i.e. exactly the use case.
                 continue
             elif va != vb and key not in expected_diffs:
-                diffs.append(f"{key}: ricostruita={va!r}  manifest={vb!r}")
+                diffs.append(f"{key}: rebuilt={va!r}  manifest={vb!r}")
 
     walk(got, want, "")
     return diffs
@@ -140,7 +140,7 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run_dir", help="the reference run folder (holds run_manifest.json)")
     ap.add_argument("--rect", nargs=4, type=int, metavar=("X0", "Y0", "W", "H"),
-                    help="ROI rettangolare in texel IUM")
+                    help="rectangular ROI in IUM texels")
     ap.add_argument("--mask", default="", help="ROI mask image (optional)")
     ap.add_argument("--mask-threshold", type=float, default=0.5)
     ap.add_argument("--tag", default="", help="sandbox name (default: derived)")
@@ -158,8 +158,8 @@ def main() -> int:
         return 2
 
     cfg, manifest, notes = config_from_manifest(manifest_path)
-    print(f"Config ricostruita da {manifest_path}")
-    print(f"  run originale: {manifest['timestamp']}  |  {manifest.get('run_note', '')}")
+    print(f"Config rebuilt from {manifest_path}")
+    print(f"  original run: {manifest['timestamp']}  |  {manifest.get('run_note', '')}")
     for n in notes:
         print(n)
 
@@ -191,7 +191,7 @@ def main() -> int:
     with _console_to_file(log_path):
         print(f"{'=' * 70}")
         print(f"  ROI rerun  : {tag}")
-        print(f"  Riferimento: {run_dir}")
+        print(f"  Reference:   {run_dir}")
         print(f"  Sandbox    : {assets_dir}")
         print(f"  rect={cfg.render.roi_rect}  mask={cfg.render.roi_mask_path or '-'}")
         print(f"{'=' * 70}")

@@ -5,7 +5,7 @@ No GPU, training or OptiX needed. It reads the EXR files produced by an earlier 
 directly (nerf_render_images/iter_*/ for the NeRF views, skybox_nerf_baked.exr for the
 skybox comparison) and rewrites the PNGs with the current nerf.metrics functions.
 
-Uso:
+Usage:
   python regen_heatmaps.py <run_dir> [gt_skybox.exr]
 
   <run_dir>      : a scene folder, e.g.
@@ -72,7 +72,7 @@ def main() -> None:
     gt_skybox_path = Path(sys.argv[2]).resolve() if len(sys.argv) >= 3 else None
 
     if not run_dir.is_dir():
-        print(f"Errore: {run_dir} non esiste o non è una directory.", flush=True)
+        print(f"Error: {run_dir} does not exist, or is not a directory.", flush=True)
         sys.exit(1)
 
     # Import the plotting functions from nerf.metrics (not from images_generator)
@@ -86,13 +86,13 @@ def main() -> None:
         if iter_dirs:
             iter_dir = iter_dirs[-1]   # use the latest iteration only
             gt_files = sorted(iter_dir.glob("frame_*_gt.exr"))
-            print(f"[regen] Per-vista: {len(gt_files)} frame in {iter_dir.name}", flush=True)
+            print(f"[regen] Per view: {len(gt_files)} frames in {iter_dir.name}", flush=True)
 
             for gt_path in gt_files:
                 stem      = gt_path.stem.replace("_gt", "")   # "frame_NNN"
                 pred_path = iter_dir / f"{stem}_pred.exr"
                 if not pred_path.exists():
-                    print(f"  ⚠  {pred_path.name} non trovato, skip", flush=True)
+                    print(f"  ⚠  {pred_path.name} not found, skipped", flush=True)
                     continue
 
                 gt_np   = _load_exr_hw3(str(gt_path))
@@ -101,18 +101,18 @@ def main() -> None:
                 plot_error_heatmap(pred_np, gt_np, out_png, title=stem)
                 print(f"  ✓  {stem}_heatmap.png", flush=True)
         else:
-            print(f"[regen] Nessuna iter_* trovata in {render_root}", flush=True)
+            print(f"[regen] No iter_* found in {render_root}", flush=True)
     else:
-        print(f"[regen] nerf_render_images/ non trovata in {run_dir} — skip per-vista", flush=True)
+        print(f"[regen] nerf_render_images/ not found in {run_dir} — skipping the per-view part", flush=True)
 
     # ── Skybox: skybox_nerf_baked.exr vs GT HDR ─────────────────────────────
     baked_path = run_dir / "skybox_nerf_baked.exr"
     if not baked_path.exists():
-        print(f"[regen] skybox_nerf_baked.exr non trovato — skip skybox compare", flush=True)
+        print(f"[regen] skybox_nerf_baked.exr not found — skipping the skybox compare", flush=True)
     elif gt_skybox_path is None:
         print("[regen] no GT skybox given (argument 2) — skipping the skybox compare", flush=True)
     elif not gt_skybox_path.exists():
-        print(f"[regen] GT skybox non trovato: {gt_skybox_path} — skip", flush=True)
+        print(f"[regen] GT skybox not found: {gt_skybox_path} — skipped", flush=True)
     else:
         print(f"[regen] Skybox compare: {baked_path.name} vs {gt_skybox_path.name}", flush=True)
         gt_sky    = _load_exr_hw3(str(gt_skybox_path))

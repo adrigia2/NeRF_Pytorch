@@ -7,7 +7,7 @@ Model (split-sum, metallic workflow, per texel, camera j):
     F_j  = F0 + (1 - F0) * (1 - cos(theta_j))^5        (Schlick)
     F0   = 0.04 * (1 - X) + d * X                       (accoppiamento spettrale)
     E    = cosine-weighted irradiance over the hemisphere (view-independent)
-    L_j(r) = radianza ambiente prefiltrata GGX attorno a reflect(v_j, n)
+    L_j(r) = GGX-prefiltered ambient radiance around reflect(v_j, n)
              (in the real pipeline: cone-traced NeRF query, here: analytic envmap + MC)
 
 Unknowns per texel: d (3), X (1), r (1).
@@ -23,7 +23,7 @@ Finally it checks the identifiability of the model pbr_solver.py adopted
 
     C_j = (a*x/pi) * E + (1 - x) * L_j(r)      L_j = mean over the cone
 
-Qui la pendenza di C rispetto a L tra le camere identifica direttamente
+Here the slope of C with respect to L across the cameras directly identifies
 beta = 1-x (the diffuse term is view-independent) and the intercept identifies
 a*x*E/pi: unlike the naive model there is no free scale on the specular, so
 (a, x, r) are recoverable. The fit is the same centred closed-form regression
@@ -252,7 +252,7 @@ def main():
             [np.stack([prefiltered_env(R, rk) for R in refl]) for rk in R_LEVELS])
 
         for noise in (0.0, 0.02, 0.05):
-            print(f"=== {n_cams} camere, rumore {noise:.0%} ===")
+            print(f"=== {n_cams} cameras, noise {noise:.0%} ===")
             for name, (d_gt, X_gt, r_gt) in materials.items():
                 L_true = np.stack([prefiltered_env(R, r_gt) for R in refl])
                 C = render(d_gt, X_gt, cos_t, E, L_true)
@@ -277,7 +277,7 @@ def main():
         print(f"  X assunto={X:.1f} -> residuo {resid:.3e},"
               f"  d recuperato={np.round(d_rec, 3)}")
     print("  -> identical residual for every X: the system does not constrain X,"
-          " e d scala di conseguenza.")
+          " and d scales accordingly.")
 
     experiment_cone_model()
 
@@ -293,12 +293,12 @@ def experiment_cone_model():
     (the 'off-grid' material has to fall on the adjacent level)."""
     E = irradiance()
     print("\n=== Modello pbr_solver: C = (a*x/pi)*E + (1-x)*mean-cone(r) ===")
-    print(f"griglia aperture: {APERTURES_TOY.astype(int).tolist()} gradi\n")
+    print(f"aperture grid: {APERTURES_TOY.astype(int).tolist()} degrees\n")
 
     materials = {
         "diffuso puro   (a rosso,  x=1.00, r=n/d)": (np.array([0.70, 0.15, 0.10]), 1.00, 90.0),
         "lucido         (a blu,    x=0.70, r=25)": (np.array([0.10, 0.20, 0.65]), 0.70, 25.0),
-        "quasi specchio (a grigio, x=0.20, r=0)": (np.array([0.50, 0.50, 0.50]), 0.20, 0.0),
+        "near mirror    (a grey,   x=0.20, r=0)": (np.array([0.50, 0.50, 0.50]), 0.20, 0.0),
         "off-grid       (a green,  x=0.50, r=35)": (np.array([0.20, 0.60, 0.25]), 0.50, 35.0),
     }
 
@@ -311,7 +311,7 @@ def experiment_cone_model():
              for ap in APERTURES_TOY])
 
         for noise in (0.0, 0.02, 0.05):
-            print(f"--- {n_cams} camere, rumore {noise:.0%} ---")
+            print(f"--- {n_cams} cameras, noise {noise:.0%} ---")
             for name, (a_gt, x_gt, r_gt) in materials.items():
                 L_true = np.stack([cone_mean_env(R, r_gt) for R in refl])
                 C = render_cone_model(a_gt, x_gt, E, L_true)

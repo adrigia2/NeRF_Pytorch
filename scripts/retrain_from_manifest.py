@@ -5,12 +5,12 @@ It answers questions of the form "does the NeRF still train without this
 hyper-parameter?" without touching the reference runs: the configuration is rebuilt
 from each scene's `run_manifest.json`, so the only difference between the new arm and
 the old one is whatever is overridden explicitly on the command line.
-comando. Ritrascrivere la config a mano invaliderebbe il confronto.
+line. Transcribing the config by hand would invalidate the comparison.
 
 Only Step 1 and Step 2 are run (plus Step 2b when the manifest calls for it): the
 texture-space reconstruction is beside the point and would cost hours.
 
-Uso:
+Usage:
     python retrain_from_manifest.py <src_root> <dst_root> \
         --iters 10000 --raw-noise-std 0.0 [--configs exp_l1_d02 ...] [--scenes ...]
 
@@ -57,12 +57,12 @@ def find_runs(src: Path, configs, scenes) -> "list[tuple[str, str, Path]]":
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("src_root", help="radice dello sweep di riferimento")
+    ap.add_argument("src_root", help="root of the reference sweep")
     ap.add_argument("dst_root", help="the new root (it gets created)")
     ap.add_argument("--iters", type=int, default=10000)
     ap.add_argument("--raw-noise-std", type=float, default=0.0)
-    ap.add_argument("--configs", nargs="*", default=None, help="filtra le config")
-    ap.add_argument("--scenes", nargs="*", default=None, help="filtra le scene")
+    ap.add_argument("--configs", nargs="*", default=None, help="filter the configs")
+    ap.add_argument("--scenes", nargs="*", default=None, help="filter the scenes")
     ap.add_argument("--step2b", choices=("keep", "on", "off"), default="keep",
                     help="render the training frames with the model (default: as in the manifest)")
     ap.add_argument("--note", default="", help="note to store in the new manifest")
@@ -72,7 +72,7 @@ def main() -> int:
     src, dst = Path(args.src_root).resolve(), Path(args.dst_root).resolve()
     runs = find_runs(src, set(args.configs or []), set(args.scenes or []))
     if not runs:
-        print(f"✗ nessun run_manifest.json sotto {src}")
+        print(f"✗ no run_manifest.json under {src}")
         return 2
 
     note = args.note or (f"{args.iters}iter | raw_noise_std={args.raw_noise_std} "
@@ -130,7 +130,7 @@ def main() -> int:
             statuses[key] = f"ok ({(time.perf_counter() - t0) / 60:.1f} min)"
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
-            statuses[key] = f"errore: {exc}"
+            statuses[key] = f"error: {exc}"
 
     print(f"\n{'=' * 70}")
     print(f"  Riepilogo ({(time.perf_counter() - t_start) / 60:.1f} min totali):")

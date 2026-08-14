@@ -16,7 +16,7 @@ The criterion is not uniform, and the distinction is the informative content of 
      executions of the same bake already give different maps.
   C  like B, propagated: maps derived from the PBR fit.
   D  like B, but passed through an argmin over 14 candidates: roughness and lobe_param
-     saltano da un candidato all'altro dove due residui quasi pareggiano.
+     jump from one candidate to another where two residuals nearly tie.
 
 Only group A gives a pass/fail verdict on the values; for B, C and D the comparison with
 the full run has no sensible a-priori threshold. To give it one, pass
@@ -26,7 +26,7 @@ intrinsic noise, and that is the yardstick for reading the full-vs-ROI column.
 The "everything zero outside the ROI" check is deterministic instead, and holds for every
 group: a non-zero value there is always a bug.
 
-Uso:
+Usage:
     python compare_roi_run.py <run_dir> [--tag TAG] [--reference full|TAG2]
                               [--cams all|0,12,24] [--source gt]
 """
@@ -45,7 +45,7 @@ import _paths  # noqa: F401
 from pbr_solver import _ExrBandReader  # noqa: E402
 
 GROUP_DESC = {
-    "A": "deterministico, bit-identico",
+    "A": "deterministic, bit-identical",
     "B": "stocastico (raw_noise_std)",
     "C": "derivate dal fit",
     "D": "argmin fra candidati",
@@ -119,10 +119,10 @@ def compare_file(full_p: Path, roi_p: Path, roi_rows: np.ndarray,
     st = Stats()
     with _ExrBandReader(full_p) as ra, _ExrBandReader(roi_p) as rb:
         if (ra.height, ra.width) != (rb.height, rb.width):
-            raise ValueError(f"{roi_p.name}: dimensioni diverse "
+            raise ValueError(f"{roi_p.name}: different sizes "
                              f"{ra.width}x{ra.height} vs {rb.width}x{rb.height}")
         if ra.names != rb.names:
-            raise ValueError(f"{roi_p.name}: canali diversi\n  full={ra.names}\n  roi ={rb.names}")
+            raise ValueError(f"{roi_p.name}: different channels\n  full={ra.names}\n  roi ={rb.names}")
         H = ra.height
         for y0 in range(0, H, band):
             r = min(band, H - y0)
@@ -186,7 +186,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run_dir", help="the full reference run (holds roi/<tag>/)")
-    ap.add_argument("--tag", default="", help="sandbox da confrontare (default: unica presente)")
+    ap.add_argument("--tag", default="", help="sandbox to compare (default: the only one present)")
     ap.add_argument("--reference", default="full",
                     help="'full' (default) or the tag of a second sandbox with the "
                          "SAME ROI, to measure the intrinsic noise")
@@ -222,7 +222,7 @@ def main() -> int:
         # image mask, the "outside" comparison would stay correct but the "inside" one
         # would include texels the ROI excluded (and which are 0).
         print(f"  ⚠  the ROI includes the mask {fp['mask_path']}: the comparison "
-              f"'dentro' usa il solo rettangolo, quindi è più severo del dovuto")
+              f"'inside' uses the rectangle alone, so it is stricter than it needs to be")
     if not fp.get("rect") and not fp.get("mask_path"):
         print("✗ roi.json describes no ROI")
         return 2
@@ -244,12 +244,12 @@ def main() -> int:
             print(f"✗ {args.reference} has a different ROI ({ref_fp['texels']} texels "
                   f"vs {fp['texels']}): the comparison would not measure the intrinsic noise")
             return 2
-        ref_label = f"sandbox {args.reference} (stessa ROI → rumore intrinseco)"
+        ref_label = f"sandbox {args.reference} (same ROI → intrinsic noise)"
 
-    print(f"Riferimento : {ref}\n              {ref_label}")
+    print(f"Reference   : {ref}\n              {ref_label}")
     print(f"Confrontata : {roi}")
     print(f"ROI         : rect={fp.get('rect')}  {fp['texels']} texels  "
-          f"su IUM {W}×{H}  (sha1 {fp['sha1'][:12]})")
+          f"on an IUM of {W}×{H}  (sha1 {fp['sha1'][:12]})")
 
     manifest = full / "run_manifest.json"
     if manifest.exists():
@@ -257,11 +257,11 @@ def main() -> int:
             std = json.load(fh)["config"].get("nerf_raw_noise_std")
         if std:
             print(f"\n  ⚠  nerf_raw_noise_std = {std}: raw2outputs aggiunge rumore "
-                  f"gaussiano alla densità a OGNI query NeRF, senza guardia di eval\n"
-                  f"     (nerf/rays.py:68). I gruppi B/C/D sono quindi stocastici di "
-                  f"loro: usare --reference <altro-tag> per il metro.")
+                  f"Gaussian noise to the density at EVERY NeRF query, with no eval guard\n"
+                  f"     (nerf/rays.py:68). Groups B/C/D are therefore stochastic in "
+                  f"themselves: use --reference <other-tag> for a yardstick.")
     print(f"\n  Verdict on the values only for group A; for every group the "
-          f"'fuori dalla ROI deve essere zero'.\n")
+          f"'outside the ROI must be zero' holds.\n")
 
     targets = build_targets(full, roi, args.source, cams)
     hdr = (f"{'gr':3} {'file':50} {'texel':>10} {'esatti':>8} "
@@ -276,8 +276,8 @@ def main() -> int:
     for rel, group, scope in targets:
         fp_ref, fp_roi = ref / rel, roi / rel
         if not fp_ref.exists() or not fp_roi.exists():
-            which = "riferimento" if not fp_ref.exists() else "sandbox"
-            missing.append(f"{rel} (manca in {which})")
+            which = "reference" if not fp_ref.exists() else "sandbox"
+            missing.append(f"{rel} (missing from the {which})")
             continue
         try:
             st = compare_file(fp_ref, fp_roi, mask2d, scope, args.band)
@@ -291,9 +291,9 @@ def main() -> int:
         ok_out = st.max_outside == 0.0 or scope == "everywhere"
         ok_val = st.n_exact == st.n if group in STRICT else True
         if not ok_out:
-            failures.append(f"{rel}: fuori ROI max {st.max_outside:.3e}")
+            failures.append(f"{rel}: outside the ROI max {st.max_outside:.3e}")
         if not ok_val:
-            failures.append(f"{rel}: {st.n - st.n_exact} valori diversi "
+            failures.append(f"{rel}: {st.n - st.n_exact} differing values "
                             f"(gruppo deterministico)")
 
         if group in STRICT:
@@ -301,7 +301,7 @@ def main() -> int:
         elif not ok_out:
             verdict = "✗ outside"
         else:
-            verdict = f"info ({100 * (1 - st.frac_exact):.3f}% diversi)"
+            verdict = f"info ({100 * (1 - st.frac_exact):.3f}% differ)"
         print(f"{group:3} {rel[-50:]:50} {st.n:>10,} {100 * st.frac_exact:7.3f}% "
               f"{st.max_abs:10.3e} {p50:9.2e} {p99:9.2e} {st.max_rel:9.2e} "
               f"{st.max_outside:8.1e}  {verdict}")
@@ -315,9 +315,9 @@ def main() -> int:
         p50 = float(np.median([s.percentiles()[0] for s in sts]))
         p99 = max(s.percentiles()[1] for s in sts)
         print(f"  gruppo {g} ({GROUP_DESC[g]}): {len(sts)} file, "
-              f"{100 * n_ex / max(n, 1):.4f}% bit-identici, "
-              f"rel p50 mediana {p50:.2e}, rel p99 max {p99:.2e}, "
-              f"max fuori ROI {max(s.max_outside for s in sts):.1e}")
+              f"{100 * n_ex / max(n, 1):.4f}% bit-identical, "
+              f"rel p50 median {p50:.2e}, rel p99 max {p99:.2e}, "
+              f"max outside the ROI {max(s.max_outside for s in sts):.1e}")
 
     if missing:
         print(f"\n  {len(missing)} files not compared:")

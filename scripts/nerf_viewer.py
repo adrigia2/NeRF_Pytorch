@@ -40,7 +40,7 @@ DEPTH_MISS_SENTINEL = 1e10
 
 
 def _orbit_c2w(center: np.ndarray, radius: float, az: float, el: float) -> np.ndarray:
-    """Posa camera-to-world 4×4 (convenzione NeRF: -Z forward) in orbita attorno a center.
+    """4×4 camera-to-world pose (NeRF convention: -Z forward), orbiting around center.
 
     az=0, el=0 → camera on the -Y side looking towards +Y (Blender's forward).
     """
@@ -134,7 +134,7 @@ class NerfViewer:
         self.radius, self.az, self.el = _orbit_from_pose(pose0, center)
 
         self.ev = 0.0
-        self.last_img: np.ndarray | None = None   # ultimo render float (preview o hi-res)
+        self.last_img: np.ndarray | None = None   # last float render (preview or hi-res)
         self.last_was_hires = False
         self.captures_dir = Path(ckpt_path).parent / "viewer_captures"
 
@@ -176,10 +176,10 @@ class NerfViewer:
             self.bundle, cfg, self.iter_done = self._load_ckpt(self.ckpt_path, return_iter=True)
             cfg.chunk = self.cfg.chunk
             self.cfg = cfg
-            print(f"[ok] checkpoint ricaricato (iter {self.iter_done})")
+            print(f"[ok] checkpoint reloaded (iter {self.iter_done})")
             return True
-        except Exception as exc:  # file in scrittura / corrotto: riprova al prossimo giro
-            print(f"[warn] reload fallito ({exc}); riprovo piu' tardi")
+        except Exception as exc:  # file being written / corrupt: retry on the next pass
+            print(f"[warn] reload failed ({exc}); retrying later")
             return False
 
     # ── capture ──────────────────────────────────────────────────────────────
@@ -194,7 +194,7 @@ class NerfViewer:
         png = self.captures_dir / f"{stem}.png"
         _write_exr(self.last_img, str(exr))
         cv2.imwrite(str(png), disp_bgr)
-        print(f"[ok] vista salvata: {exr}")
+        print(f"[ok] view saved: {exr}")
 
 
 def main() -> None:
@@ -265,11 +265,11 @@ def main() -> None:
                       65362, 2490368, 65364, 2621440):   # up / down
             c2w_cur = _orbit_c2w(viewer.center, viewer.radius, viewer.az, viewer.el)
             cam_right = c2w_cur[:3, 0]
-            cam_fwd = -c2w_cur[:3, 2]                     # direzione verso cui guarda la camera
+            cam_fwd = -c2w_cur[:3, 2]                     # direction the camera looks at
             step = viewer.radius * 0.1
-            if kraw in (65361, 2424832):      # ←  sinistra
+            if kraw in (65361, 2424832):      # ←  left
                 viewer.center -= cam_right * step
-            elif kraw in (65363, 2555904):    # →  destra
+            elif kraw in (65363, 2555904):    # →  right
                 viewer.center += cam_right * step
             elif kraw in (65362, 2490368):    # ↑  forward (along the camera's forward)
                 viewer.center += cam_fwd * step

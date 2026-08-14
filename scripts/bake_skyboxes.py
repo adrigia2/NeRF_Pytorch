@@ -10,7 +10,7 @@ When a ground-truth HDR skybox is available (the --gt option, or skybox_path in 
 run's run_manifest.json), it also writes `<run_dir>/skybox_compare/skybox_heatmap.png`,
 identical to the one Step 3 produces with compare_skybox_to_gt=True.
 
-Uso:
+Usage:
   python bake_skyboxes.py <root> [--gt GT.exr] [--force] [--size W H] [--yaw DEG] [--dry-run]
 
   <root>    : the root of a sweep (holding <tag>/<scene>/model/...) or a single run dir.
@@ -130,28 +130,28 @@ def main() -> int:
     parser.add_argument("--force", action="store_true",
                         help="redo bake and heatmap even when the files exist")
     parser.add_argument("--size", type=int, nargs=2, metavar=("W", "H"), default=None,
-                        help="override di skybox_size (default: dal run_manifest.json)")
+                        help="override skybox_size (default: from run_manifest.json)")
     parser.add_argument("--yaw", type=float, default=None,
-                        help="override di skybox_yaw_degrees (default: dal run_manifest.json)")
+                        help="override skybox_yaw_degrees (default: from run_manifest.json)")
     parser.add_argument("--dry-run", action="store_true",
                         help="list what would be done without importing torch")
     args = parser.parse_args()
 
     root = args.root.resolve()
     if not root.is_dir():
-        print(f"Errore: {root} non esiste o non è una directory.", flush=True)
+        print(f"Error: {root} does not exist, or is not a directory.", flush=True)
         return 1
 
     if args.gt is not None and not args.gt.exists():
-        print(f"Errore: GT skybox non trovato: {args.gt}", flush=True)
+        print(f"Error: GT skybox not found: {args.gt}", flush=True)
         return 1
 
     run_dirs = find_run_dirs(root)
     if not run_dirs:
-        print(f"Nessun checkpoint {CKPT_REL.as_posix()} trovato sotto {root}", flush=True)
+        print(f"No {CKPT_REL.as_posix()} checkpoint found under {root}", flush=True)
         return 1
 
-    print(f"[bake] {len(run_dirs)} run trovate sotto {root}", flush=True)
+    print(f"[bake] {len(run_dirs)} runs found under {root}", flush=True)
 
     # The pipeline functions live next to this file.
     import _paths  # noqa: F401
@@ -171,19 +171,19 @@ def main() -> int:
         print(f"\n[bake] {label}  ({width}x{height}, yaw={yaw}°)", flush=True)
 
         if args.dry_run:
-            print(f"  bake:    {'skip (esiste)' if baked_exists and not args.force else 'da fare'}", flush=True)
+            print(f"  bake:    {'skip (exists)' if baked_exists and not args.force else 'to do'}", flush=True)
             if gt_ok:
-                print(f"  heatmap: {'skip (esiste)' if heatmap_exists and not args.force else 'da fare'}"
+                print(f"  heatmap: {'skip (exists)' if heatmap_exists and not args.force else 'to do'}"
                       f"  vs {gt_path.name}", flush=True)
             elif gt_path is not None:
-                print(f"  heatmap: skip (GT non trovato: {gt_path})", flush=True)
+                print(f"  heatmap: skip (GT not found: {gt_path})", flush=True)
             else:
                 print("  heatmap: skip (nessuna GT: usa --gt)", flush=True)
             continue
 
         try:
             if baked_exists and not args.force:
-                print(f"  ↻  {BAKED_NAME} già presente — skip bake (--force per rifarlo)", flush=True)
+                print(f"  ↻  {BAKED_NAME} already present — skipping the bake (--force to redo it)", flush=True)
                 n_skipped += 1
             else:
                 bake_one(run_dir, width, height, yaw)
@@ -191,15 +191,15 @@ def main() -> int:
 
             if not gt_ok:
                 if gt_path is not None:
-                    print(f"  ⚠  GT non trovato ({gt_path}) — skip heatmap", flush=True)
+                    print(f"  ⚠  GT not found ({gt_path}) — skipping the heatmap", flush=True)
                 else:
                     print("  •  nessuna GT disponibile — skip heatmap (usa --gt)", flush=True)
             elif heatmap_exists and not args.force:
-                print(f"  ↻  {HEATMAP_REL.as_posix()} già presente — skip", flush=True)
+                print(f"  ↻  {HEATMAP_REL.as_posix()} already present — skipped", flush=True)
             else:
                 compare_one(run_dir, gt_path)
 
-        except Exception as exc:      # una run rotta non deve fermare le altre
+        except Exception as exc:      # one broken run must not stop the others
             n_failed += 1
             print(f"  ✗  FALLITA: {type(exc).__name__}: {exc}", flush=True)
             traceback.print_exc()

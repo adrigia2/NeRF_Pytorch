@@ -5,7 +5,7 @@ For each variant it produces two PNGs:
 
   <key>_view.png    the rendered view, tonemapped
   <key>_detail.png  a full-resolution crop on the element that sets the variant apart
-                    variante (il cubo metallico, la sfera emissiva)
+                    variant (the metallic cube, the emissive sphere)
 
     python make_scenes_figure.py --out ../Doc/images/scenes
     python make_scenes_figure.py --family sword --out ../Doc/images/scenes
@@ -191,10 +191,10 @@ def skybox_previews(out: Path, key: float, downsample: int = 4) -> None:
     for name, rel in SKYBOXES:
         p = SCENES_ROOT / rel
         if not p.exists():
-            raise SystemExit(f"ERRORE: {p} non esiste")
+            raise SystemExit(f"ERROR: {p} does not exist")
         a = block_mean(load_exr(p), downsample)
         expo, med = exposure_of(a, key)
-        print(f"{name}: {p.name}  esposizione {expo:.3f} "
+        print(f"{name}: {p.name}  exposure {expo:.3f} "
               f"(mediana luminanza {med:.4f})")
         save_png(tonemap(a, expo), out / f"{name}.png")
 
@@ -205,11 +205,11 @@ def contact_sheet(scene_dir: str, out: Path, downsample: int = 8,
     paths = sorted((root / scene_dir / "images").glob("*.exr"))
     if not paths:
         raise SystemExit(f"ERROR: no EXR in {root / scene_dir / 'images'}")
-    print(f"contact sheet di {scene_dir}: {len(paths)} frame")
+    print(f"contact sheet of {scene_dir}: {len(paths)} frames")
 
     thumbs = [block_mean(load_exr(p), downsample) for p in paths]
     expo, med = exposure_of(np.concatenate([t.reshape(-1, 3) for t in thumbs])[None])
-    print(f"  esposizione = {expo:.4f} (mediana luminanza {med:.4f})")
+    print(f"  exposure = {expo:.4f} (median luminance {med:.4f})")
 
     nrows = (len(thumbs) + ncols - 1) // ncols
     h, w = thumbs[0].shape[:2]
@@ -234,13 +234,13 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True, help="destination folder for the PNGs")
     ap.add_argument("--family", default="interior", choices=sorted(FAMILIES),
-                    help="famiglia di scene da generare (default interior)")
+                    help="scene family to generate (default interior)")
     ap.add_argument("--camera", default=None,
                     help="frame to use (default: the family's own)")
     ap.add_argument("--downsample", type=int, default=2,
                     help="block mean on the view (default 2: 1920x1080 -> 960x540)")
     ap.add_argument("--key", type=float, default=KEY,
-                    help=f"livello a cui portare la mediana della luminanza (default {KEY})")
+                    help=f"level the median luminance is brought to (default {KEY})")
     ap.add_argument("--contact-sheet", default=None, metavar="KEY",
                     help="write only the frame grid of the given variant")
     ap.add_argument("--skyboxes", action="store_true",
@@ -261,7 +261,7 @@ def main() -> int:
 
     if args.contact_sheet:
         if args.contact_sheet not in by_key:
-            print(f"ERRORE: {args.contact_sheet} non e' fra {list(by_key)}")
+            print(f"ERROR: {args.contact_sheet} is not among {list(by_key)}")
             return 2
         contact_sheet(by_key[args.contact_sheet][0],
                       out / f"contact_{args.contact_sheet}.png", root=fam.root)
@@ -273,7 +273,7 @@ def main() -> int:
     for key, scene_dir, _, _ in fam.scenes:
         p = frame_path(scene_dir, camera, fam.root)
         if not p.exists():
-            print(f"ERRORE: {p} non esiste")
+            print(f"ERROR: {p} does not exist")
             return 2
         linear[key] = load_exr(p)
         print(f"{key:14s} {p.name}  {linear[key].shape[1]}x{linear[key].shape[0]}")
@@ -283,8 +283,8 @@ def main() -> int:
     print()
     for group, ref_key in fam.reference.items():
         expo[group], med = exposure_of(linear[ref_key], args.key)
-        print(f"esposizione {group:8s} = {expo[group]:9.4f}  "
-              f"(mediana luminanza di {ref_key}: {med:.5f})")
+        print(f"exposure {group:8s} = {expo[group]:9.4f}  "
+              f"(median luminance of {ref_key}: {med:.5f})")
 
     print()
     for key, _, _, group in fam.scenes:
