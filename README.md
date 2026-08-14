@@ -77,6 +77,11 @@ Prerequisites:
 - Visual Studio 2022 (MSVC toolset, x64)
 - NVIDIA CUDA Toolkit
 - NVIDIA OptiX SDK 9.0.0
+- the pybind11 submodule, which the build needs and a plain clone leaves empty:
+
+```bash
+git -C ../OptixProjectCMake submodule update --init --recursive
+```
 
 Then, from inside the activated environment:
 
