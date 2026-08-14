@@ -31,7 +31,7 @@ import numpy as np
 import _paths  # noqa: F401
 import OptixProgrammablePasses as optix
 
-REPO = Path(__file__).resolve().parents[1] / "OptixProjectCMake"
+REPO = Path(__file__).resolve().parents[2] / "OptixProjectCMake"
 MODEL = REPO / "Scenes" / "SwordShield" / "Models" / "SwordShield.obj"
 
 APERTURES = [0.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180.0]

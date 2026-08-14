@@ -41,7 +41,7 @@ import numpy as np
 from matplotlib.colors import LogNorm
 from matplotlib.ticker import LogFormatterSciNotation, LogLocator
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root
 DIR_ORIGINAL = os.path.join(ROOT, "NerfOpenEXRSmooth", "images")
 DIR_COMPUTED = os.path.join(ROOT, "NerfOpenEXRSmoothRerender", "images")
 DIR_OUTPUT = os.path.join(ROOT, "output")

@@ -18,23 +18,23 @@ class NerfConfig:
     # Sampling
     near: float = 0.01
     far: float = 20.0          # overwritten at runtime from sphere radius
-    # Deviazione standard del rumore gaussiano sommato alla densità grezza in
-    # raw2outputs. È un REGOLARIZZATORE DI TRAINING: lo attiva soltanto il forward
-    # su cui si fa backward (train.py), passandolo esplicitamente come noise_std.
-    # Nessun percorso di inferenza lo legge — render_image, query_radiance e
-    # bake_envmap usano il default 0.0 delle funzioni di render, così un bake è
-    # riproducibile. Fino al 2026-08-12 veniva invece applicato ovunque, e i bake
-    # prodotti allora non sono confrontabili con quelli successivi.
+    # Standard deviation of the Gaussian noise added to the raw density in
+    # raw2outputs. It is a TRAINING REGULARIZER: only the forward pass that gets
+    # back-propagated (train.py) enables it, by passing it explicitly as
+    # noise_std. No inference path reads it — render_image, query_radiance and
+    # bake_envmap use the render functions' default of 0.0, which is what makes a
+    # bake reproducible. Until 2026-08-12 it was applied everywhere instead, so
+    # bakes produced back then are not comparable with later ones.
     raw_noise_std: float = 0.0
     # RGB output activation: "exp" (HDR, mirrors NeILFMLP/pbrnerf) or "softplus".
     # Note: checkpoints saved with one activation are NOT compatible with the
     # other (different weight scales).
     rgb_activation: str = "exp"
     # Training loss: "l1" | "mse" |
-    #   "rel_mse"     — variante con eps fuori dal quadrato: / (pred²+eps)
-    #   "rel_mse_raw" — RawNeRF fedele: / (pred+eps)² (cfr. multinerf train_utils.py)
-    #   "log_l1"      — L1 su log1p (comprime gli highlights)
-    # Default qui è "l1"; il default effettivo del training viene da
+    #   "rel_mse"     — variant with eps outside the square: / (pred²+eps)
+    #   "rel_mse_raw" — faithful RawNeRF: / (pred+eps)² (cf. multinerf train_utils.py)
+    #   "log_l1"      — L1 on log1p (compresses the highlights)
+    # The default here is "l1"; the effective training default comes from
     # nerf_loss_type in images_generator.py (→ "rel_mse_raw").
     loss_type: str = "l1"
     # Initial bias of rgb_linear when rgb_activation="exp".
@@ -54,9 +54,10 @@ class NerfConfig:
     # 0.1 is more aggressive, 0.5 is gentler.
     lrate: float = 5e-4
     lr_decay_factor: float = 0.2  # sweepable via PipelineConfig.nerf_lr_decay
-    # Orizzonte (in iterazioni ASSOLUTE) su cui si spalma il decay. Ancora FISSA,
-    # indipendente da num_iters/iter_start: garantisce uno schedule continuo quando si
-    # riprende il training. 0 = auto → usa num_iters (orizzonte del run fresh).
+    # Horizon (in ABSOLUTE iterations) the decay is spread over. It is a FIXED
+    # anchor, independent of num_iters/iter_start: that is what keeps the schedule
+    # continuous when training is resumed. 0 = auto → use num_iters (the horizon
+    # of a fresh run).
     lr_decay_steps: int = 0  # sweepable via PipelineConfig.nerf_lr_decay_steps
 
     # Foreground depth-window (mesh surface)
@@ -66,7 +67,7 @@ class NerfConfig:
     opacity_weight: float = 1.0      # deprecated: no longer used (unified loss, no opacity term)
 
     # Background sphere-shell window (origin = scene centre, t_hit = sphere radius)
-    bg_radius_mult: float = 6.0      # sphere radius = bg_radius_mult × max bbox side
+    bg_radius_mult: float = 6.0      # sphere radius = bg_radius_mult × max |p| from the origin
     bg_depth_window: float = 2.0     # wider window than mesh (shell is far away)
     bg_depth_window_end: float = 2.0
     # Profiling: per-phase synchronized timing for the first N iters (0 = off)

@@ -54,7 +54,7 @@ from images_generator import (
 )
 from pbr_solver import read_cones
 
-REPO = Path(__file__).resolve().parents[1] / "OptixProjectCMake"
+REPO = Path(__file__).resolve().parents[2] / "OptixProjectCMake"
 MODEL = REPO / "Scenes" / "SwordShield" / "Models" / "SwordShield.obj"
 
 APERTURES = [0.0, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 80.0,

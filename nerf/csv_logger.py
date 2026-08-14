@@ -11,7 +11,7 @@ the logger is stateless and reentrant, and the file on disk is always complete
 even if the process is killed mid-training.
 
 Column names and header text are in English so the CSVs can feed thesis figures
-directly.  Italian stays only in comments.
+directly.
 """
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ class CsvLogger:
     def __init__(self, path: str | Path, fieldnames: list[str]) -> None:
         self.path = Path(path)
         self.fieldnames = list(fieldnames)
-        self._checked = False   # schema verificato una volta per processo
+        self._checked = False   # schema checked once per process
 
     # ── schema guard ──────────────────────────────────────────────────────────
 
@@ -46,7 +46,7 @@ class CsvLogger:
             with open(self.path, newline="", encoding="utf-8") as fh:
                 header = next(csv.reader(fh), None)
         except OSError as exc:
-            print(f"  [warn] CSV metriche illeggibile ({exc}); lo sovrascrivo: {self.path}")
+            print(f"  [warn] metrics CSV unreadable ({exc}); overwriting it: {self.path}")
             header = None
 
         if header == self.fieldnames:
@@ -56,10 +56,10 @@ class CsvLogger:
         rotated = self.path.with_name(f"{self.path.stem}_{stamp}{self.path.suffix}")
         try:
             self.path.rename(rotated)
-            print(f"  [warn] header CSV diverso da quello atteso; vecchio file → {rotated.name}")
+            print(f"  [warn] CSV header differs from the expected one; old file → {rotated.name}")
         except OSError as exc:
-            print(f"  [warn] impossibile ruotare il CSV ({exc}); logging disattivato: {self.path}")
-            self.fieldnames = []   # disabilita i log successivi senza sollevare
+            print(f"  [warn] cannot rotate the CSV ({exc}); logging disabled: {self.path}")
+            self.fieldnames = []   # disable later logging without raising
 
     # ── write ─────────────────────────────────────────────────────────────────
 
@@ -74,8 +74,8 @@ class CsvLogger:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             write_header = not self.path.exists() or self.path.stat().st_size == 0
-            # newline="" è obbligatorio col modulo csv su Windows: senza, ogni
-            # record viene seguito da una riga vuota.
+            # newline="" is mandatory with the csv module on Windows: without it,
+            # every record is followed by a blank line.
             with open(self.path, "a", newline="", encoding="utf-8") as fh:
                 writer = csv.DictWriter(fh, fieldnames=self.fieldnames,
                                         extrasaction="ignore")
@@ -83,4 +83,4 @@ class CsvLogger:
                     writer.writeheader()
                 writer.writerow(row)
         except OSError as exc:
-            print(f"  [warn] scrittura CSV metriche fallita ({exc}): {self.path}")
+            print(f"  [warn] metrics CSV write failed ({exc}): {self.path}")

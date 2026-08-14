@@ -10,24 +10,24 @@ from .config import NerfConfig
 from .encoding import get_embedder
 from .model import NeRF
 
-# Marcatore della convenzione geometrica con cui il modello è stato addestrato.
-# "unit": rays_d unitario e t_hit distanza metrica (vedi get_rays_np). I checkpoint
-# scritti prima di questa convenzione non hanno la chiave: il loro campo è ancorato a
-# posizioni di campionamento spostate fino a ~0.4 unità e sono inutilizzabili, quindi
-# vengono rifiutati invece che migrati.
+# Marker of the geometric convention the model was trained under.
+# "unit": unit-length rays_d and metric t_hit (see get_rays_np). Checkpoints
+# written before this convention lack the key: their field is anchored to sample
+# positions displaced by up to ~0.4 units and is unusable, so they are rejected
+# rather than migrated.
 RAY_CONVENTION = "unit"
 
 _LEGACY_CKPT_MSG = (
-    "Checkpoint scritto con la vecchia parametrizzazione dei raggi (rays_d non "
-    "normalizzato con t_hit metrico): i campioni foreground erano piazzati oltre la "
-    "superficie e il modello non è utilizzabile.\n"
+    "Checkpoint written with the old ray parametrization (non-normalized rays_d "
+    "with metric t_hit): the foreground samples were placed past the surface and "
+    "the model is unusable.\n"
     "  checkpoint: {path}\n"
-    "  Cancellalo (o punta a un output_dir nuovo) e ri-addestra."
+    "  Delete it (or point at a fresh output_dir) and retrain."
 )
 
 
 def _check_ray_convention(ckpt: dict, path: str) -> None:
-    """Rifiuta i checkpoint pre-normalizzazione. Vedi RAY_CONVENTION."""
+    """Reject pre-normalization checkpoints. See RAY_CONVENTION."""
     if ckpt.get("ray_convention") != RAY_CONVENTION:
         raise RuntimeError(_LEGACY_CKPT_MSG.format(path=path))
 
@@ -58,8 +58,8 @@ def save_checkpoint(path: str, model, optimizer, iter_done: int, cfg: NerfConfig
                     scene_center=None, sphere_radius: float = 0.0) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     center_list = scene_center.tolist() if scene_center is not None else [0.0, 0.0, 0.0]
-    # Scrittura atomica (tmp + replace): un reader concorrente (es. nerf_viewer
-    # in watch-mode) non vede mai un file parziale.
+    # Atomic write (tmp + replace): a concurrent reader (e.g. nerf_viewer in
+    # watch mode) never sees a partial file.
     tmp_path = str(path) + ".tmp"
     torch.save({
         "model_state":    model.state_dict(),
@@ -68,8 +68,8 @@ def save_checkpoint(path: str, model, optimizer, iter_done: int, cfg: NerfConfig
         "config":         {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)},
         "scene_center":   center_list,
         "sphere_radius":  float(sphere_radius),
-        # Fuori da "config" apposta: non è un iperparametro, ed è letto anche da chi
-        # (train.py) apre il checkpoint senza ricostruire NerfConfig.
+        # Deliberately outside "config": it is not a hyper-parameter, and it is read
+        # by code (train.py) that opens the checkpoint without rebuilding NerfConfig.
         "ray_convention": RAY_CONVENTION,
     }, tmp_path)
     os.replace(tmp_path, path)

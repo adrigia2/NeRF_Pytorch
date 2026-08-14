@@ -17,15 +17,15 @@ from .render import render_image, render_rays_depth, render_unified
 
 
 def _rel_mse(pred, target, eps=1e-3):
-    """Relative MSE (variante con eps fuori dal quadrato): divide per pred²+eps.
-    Non è la formulazione esatta di RawNeRF — vedi _rel_mse_raw per quella."""
+    """Relative MSE (variant with eps outside the square): divides by pred²+eps.
+    This is not the exact RawNeRF formulation — see _rel_mse_raw for that."""
     return (((pred - target) ** 2) / (pred.detach() ** 2 + eps)).mean()
 
 def _rel_mse_raw(pred, target, eps=1e-3):
-    """Relative MSE (RawNeRF fedele): pesa ogni pixel per l'inverso del quadrato
-    dell'intensità predetta, con eps dentro al quadrato → (pred+eps)².
-    Garantisce fedeltà relativa uniforme su tutto il range dinamico.
-    Cfr. google-research/multinerf, internal/train_utils.py."""
+    """Relative MSE (faithful RawNeRF): weights every pixel by the inverse square
+    of the predicted intensity, with eps inside the square → (pred+eps)².
+    Gives uniform relative fidelity across the whole dynamic range.
+    Cf. google-research/multinerf, internal/train_utils.py."""
     return (((pred - target) ** 2) / (pred.detach() + eps) ** 2).mean()
 
 def _mse(pred, target):
@@ -38,37 +38,37 @@ def _log_l1(pred, target):
 LOSSES = {
     "l1":          F.l1_loss,
     "mse":         _mse,
-    "rel_mse":     _rel_mse,      # variante: eps fuori dal quadrato
-    "rel_mse_raw": _rel_mse_raw,  # RawNeRF fedele: eps dentro al quadrato
+    "rel_mse":     _rel_mse,      # variant: eps outside the square
+    "rel_mse_raw": _rel_mse_raw,  # faithful RawNeRF: eps inside the square
     "log_l1":      _log_l1,
 }
 
 
-# Colonne di <output_dir>/training_metrics.csv, una riga per display block.
+# Columns of <output_dir>/training_metrics.csv, one row per display block.
 #
-# Quali confronti sono leciti:
-#   - ``loss`` è nelle unità di cfg.loss_type: confrontarla tra run con loss
-#     diverse non ha significato, serve a leggere la convergenza dentro un run.
-#   - ``mse``/``psnr_db`` sono calcolate sempre, indipendentemente dalla loss
-#     usata per il gradiente: sono le uniche colonne confrontabili tra run con
-#     loss diverse.
-#   - Il dominio è il BATCH di training dell'iterazione, non un'immagine: il
-#     batch è una fetta di una permutazione dell'intero pool di raggi, quindi
-#     foreground e background sono mescolati nelle proporzioni del dataset. Non è
-#     in nessun senso una metrica held-out.
-#   - La media è sugli ultimi ``display_every`` iterazioni (la finestra delle
-#     deque), NON sull'epoca: per l'aggregato per epoca c'è epoch_metrics.csv.
-#   - psnr_db = -10·log10(mse) assume implicitamente MAX_I = 1, ma i target sono
-#     HDR (valori > 1): è una rimappatura monotona della MSE, confrontabile tra
-#     run sugli stessi dati ma NON con i valori di PSNR della letteratura, e
-#     potenzialmente negativa se mse > 1. Con composite_white=False la GT dei
-#     raggi di background sono i pixel reali dell'envmap, quindi le zone luminose
-#     pesano quadraticamente e dominano la metrica rispetto al range diffuso.
+# Which comparisons are legitimate:
+#   - ``loss`` is in the units of cfg.loss_type: comparing it across runs with
+#     different losses is meaningless; it is for reading convergence within a run.
+#   - ``mse``/``psnr_db`` are always computed, regardless of the loss driving the
+#     gradient: they are the only columns comparable across runs that use
+#     different losses.
+#   - The domain is the training BATCH of the iteration, not an image: the batch
+#     is a slice of a permutation of the whole ray pool, so foreground and
+#     background are mixed in the dataset's own proportions. It is not a held-out
+#     metric in any sense.
+#   - The average is over the last ``display_every`` iterations (the deque
+#     window), NOT over the epoch: for the per-epoch aggregate see epoch_metrics.csv.
+#   - psnr_db = -10·log10(mse) implicitly assumes MAX_I = 1, but the targets are
+#     HDR (values > 1): it is a monotone remapping of the MSE, comparable between
+#     runs on the same data but NOT with PSNR figures from the literature, and
+#     possibly negative when mse > 1. With composite_white=False the GT of the
+#     background rays is the real envmap pixels, so the bright regions weigh
+#     quadratically and dominate the metric over the diffuse range.
 #
-# Le ultime quattro colonne sono costanti per run e ridondanti riga per riga, ma
-# rendono il CSV auto-descrittivo: sono gli assi dello sweep, quindi concatenare
-# N file in un solo dataframe basta a etichettare le curve. La scena non è nota
-# qui ma è nel path (<output_root>/<scene>/nerf_train/).
+# The last four columns are constant per run and redundant row by row, but they
+# make the CSV self-describing: they are the axes of the sweep, so concatenating
+# N files into one dataframe is enough to label the curves. The scene is not known
+# here, but it is in the path (<output_root>/<scene>/nerf_train/).
 CSV_FIELDS = [
     "iter", "epoch", "loss", "mse", "psnr_db", "lr",
     "iters_per_s", "rays_per_s", "acc_fg",
@@ -77,20 +77,20 @@ CSV_FIELDS = [
 ]
 
 
-# Colonne di <output_dir>/epoch_metrics.csv, una riga per epoca completata.
+# Columns of <output_dir>/epoch_metrics.csv, one row per completed epoch.
 #
-# La differenza sostanziale rispetto a CSV_FIELDS è il dominio della media:
-# qui ``loss`` e ``mse`` sono medie su TUTTE le iterazioni dell'epoca, cioè su un
-# passaggio completo sul dataset, mentre in training_metrics.csv sono medie sugli
-# ultimi ``display_every`` iterazioni (con 1266 iter/epoca e display_every=100,
-# l'8 % dell'epoca). Sono quindi due granularità diverse e vanno tenute su due
-# curve diverse, non concatenate.
+# The substantive difference from CSV_FIELDS is the domain of the average: here
+# ``loss`` and ``mse`` are averaged over ALL the iterations of the epoch, that is
+# over a full pass on the dataset, whereas in training_metrics.csv they are
+# averaged over the last ``display_every`` iterations (with 1266 iters/epoch and
+# display_every=100, 8 % of the epoch). They are two different granularities and
+# belong on two different curves, not concatenated.
 #
-# ``iters_in_epoch``/``rays_in_epoch`` non sono ridondanti: su un resume a metà
-# epoca gli accumulatori partono da dove il segmento è ripreso, quindi la prima
-# riga scritta dopo un resume copre solo la coda dell'epoca e ha
-# iters_in_epoch < iters_per_epoch. È il comportamento atteso, e queste due
-# colonne sono ciò che lo rende leggibile a posteriori.
+# ``iters_in_epoch``/``rays_in_epoch`` are not redundant: on a resume mid-epoch
+# the accumulators start where the segment resumed, so the first row written
+# after a resume covers only the tail of the epoch and has
+# iters_in_epoch < iters_per_epoch. That is the expected behaviour, and these two
+# columns are what makes it readable after the fact.
 EPOCH_CSV_FIELDS = [
     "epoch", "iter_end", "iters_in_epoch", "rays_in_epoch",
     "loss", "mse", "psnr_db", "lr",
@@ -153,24 +153,24 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
             "Ensure transforms_extended.json includes depth_path for every frame."
         )
 
-    # Ordine a epoche: una permutazione del pool intero per epoca, consumata un
-    # batch alla volta. Sostituisce il campionamento con reinserimento, che non
-    # dava nessuna garanzia di copertura (la frazione di raggi mai visti dopo T
-    # iterazioni era exp(-T·batch/n_rays)).
+    # Epoch ordering: one permutation of the whole pool per epoch, consumed one
+    # batch at a time. This replaces sampling with replacement, which gave no
+    # coverage guarantee at all (the fraction of rays never seen after T iterations
+    # was exp(-T·batch/n_rays)).
     iters_per_epoch = dataset.configure_epochs(batch_size, seed)
     tail = dataset.n_rays - (iters_per_epoch - 1) * batch_size
-    print(f"  Epoche: {dataset.n_rays} raggi / batch {batch_size} = "
-          f"{iters_per_epoch} iter/epoca (ultimo batch: {tail} raggi)  —  "
-          f"{num_iters} iter ≈ {num_iters / iters_per_epoch:.2f} epoche")
+    print(f"  Epochs: {dataset.n_rays} rays / batch {batch_size} = "
+          f"{iters_per_epoch} iters/epoch (last batch: {tail} rays)  —  "
+          f"{num_iters} iters ≈ {num_iters / iters_per_epoch:.2f} epochs")
     if iters_per_epoch < display_every:
         print(f"  [warn] iters_per_epoch ({iters_per_epoch}) < display_every "
-              f"({display_every}): il display block scatta a ogni fine epoca, "
-              f"quindi più spesso di display_every (preview EXR + checkpoint ogni volta)")
+              f"({display_every}): the display block fires at every epoch end, "
+              f"so more often than display_every (EXR preview + checkpoint each time)")
 
-    # La sfera di background è ancorata all'ORIGINE del mondo: l'ambiente è una funzione
-    # puramente direzionale, quindi il centro è una convenzione, e sceglierlo fisso lo
-    # rende riproducibile invece che dipendente dal set di camere. La geometria serve
-    # solo a dimensionare il raggio.
+    # The background sphere is anchored at the world ORIGIN: the environment is a purely
+    # directional function, so the centre is a convention, and fixing it makes it
+    # reproducible instead of dependent on the camera set. The geometry only serves to
+    # size the radius.
     scene_radius, p_min, p_max = dataset.compute_scene_bounds()
     scene_radius = float(scene_radius)
     center = torch.zeros(3, device=device, dtype=torch.float32)
@@ -182,8 +182,8 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
     print(f"  Scene radius (from origin): {scene_radius:.3f}  "
           f"sphere radius: {sphere_radius:.3f}  far: {cfg.far:.3f}")
 
-    # Il guscio deve stare interamente fuori dalla geometria, altrimenti i campioni di
-    # background finirebbero dentro l'oggetto, dove vive il campo foreground.
+    # The shell must sit entirely outside the geometry, otherwise the background samples
+    # would land inside the object, where the foreground field lives.
     if sphere_radius <= scene_radius:
         raise RuntimeError(
             f"Background sphere radius {sphere_radius:.3f} is inside the geometry "
@@ -191,9 +191,9 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
             f"bg_radius_mult is {cfg.bg_radius_mult} and must be > 1."
         )
 
-    # Non è un errore (i raggi bg sono ri-ancorati al centro, quindi la matematica regge
-    # comunque), ma un guscio dentro il rig di camere è una condizione che vale la pena
-    # vedere: l'ambiente finisce più vicino all'origine di dove stanno gli osservatori.
+    # Not an error (bg rays are re-anchored at the centre, so the maths still holds), but
+    # a shell inside the camera rig is worth seeing: the environment ends up closer to
+    # the origin than the observers are.
     cam_max = max(float(np.linalg.norm(m["pose"][:3, 3])) for m in dataset._frames_meta)
     if sphere_radius <= cam_max:
         print(f"  [warn] sphere radius {sphere_radius:.3f} does not enclose all cameras "
@@ -207,10 +207,10 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
     ckpt = Path(ckpt_path)
     if ckpt.exists():
         saved = torch.load(str(ckpt), map_location=device)
-        # Prima di qualsiasi altra cosa: un checkpoint pre-normalizzazione non è
-        # riprendibile. Serve qui e non solo in load_checkpoint() perché questo è
-        # l'unico punto che apre il checkpoint senza ricostruire NerfConfig, ed è la
-        # strada che percorre resume_skip_step2_if_ckpt.
+        # Before anything else: a pre-normalization checkpoint is not resumable. It is
+        # needed here and not only in load_checkpoint() because this is the only place
+        # that opens the checkpoint without rebuilding NerfConfig, and it is the path
+        # resume_skip_step2_if_ckpt takes.
         _check_ray_convention(saved, str(ckpt))
         model.load_state_dict(saved["model_state"])
         try:
@@ -222,36 +222,36 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
             center = torch.tensor(saved["scene_center"], device=device, dtype=torch.float32)
         if "sphere_radius" in saved:
             sphere_radius = float(saved["sphere_radius"])
-        print(f"  Ripreso da checkpoint: {ckpt}  (iter {iter_start})")
+        print(f"  Resumed from checkpoint: {ckpt}  (iter {iter_start})")
 
     model_bundle = (model, embed_fn, embeddirs_fn, device, center, sphere_radius)
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # CSV delle metriche, una riga per display block. In append: train() viene
-    # rientrata sullo stesso output_dir sia dai resume sia dal loop interattivo
-    # di run_pipeline, e i segmenti devono accumularsi.
+    # Metrics CSV, one row per display block. Append mode: train() is re-entered on
+    # the same output_dir both by resumes and by the interactive loop of
+    # run_pipeline, and the segments have to accumulate.
     csv_logger = CsvLogger(out_dir / "training_metrics.csv", CSV_FIELDS)
-    # Secondo file, una riga per epoca completata: stessa politica di append, ma
-    # con le medie su un passaggio intero sul dataset invece che sulla finestra.
+    # Second file, one row per completed epoch: same append policy, but with the
+    # averages taken over a full pass on the dataset instead of over the window.
     epoch_csv_logger = CsvLogger(out_dir / "epoch_metrics.csv", EPOCH_CSV_FIELDS)
     _t_train_start = time.perf_counter()
 
-    # Decay ancorato a un orizzonte FISSO in iterazioni assolute (lr_decay_steps):
-    # schedule = funzione pura di i, continuo attraverso i resume. 0 = auto → num_iters.
+    # Decay anchored to a FIXED horizon in absolute iterations (lr_decay_steps):
+    # schedule = pure function of i, continuous across resumes. 0 = auto → num_iters.
     decay_steps = cfg.lr_decay_steps if cfg.lr_decay_steps > 0 else num_iters
     loss_window: deque[torch.Tensor] = deque(maxlen=display_every)
     mse_window:  deque[torch.Tensor] = deque(maxlen=display_every)
-    # Dimensioni EFFETTIVE dei batch: l'ultimo di ogni epoca è più corto, e
-    # rays_per_s calcolato su batch_size nominale sarebbe ottimista.
+    # ACTUAL batch sizes: the last one of each epoch is shorter, and rays_per_s
+    # computed on the nominal batch_size would be optimistic.
     rays_window: deque[int] = deque(maxlen=display_every)
-    _final_psnr: float = float("nan")  # aggiornato ad ogni display block, ritornato a fine
+    _final_psnr: float = float("nan")  # updated at every display block, returned at the end
 
-    # Accumulatori sull'epoca corrente (alimentano solo epoch_metrics.csv: la
-    # console e training_metrics.csv restano sulla finestra display_every).
-    # Il reset è agganciato al CAMBIO di epoca e non a epoch_iter == 1, altrimenti
-    # un resume che riparte a metà epoca non li inizializzerebbe mai.
+    # Accumulators over the current epoch (they feed only epoch_metrics.csv: the
+    # console and training_metrics.csv stay on the display_every window).
+    # The reset is hooked to the epoch CHANGE and not to epoch_iter == 1, otherwise a
+    # resume starting mid-epoch would never initialise them.
     _epoch_cur:      int   = -1
     _epoch_loss_sum: torch.Tensor | None = None
     _epoch_mse_sum:  torch.Tensor | None = None
@@ -281,7 +281,7 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
         _profiling = _prof_active and (i - iter_start) < cfg.profile_iters
 
         epoch, _k = divmod(i, iters_per_epoch)
-        epoch_iter = _k + 1                       # 1-based, come iter = i + 1
+        epoch_iter = _k + 1                       # 1-based, like iter = i + 1
         is_epoch_end = epoch_iter == iters_per_epoch
 
         if epoch != _epoch_cur:
@@ -297,17 +297,17 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
         for pg in optimizer.param_groups:
             pg["lr"] = new_lr
 
-        # ── sample (fetta della permutazione dell'epoca; l'ultima è più corta) ─
+        # ── sample (slice of the epoch permutation; the last one is shorter) ──
         if _profiling: _sync(); _t0 = time.perf_counter()
         rays_o, rays_d, rgb_gt, depths, in_mask = dataset.sample_epoch(i)
         if _profiling: _sync(); _prof["sample"] += time.perf_counter() - _t0
         n_rays_batch = rays_o.shape[0]
 
-        # ── render unificato fg+bg ───────────────────────────────────────────
+        # ── unified fg+bg render ────────────────────────────────────────────
         if _profiling: _sync(); _t0 = time.perf_counter()
-        # Unico punto della repo che attiva il rumore sulla densità: è un
-        # regolarizzatore, quindi vale solo per il forward su cui si fa backward.
-        # Ogni percorso di inferenza usa il default noise_std=0.0 ed è riproducibile.
+        # The only place in the repo that enables density noise: it is a regularizer,
+        # so it applies only to the forward pass that gets back-propagated. Every
+        # inference path uses the default noise_std=0.0 and is reproducible.
         rgb_pred = render_unified(
             rays_o, rays_d, depths, in_mask,
             model, embed_fn, embeddirs_fn, cfg, center, sphere_radius,
@@ -339,8 +339,8 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
         mse_window.append(_mse_d)
         rays_window.append(n_rays_batch)
 
-        # Somme sull'epoca: restano tensori sul device, un solo .item() a fine
-        # epoca invece di una sincronizzazione per iterazione.
+        # Epoch sums: they stay as device tensors, with a single .item() at the end
+        # of the epoch instead of one synchronisation per iteration.
         _epoch_loss_sum = _loss_d if _epoch_loss_sum is None else _epoch_loss_sum + _loss_d
         _epoch_mse_sum  = _mse_d  if _epoch_mse_sum  is None else _epoch_mse_sum  + _mse_d
         _epoch_iters += 1
@@ -352,7 +352,7 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
 
         # ── profiling report (printed once, at end of window) ─────────────────
         if _profiling and (i - iter_start) == cfg.profile_iters - 1:
-            # list() prima dello slice: deque non è affettabile.
+            # list() before slicing: a deque is not sliceable.
             total_s    = sum(list(_iter_times)[:_prof_n])
             total_rays = sum(list(rays_window)[:_prof_n])
             total_syn  = sum(_prof.values())
@@ -375,14 +375,14 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
                 print(f"  [prof]  {k:<8}  {ms:>8.3f}  {pct:>5.1f}%")
 
         # ── display ───────────────────────────────────────────────────────────
-        # Scatta ogni display_every, a ogni fine epoca, e sull'ultima iterazione
-        # della chiamata. Se un confine di epoca cade su un multiplo di
-        # display_every l'or lo rende comunque un blocco solo.
+        # Fires every display_every, at every epoch end, and on the last iteration of
+        # the call. If an epoch boundary lands on a multiple of display_every, the or
+        # still makes it a single block.
         if (i + 1) % display_every == 0 or is_epoch_end or i == iter_start + num_iters - 1:
             recent_loss = torch.stack(list(loss_window)).mean().item()
             recent_mse  = torch.stack(list(mse_window)).mean().item()
             psnr = -10.0 * np.log10(recent_mse + 1e-10)
-            _final_psnr = psnr  # tracciamo il PSNR dell'ultimo block per il ritorno
+            _final_psnr = psnr  # track the last block's PSNR for the return value
 
             win_times   = list(_iter_times)
             win_secs    = max(sum(win_times), 1e-9)
@@ -392,7 +392,7 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
                   f"{cfg.loss_type}={recent_loss:.4f}  PSNR≈{psnr:.2f} dB  "
                   f"lr={new_lr:.2e}  {iters_per_s:.1f} it/s  {rays_per_s/1e3:.0f}k rays/s")
 
-            # — TensorBoard scalars (no-op se tb_logger è None) —
+            # — TensorBoard scalars (no-op when tb_logger is None) —
             if tb_logger is not None:
                 tb_logger.log_scalars("nerf", {
                     "loss":        recent_loss,
@@ -402,9 +402,9 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
                     "epoch":       epoch + 1,
                 }, step=i + 1)
 
-            # sample_natural e non sample_epoch: il batch diagnostico deve essere
-            # indipendente dall'ordine dell'epoca, altrimenti ne consumerebbe
-            # posizioni e i raggi verrebbero visti due volte nello stesso passaggio.
+            # sample_natural and not sample_epoch: the diagnostic batch must be
+            # independent of the epoch order, otherwise it would consume positions
+            # from it and rays would be seen twice in the same pass.
             with torch.no_grad():
                 _ro, _rd, _rgb_gt, _dep, _msk = dataset.sample_natural(min(512, batch_size))
                 _rgb_pred, _acc = render_unified(
@@ -416,9 +416,9 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
                       f"pred=[{_rgb_pred.min():.3f},{_rgb_pred.mean():.3f},{_rgb_pred.max():.3f}]  "
                       f"target=[{_rgb_gt.min():.3f},{_rgb_gt.mean():.3f},{_rgb_gt.max():.3f}]")
 
-            # Riga CSV: scritta qui perché acc_fg nasce nel blocco diag sopra, e
-            # prima della preview perché un errore in OpenEXR non deve far perdere
-            # una riga già calcolata.
+            # CSV row: written here because acc_fg is produced by the diag block above,
+            # and before the preview because an OpenEXR error must not lose a row that
+            # has already been computed.
             csv_logger.log({
                 "iter":            i + 1,
                 "epoch":           epoch + 1,
@@ -429,8 +429,8 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
                 "iters_per_s":     f"{iters_per_s:.6g}",
                 "rays_per_s":      f"{rays_per_s:.6g}",
                 "acc_fg":          f"{float(acc_fg):.6g}",
-                # wall_s si azzera a ogni rientro in train(): è il marcatore dei
-                # segmenti del loop interattivo.
+                # wall_s restarts at every re-entry into train(): it is the marker of
+                # the interactive loop's segments.
                 "wall_s":          f"{time.perf_counter() - _t_train_start:.3f}",
                 "timestamp":       datetime.datetime.now().isoformat(timespec="seconds"),
                 "loss_type":       cfg.loss_type,
@@ -439,16 +439,16 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
                 "lr_decay_factor": cfg.lr_decay_factor,
             })
 
-            # Riga di epoca: stessa iterazione, dominio diverso — le medie qui
-            # sono su tutte le _epoch_iters iterazioni dell'epoca, non sulla
-            # finestra. Su un resume a metà epoca _epoch_iters < iters_per_epoch.
+            # Epoch row: same iteration, different domain — the averages here are over
+            # all _epoch_iters iterations of the epoch, not over the window. On a resume
+            # mid-epoch, _epoch_iters < iters_per_epoch.
             if is_epoch_end and _epoch_iters > 0:
                 ep_loss = float(_epoch_loss_sum) / _epoch_iters
                 ep_mse  = float(_epoch_mse_sum)  / _epoch_iters
                 ep_psnr = -10.0 * np.log10(ep_mse + 1e-10)
                 ep_wall = time.perf_counter() - _t_epoch_start
-                print(f"    [epoca {epoch + 1}] {_epoch_iters} iter · "
-                      f"{_epoch_rays} raggi · {cfg.loss_type}={ep_loss:.4f}  "
+                print(f"    [epoch {epoch + 1}] {_epoch_iters} iters · "
+                      f"{_epoch_rays} rays · {cfg.loss_type}={ep_loss:.4f}  "
                       f"PSNR≈{ep_psnr:.2f} dB  {ep_wall:.1f} s")
                 epoch_csv_logger.log({
                     "epoch":           epoch + 1,
@@ -476,7 +476,7 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
                         "epoch_wall_s": ep_wall,
                     }, step=i + 1)
 
-            # Preview: _save_preview ora ritorna l'array per il log TB
+            # Preview: _save_preview also returns the array, for the TB log
             preview_img = _save_preview(
                 model_bundle, dataset, cfg, out_dir / f"preview_iter_{i+1:06d}.exr"
             )
@@ -484,8 +484,8 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
                 tb_logger.log_image("nerf/preview", preview_img, step=i + 1, tonemap=True)
                 tb_logger.flush()
 
-            # Checkpoint periodico: permette il watch-mode di nerf_viewer e il
-            # resume da crash. Scrittura atomica, costo trascurabile vs preview.
+            # Periodic checkpoint: enables nerf_viewer's watch mode and resuming after
+            # a crash. Atomic write, negligible cost next to the preview.
             save_checkpoint(ckpt_path, model, optimizer, i + 1, cfg,
                             scene_center=center, sphere_radius=sphere_radius)
             if use_cuda:
@@ -494,7 +494,7 @@ def train(transforms_path: str, cfg: NerfConfig, *, ckpt_path: str, output_dir: 
 
     save_checkpoint(ckpt_path, model, optimizer, iter_start + num_iters, cfg,
                     scene_center=center, sphere_radius=sphere_radius)
-    print(f"  Checkpoint salvato: {ckpt_path}")
+    print(f"  Checkpoint saved: {ckpt_path}")
     return _final_psnr
 
 

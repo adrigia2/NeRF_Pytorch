@@ -174,8 +174,8 @@ class NerfDataset:
             self._fg_idx = torch.zeros(0, dtype=torch.long, device=device)
             self._bg_idx = torch.zeros(0, dtype=torch.long, device=device)
 
-        # Stato del campionamento a epoche: inattivo finché configure_epochs()
-        # non viene chiamata (sample_epoch solleva se manca).
+        # Epoch-sampling state: inactive until configure_epochs() is called
+        # (sample_epoch raises if it was not).
         self._epoch_batch     = 0
         self._epoch_seed      = 0
         self._iters_per_epoch = 0
@@ -199,12 +199,12 @@ class NerfDataset:
 
     @property
     def n_rays(self) -> int:
-        """Numero totale di raggi nel pool di training."""
+        """Total number of rays in the training pool."""
         return self._n_rays
 
     @property
     def iters_per_epoch(self) -> int:
-        """Iterazioni per epoca; 0 finché configure_epochs() non è stata chiamata."""
+        """Iterations per epoch; 0 until configure_epochs() has been called."""
         return self._iters_per_epoch
 
     @property
@@ -221,9 +221,9 @@ class NerfDataset:
         in_mask is True for foreground rays (mesh hit, depth > 0).
         depths is 0 for background rays.
 
-        Non è più il campionatore del training (vedi sample_epoch): resta per il
-        batch diagnostico del display block, che deve essere indipendente
-        dall'ordine dell'epoca per non consumarne posizioni.
+        This is no longer the training sampler (see sample_epoch): it remains for
+        the diagnostic batch of the display block, which has to be independent of
+        the epoch order so that it does not consume positions from it.
         """
         idxs    = torch.randint(0, self._n_rays, (batch_size,), device=self.device)
         depths  = self._depths[idxs]
@@ -231,17 +231,17 @@ class NerfDataset:
         return (self._rays_o[idxs], self._rays_d[idxs],
                 self._rgb[idxs], depths, in_mask)
 
-    # ── campionamento a epoche ────────────────────────────────────────────────
+    # ── epoch sampling ────────────────────────────────────────────────────────
 
     def configure_epochs(self, batch_size: int, seed: int) -> int:
-        """Attiva l'ordinamento a epoche per sample_epoch(). Ritorna iters_per_epoch.
+        """Enable epoch ordering for sample_epoch(). Returns iters_per_epoch.
 
-        Un'epoca è una permutazione dell'intero pool di raggi consumata un batch
-        alla volta: ogni raggio è visto esattamente una volta per epoca e l'ultimo
-        batch è più corto quando batch_size non divide n_rays.
+        An epoch is a permutation of the whole ray pool consumed one batch at a
+        time: every ray is seen exactly once per epoch, and the last batch is
+        shorter whenever batch_size does not divide n_rays.
         """
         if batch_size < 1:
-            raise ValueError(f"batch_size deve essere >= 1, ricevuto {batch_size}")
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         self._epoch_batch     = int(batch_size)
         self._epoch_seed      = int(seed)
         self._iters_per_epoch = (self._n_rays + batch_size - 1) // batch_size
@@ -250,30 +250,30 @@ class NerfDataset:
         return self._iters_per_epoch
 
     def _epoch_indices(self, iteration: int) -> torch.Tensor:
-        """Indici (int64, su device) del batch dell'iterazione ASSOLUTA data.
+        """Indices (int64, on device) of the batch for the given ABSOLUTE iteration.
 
-        Epoca e posizione si derivano da `iteration`, quindi l'ordine è una
-        funzione pura di (seed, batch_size, n_rays) e un resume a metà epoca
-        riprende esattamente dove aveva lasciato senza salvare nulla nel
-        checkpoint.  La permutazione è generata da un Generator DEDICATO: il
-        campionamento diagnostico di train() attinge all'RNG globale e non deve
-        poter sfasare l'ordine dell'epoca (né viceversa).
+        Epoch and offset are derived from `iteration`, so the order is a pure
+        function of (seed, batch_size, n_rays) and a resume mid-epoch picks up
+        exactly where it left off without storing anything in the checkpoint.
+        The permutation comes from a DEDICATED Generator: the diagnostic sampling
+        in train() draws on the global RNG and must not be able to shift the epoch
+        order (nor the other way round).
 
-        Vive sulla CPU in int32: su questa scena sono 475 MiB che altrimenti
-        andrebbero a sommarsi ai ~6 GB di dataset già residenti in VRAM, e
-        torch.randperm su CUDA allocherebbe temporanei per qualche GB a ogni
-        confine di epoca.  Lo slice trasferito è invece di pochi centinaia di KB.
+        It lives on the CPU as int32: on this scene that is 475 MiB which would
+        otherwise add to the ~6 GB of dataset already resident in VRAM, and
+        torch.randperm on CUDA would allocate several GB of temporaries at every
+        epoch boundary.  The slice actually transferred is a few hundred KB.
         """
         if self._iters_per_epoch == 0:
-            raise RuntimeError("configure_epochs() non è stata chiamata su questo dataset.")
+            raise RuntimeError("configure_epochs() has not been called on this dataset.")
 
         epoch, k = divmod(int(iteration), self._iters_per_epoch)
 
         if self._perm_epoch != epoch:
             g = torch.Generator()
             g.manual_seed((self._epoch_seed * 1_000_003 + epoch) % (2 ** 63 - 1))
-            # assegnato in due tempi così la vecchia permutazione è liberata
-            # prima di allocare la nuova
+            # assigned in two steps so the old permutation is released before the
+            # new one is allocated
             self._perm = None
             self._perm = torch.randperm(self._n_rays, generator=g, dtype=torch.int32)
             self._perm_epoch = epoch
@@ -283,10 +283,10 @@ class NerfDataset:
         return self._perm[lo:hi].to(self.device, non_blocking=True).long()
 
     def sample_epoch(self, iteration: int):
-        """Batch dell'iterazione assoluta `iteration` nell'ordine a epoche.
+        """Batch for absolute iteration `iteration`, in epoch order.
 
-        Stessa tupla di sample_natural — (rays_o, rays_d, rgb, depths, in_mask) —
-        ma l'ultimo batch di ogni epoca ha meno di batch_size elementi.
+        Same tuple as sample_natural — (rays_o, rays_d, rgb, depths, in_mask) —
+        but the last batch of each epoch has fewer than batch_size elements.
         """
         idxs    = self._epoch_indices(iteration)
         depths  = self._depths[idxs]

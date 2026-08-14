@@ -38,9 +38,9 @@ def render_rays_depth(rays_o, rays_d, model, embed_fn, embeddirs_fn, cfg: NerfCo
     rays_d is normalized here: t_hit is a metric distance (OptiX depth, or a sphere
     radius), so direction and distance must share the same parametrization.
 
-    noise_std: rumore gaussiano sulla densità, regolarizzatore di training. Il
-    default 0.0 rende deterministico ogni percorso di inferenza; solo il forward
-    che produce il gradiente passa cfg.raw_noise_std (train.py).
+    noise_std: Gaussian noise on the density, a training regularizer. The default
+    of 0.0 makes every inference path deterministic; only the forward pass that
+    produces the gradient passes cfg.raw_noise_std (train.py).
     """
     device = rays_o.device
     N = rays_o.shape[0]
@@ -223,7 +223,7 @@ def bake_envmap(model_bundle, cfg: NerfConfig, width: int, height: int,
     model, embed_fn, embeddirs_fn, device, center, sphere_radius = model_bundle
 
     yaw_offset_u = (yaw_degrees * np.pi / 180.0) / (2.0 * np.pi)
-    yaw_offset_u -= np.floor(yaw_offset_u)  # wrap a [0, 1) come Irradiance_Generator.cpp
+    yaw_offset_u -= np.floor(yaw_offset_u)  # wrap to [0, 1) as Irradiance_Generator.cpp does
 
     px = (np.arange(width,  dtype=np.float32) + 0.5) / width    # u
     py = (np.arange(height, dtype=np.float32) + 0.5) / height   # v
@@ -262,13 +262,13 @@ def query_radiance(model_bundle, origins_np, dirs_np,
     t_hits_np:  (N,)  — OptiX hit distance; rays with t_hit>0 use the mesh window,
                          rays that miss geometry use the spherical shell from centre.
 
-    Gli input possono essere array NumPy oppure tensori torch già sul device:
-    `torch.as_tensor` non copia quando device e dtype coincidono già. Con
-    return_torch=True anche l'uscita resta sul device — serve al bake spec_cone
-    condiviso, dove le radianze vengono classificate per camera in torch e un
-    round-trip GPU→CPU→GPU costerebbe centinaia di MB per tile.
+    Inputs may be NumPy arrays or torch tensors already on the device:
+    `torch.as_tensor` does not copy when device and dtype already match. With
+    return_torch=True the output stays on the device too — this is what the shared
+    spec_cone bake needs, where the radiances are binned per camera in torch and a
+    GPU→CPU→GPU round trip would cost hundreds of MB per tile.
 
-    Returns:    (N, 3) float32 RGB per raggio (NumPy, o tensore se return_torch)
+    Returns:    (N, 3) float32 RGB per ray (NumPy, or a tensor when return_torch)
     """
     model, embed_fn, embeddirs_fn, device, center, sphere_radius = model_bundle
 
