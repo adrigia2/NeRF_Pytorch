@@ -110,7 +110,6 @@ def check_against_manifest(cfg: PipelineConfig, manifest: dict,
     `expected_diffs` is the set of keys the caller changes on purpose; by default the ROI
     ones. `rerun_irradiance.py` parametrises it, reusing this validation with a different
     set of overrides."""
-    """
     if expected_diffs is None:
         expected_diffs = _EXPECTED_DIFFS
     got, want = _encode_config(cfg), manifest["config"]
