@@ -1,37 +1,37 @@
 #!/usr/bin/env python
-"""make_geometry_diagrams.py -- Schemi geometrici del capitolo Implementation.
+"""make_geometry_diagrams.py -- geometric diagrams of the Implementation chapter.
 
     python make_geometry_diagrams.py --out ../Doc/images/diagrams
     python make_geometry_diagrams.py --out DIR --only irradiance
 
-Scrive cinque PNG, uno per figura della tesi:
+Writes five PNGs, one per thesis figure:
 
-  depth_ray.png                 3.4   camera, griglia di raggi dal FOV, o / d / t
-  ium_trick.png                 3.6   il trucco dell'inverse UV mapping
-  grazing_cull.png              3.9   scarto dei contributi ad angolo radente
-  color_texture_projection.png  3.10  proiezione texel -> pixel attraverso il near plane
-  irradiance_hemisphere.png     3.11  emisfero di Fibonacci, diretta contro indiretta
+  depth_ray.png                 3.4   camera, grid of rays from the FOV, o / d / t
+  ium_trick.png                 3.6   the inverse UV mapping trick
+  grazing_cull.png              3.9   discarding grazing-angle contributions
+  color_texture_projection.png  3.10  texel -> pixel projection through the near plane
+  irradiance_hemisphere.png     3.11  Fibonacci hemisphere, direct against indirect
 
-Due scelte che vale la pena conoscere prima di metterci le mani.
+Two choices worth knowing before touching this.
 
-**Le intersezioni sono calcolate, non disegnate.**  Ogni raggio viene davvero intersecato
-con la geometria (piano, box, sfera) e il punto di impatto e' quello che esce dal conto.
-Un raggio che nella figura sembra colpire, colpisce; e cambiare un parametro in testa allo
-script non produce una figura che mente.
+**The intersections are computed, not drawn.**  Every ray really is intersected with the
+geometry (plane, box, sphere) and the impact point is the one that comes out of the
+computation.  A ray that looks like it hits in the figure does hit; and changing a
+parameter at the top of the script cannot produce a figure that lies.
 
-**La scena e' 3D ma il disegno e' 2D.**  Si proietta a mano in ortografica (`Projector`) e
-si disegna su assi normali, invece di usare mplot3d.  Con mplot3d l'inquadratura la decide
-la libreria a partire dal cubo dei dati e la geometria finisce minuscola in mezzo al vuoto,
-l'ordine di disegno non e' controllabile e le etichette ballano.  Qui l'ordine e' quello
-delle chiamate (painter), i limiti si ricavano dai punti proiettati e l'inquadratura e'
-sempre giusta.
+**The scene is 3D but the drawing is 2D.**  The projection to orthographic is done by
+hand (`Projector`) and drawn on plain axes, instead of using mplot3d.  With mplot3d the
+framing is decided by the library from the data cube, the geometry ends up tiny in the
+middle of nothing, the draw order is not controllable and the labels dance around.  Here
+the order is the call order (painter), the limits come from the projected points and the
+framing is always right.
 
-Le direzioni della figura 3.11 usano la stessa formula del kernel
-`deviceProgramsIrradiance.cu`: cos(theta) equispaziato e azimut sulla sequenza aurea come
-frazione di giro, (3-sqrt(5))/2, ridotta in [0,1) prima della trigonometria.  Non e'
-l'unica sequenza di Fibonacci della pipeline: HemiVis usa 1/phi, cioe' il verso opposto
-(vedi `_hemivis_directions` in images_generator.py).  Qui serve quella dell'irradiance,
-perche' e' il pass che la figura illustra.
+The directions of figure 3.11 use the same formula as the kernel
+`deviceProgramsIrradiance.cu`: equispaced cos(theta) and azimuth on the golden sequence
+as a fraction of a turn, (3-sqrt(5))/2, reduced to [0,1) before the trigonometry.  It is
+not the pipeline's only Fibonacci sequence: HemiVis uses 1/phi, i.e. the opposite sense
+(see `_hemivis_directions` in images_generator.py).  The irradiance one is needed here,
+because that is the pass the figure illustrates.
 """
 from __future__ import annotations
 
@@ -49,21 +49,21 @@ plt.rcParams.update({"font.size": 13})
 
 DPI = 190
 
-# ── Palette: lo stesso concetto ha lo stesso colore in tutte le figure ───────
-C_GEOM   = "#b9c3cd"   # geometria della scena
-C_EDGE   = "#5f6c79"   # spigoli
-C_RAY    = "#5b9bd5"   # raggio generico
-C_HILITE = "#d62728"   # elemento evidenziato
-C_ACCEPT = "#2ca02c"   # contributo accettato
-C_REJECT = "#d62728"   # contributo scartato
-C_DIRECT = "#e8a33d"   # irradiance diretta (cielo)
-C_INDIR  = "#8452c9"   # irradiance indiretta (rimbalzo)
-C_CAM    = "#33404d"   # corpo camera
+# ── Palette: the same concept has the same colour in every figure ────────────
+C_GEOM   = "#b9c3cd"   # scene geometry
+C_EDGE   = "#5f6c79"   # edges
+C_RAY    = "#5b9bd5"   # generic ray
+C_HILITE = "#d62728"   # highlighted element
+C_ACCEPT = "#2ca02c"   # accepted contribution
+C_REJECT = "#d62728"   # discarded contribution
+C_DIRECT = "#e8a33d"   # direct irradiance (sky)
+C_INDIR  = "#8452c9"   # indirect irradiance (bounce)
+C_CAM    = "#33404d"   # camera body
 
-# ── Parametri: tutto cio' che vale la pena ritoccare sta qui ─────────────────
-# Nota sull'azimut di `view`: va tenuto a circa 90 gradi dall'azimut dell'asse della
-# camera della scena.  Se i due sono allineati (o opposti) si guarda il frustum di
-# infilata, il ventaglio di raggi collassa in una riga e la figura diventa illeggibile.
+# ── Parameters: everything worth tweaking lives here ─────────────────────────
+# Note on the azimuth of `view`: it has to stay about 90 degrees from the azimuth of the
+# scene camera's axis.  If the two are aligned (or opposite) the frustum is seen edge-on,
+# the fan of rays collapses into a line and the figure becomes unreadable.
 FIG_DEPTH_RAY = dict(fov_deg=34.0, grid=(5, 4), cam=(0.0, -1.70, 0.78),
                      look=(0.0, 0.0, 0.25), hilite=(2, 1), ground_half=1.05,
                      miss_len=0.85, view=(16.0, -20.0), size=(7.6, 4.6))
@@ -77,14 +77,14 @@ FIG_IRR       = dict(n_samples=72, sphere_c=(0.62, 0.05, 0.92), sphere_r=0.50,
                      view=(16.0, -62.0), size=(7.4, 5.0))
 
 
-# ── Proiezione ortografica ───────────────────────────────────────────────────
+# ── Orthographic projection ──────────────────────────────────────────────────
 
 class Projector:
-    """Mondo 3D -> piano, in ortografica.  `depth` serve per l'ordinamento painter."""
+    """3D world -> plane, orthographic.  `depth` is used for the painter ordering."""
 
     def __init__(self, elev_deg: float, azim_deg: float):
         e, a = np.radians(elev_deg), np.radians(azim_deg)
-        # v punta dalla scena verso l'osservatore
+        # v points from the scene towards the observer
         self.v = np.array([np.cos(e) * np.cos(a), np.cos(e) * np.sin(a), np.sin(e)])
         self.right = np.array([-np.sin(a), np.cos(a), 0.0])
         self.up = np.cross(self.v, self.right)
@@ -99,7 +99,7 @@ class Projector:
 
 
 class Scene:
-    """Accumula i punti disegnati per poter incorniciare esattamente alla fine."""
+    """Collect the drawn points so the frame can be fitted exactly at the end."""
 
     def __init__(self, ax, proj: Projector):
         self.ax, self.proj, self.pts = ax, proj, []
@@ -166,12 +166,12 @@ def save(fig, sc, out: Path, note: str = "") -> None:
     print(f"  {out.name}{('  ' + note) if note else ''}")
 
 
-# ── Geometria: intersezioni vere ─────────────────────────────────────────────
+# ── Geometry: real intersections ─────────────────────────────────────────────
 
 def hit_plane(o, d, z=0.0, half=None):
-    """Intersezione col piano z=cost.  `half` lo limita al quadrato effettivamente
-    disegnato: senza, un raggio che atterra fuori dal terreno visibile risulta comunque
-    un hit a distanza enorme, e la figura mostra un segmento che finisce nel nulla."""
+    """Intersection with the plane z=const.  `half` bounds it to the square actually
+    drawn: without it, a ray landing outside the visible ground still counts as a hit at
+    an enormous distance, and the figure shows a segment ending in nothing."""
     o, d = np.asarray(o, float), np.asarray(d, float)
     if abs(d[2]) < 1e-9:
         return np.inf
@@ -186,7 +186,7 @@ def hit_plane(o, d, z=0.0, half=None):
 
 
 def hit_box(o, d, lo, hi):
-    """Slab method: t di ingresso, inf se il raggio manca il box."""
+    """Slab method: entry t, inf when the ray misses the box."""
     o, d = np.asarray(o, float), np.asarray(d, float)
     with np.errstate(divide="ignore", invalid="ignore"):
         t1, t2 = (np.asarray(lo, float) - o) / d, (np.asarray(hi, float) - o) / d
@@ -217,7 +217,7 @@ def ground(sc: Scene, half=1.5, z=0.0, color=C_GEOM, alpha=0.30):
 
 
 def draw_box(sc: Scene, lo, hi, color=C_GEOM):
-    """Le tre facce visibili, ordinate per profondita' cosi' non si sovrappongono male."""
+    """The three visible faces, ordered by depth so they do not overlap badly."""
     lo, hi = np.asarray(lo, float), np.asarray(hi, float)
     faces = [
         [(lo[0], lo[1], hi[2]), (hi[0], lo[1], hi[2]), (hi[0], hi[1], hi[2]), (lo[0], hi[1], hi[2])],
@@ -247,7 +247,7 @@ def image_rect(pos, f, r, u, dist, fov_deg, aspect=1.5):
 
 
 def draw_camera(sc: Scene, pos, f, r, u, size=0.13, z=7):
-    """Piramide che identifica la camera senza rubare la scena."""
+    """Pyramid that identifies the camera without stealing the scene."""
     c = np.asarray(pos, float)
     back = [c + (r * sx + u * sy) * size - f * size * 0.9
             for sx, sy in ((1, 1), (1, -1), (-1, -1), (-1, 1))]
@@ -257,7 +257,7 @@ def draw_camera(sc: Scene, pos, f, r, u, size=0.13, z=7):
     sc.dot(c, C_CAM, s=26, z=z + 1)
 
 
-# ── 3.4 -- Il raggio del depth pass ──────────────────────────────────────────
+# ── 3.4 -- The depth pass ray ────────────────────────────────────────────────
 
 def fig_depth_ray(out: Path) -> None:
     p = FIG_DEPTH_RAY
@@ -277,7 +277,7 @@ def fig_depth_ray(out: Path) -> None:
         sx = (2.0 * (i + 0.5) / nx - 1.0) * h * 1.5
         sy = (2.0 * (j + 0.5) / ny - 1.0) * h
         d = f + r * sx + u * sy
-        return d / np.linalg.norm(d)          # unitaria: convenzione della pipeline
+        return d / np.linalg.norm(d)          # unit length: the pipeline's convention
 
     for j in range(ny):
         for i in range(nx):
@@ -313,11 +313,11 @@ def fig_depth_ray(out: Path) -> None:
     save(fig, sc, out)
 
 
-# ── 3.6 -- Il trucco dell'inverse UV mapping ─────────────────────────────────
+# ── 3.6 -- The inverse UV mapping trick ──────────────────────────────────────
 
 def _uv_islands():
-    """Due isole appena irregolari: un atlante vero non e' un rettangolo, ed e' proprio
-    il fatto che parte del dominio resti vuota a rendere utile la maschera."""
+    """Two slightly irregular islands: a real atlas is not a rectangle, and it is exactly
+    the fact that part of the domain stays empty that makes the mask useful."""
     return [np.array([(-0.82, -0.72), (-0.06, -0.74), (0.10, -0.10),
                       (-0.34, 0.30), (-0.88, -0.04)]),
             np.array([(0.20, 0.08), (0.84, 0.00), (0.88, 0.62),
@@ -325,7 +325,7 @@ def _uv_islands():
 
 
 def _inside(poly, pt):
-    """Punto in poligono, ray casting: la stessa domanda che il tracer pone al BVH."""
+    """Point in polygon, ray casting: the same question the tracer asks the BVH."""
     x, y = pt
     ins = False
     for k in range(len(poly)):
@@ -368,10 +368,10 @@ def fig_ium_trick(out: Path) -> None:
         Line2D([], [], color=C_ACCEPT, lw=1.8, label=r"hit: texel lies on the mesh, mask $=1$"),
         Line2D([], [], color=C_REJECT, lw=1.4, ls=(0, (2, 2)), label=r"miss: mask $=0$"),
     ], loc="upper left", frameon=False, fontsize=11)
-    save(fig, sc, out, f"({n_hit}/{nx * ny} raggi colpiscono)")
+    save(fig, sc, out, f"({n_hit}/{nx * ny} rays hit)")
 
 
-# ── 3.9 -- Scarto ad angolo radente ──────────────────────────────────────────
+# ── 3.9 -- Grazing-angle culling ─────────────────────────────────────────────
 
 def fig_grazing_cull(out: Path) -> None:
     p = FIG_GRAZING
@@ -410,7 +410,7 @@ def fig_grazing_cull(out: Path) -> None:
     save(fig, sc, out)
 
 
-# ── 3.10 -- Proiezione del texel nel pixel ───────────────────────────────────
+# ── 3.10 -- Projection of the texel into the pixel ───────────────────────────
 
 def fig_color_texture(out: Path) -> None:
     p = FIG_PROJ
@@ -425,8 +425,8 @@ def fig_color_texture(out: Path) -> None:
     ground(sc, half=1.15)
 
     def pixel_of(P):
-        """Dove il segmento P->camera buca il piano immagine, e se ci cade dentro.
-        E' la domanda del kernel: il texel finisce in un pixel, o in nessuno."""
+        """Where the segment P->camera crosses the image plane, and whether it lands
+        inside.  It is the kernel's question: does the texel land in a pixel, or none."""
         d = cam - np.asarray(P, float)
         den = d @ f
         if abs(den) < 1e-9:
@@ -461,18 +461,19 @@ def fig_color_texture(out: Path) -> None:
     save(fig, sc, out)
 
 
-# ── 3.11 -- Emisfero di Fibonacci, diretta contro indiretta ──────────────────
+# ── 3.11 -- Fibonacci hemisphere, direct against indirect ────────────────────
 
-IRR_GOLDEN_TURN = 0.3819660112501051518   # (3 - sqrt(5))/2, come nel kernel
+IRR_GOLDEN_TURN = 0.3819660112501051518   # (3 - sqrt(5))/2, as in the kernel
 TWO_PI = 6.283185307179586477
 
 
 def irradiance_directions(n_samples: int) -> np.ndarray:
-    """Le direzioni del kernel irradiance attorno a +z, uniformi in angolo solido.
+    """The irradiance kernel's directions around +z, uniform in solid angle.
 
-    Identica a `__raygen__renderIrradiance`: z = 1 - (i+0.5)/S e azimut sulla sequenza
-    aurea ridotta in [0,1) PRIMA della trigonometria.  La riduzione anticipata e' il fix
-    del 13/08/2026: senza, in float32 e a S grande l'azimut perde la bassa discrepanza.
+    Identical to `__raygen__renderIrradiance`: z = 1 - (i+0.5)/S and azimuth on the golden
+    sequence reduced to [0,1) BEFORE the trigonometry.  The early reduction is the
+    2026-08-13 fix: without it, in float32 and at large S the azimuth loses its low
+    discrepancy.
     """
     i = np.arange(n_samples)
     z = 1.0 - (i + 0.5) / n_samples
@@ -499,7 +500,7 @@ def fig_irradiance(out: Path) -> None:
         else:
             sc.line(P, P + d * 1.30, C_DIRECT, lw=0.9, alpha=0.60, z=1)
 
-    # La sfera occludente, sopra i raggi liberi e sotto quelli occlusi
+    # The occluding sphere, above the free rays and below the occluded ones
     circ = np.linspace(0, 2 * np.pi, 90)
     disc = [sc_c + sr * (np.cos(a) * sc.proj.right + np.sin(a) * sc.proj.up) for a in circ]
     sc.poly(disc, C_GEOM, alpha=0.97, edge=C_EDGE, lw=1.1, z=3)
@@ -521,7 +522,7 @@ def fig_irradiance(out: Path) -> None:
         Line2D([], [], color=C_INDIR, lw=1.8,
                label="blocked: indirect, radiance queried from the NeRF"),
     ], loc="upper left", frameon=False, fontsize=11)
-    save(fig, sc, out, f"({n_ind}/{len(dirs)} raggi occlusi)")
+    save(fig, sc, out, f"({n_ind}/{len(dirs)} rays occluded)")
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -539,14 +540,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default="../Doc/images/diagrams",
-                    help="cartella di destinazione dei PNG")
+                    help="destination folder for the PNGs")
     ap.add_argument("--only", nargs="+", choices=sorted(FIGURES),
-                    help="genera solo queste figure")
+                    help="generate only these figures")
     args = ap.parse_args()
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    print(f"Figure geometriche → {out.resolve()}")
+    print(f"Geometry figures → {out.resolve()}")
     for key in (args.only or sorted(FIGURES)):
         name, fn = FIGURES[key]
         fn(out / name)
