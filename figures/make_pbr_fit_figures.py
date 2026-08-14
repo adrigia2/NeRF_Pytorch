@@ -1,49 +1,49 @@
 #!/usr/bin/env python
-"""make_pbr_fit_figures.py -- Figure dell'esempio numerico del fit PBR.
+"""make_pbr_fit_figures.py -- figures for the worked example of the PBR fit.
 
     python make_pbr_fit_figures.py --out ../figure_review/pbr-fit
     python make_pbr_fit_figures.py --out ../Doc/images/pbr-fit \
-           --figures worked_combined,moments_per_camera        (le due gia' in tesi)
+           --figures worked_combined,moments_per_camera        (the two already in the thesis)
 
-Genera i grafici di "A Worked Example" (Doc/chapters/implementation.tex, subsubsection
-dopo eq:pbr-residual): un texel, tre camere, la regressione C_jc = alpha_c + beta*L_jc
-e la scelta dell'apertura.
+Generates the plots of "A Worked Example" (Doc/chapters/implementation.tex, the
+subsubsection after eq:pbr-residual): one texel, three cameras, the regression
+C_jc = alpha_c + beta*L_jc and the choice of aperture.
 
-  fit_color_raw.png         C_j per camera: swatch + barre R/G/B, con la media per canale
-  fit_color_centered.png    lo stesso dopo il centramento: Delta C
-  fit_cone_raw.png          L_j al candidato mostrato in tabella
+  fit_color_raw.png         C_j per camera: swatch + R/G/B bars, with the per-channel mean
+  fit_color_centered.png    the same after centering: Delta C
+  fit_cone_raw.png          L_j at the candidate shown in the table
   fit_cone_centered.png     Delta L
-  fit_worked_combined.png   i quattro sopra in una griglia sola (alternativa per la pagina)
-  fit_scatter.png           Delta L vs Delta C, i 9 punti, la retta di pendenza beta*
-  fit_aperture_selection.png  perche' vince un'apertura e non un'altra
-  fit_residual_materials.png  res(Theta) per metallo, dielettrico lucido, diffuso
+  fit_worked_combined.png   the four above in a single grid (the page alternative)
+  fit_scatter.png           Delta L vs Delta C, the 9 points, the line of slope beta*
+  fit_aperture_selection.png  why one aperture wins and another does not
+  fit_residual_materials.png  res(Theta) for metal, glossy dielectric, diffuse
 
-I numeri di C e L al candidato mostrato sono quelli di tab:pbr-worked-example, scritti
-qui una volta sola come INPUT: medie, deviazioni, V_LL, V_CL, V_CC, beta* e res sono
-sempre ricalcolati e confrontati con la tabella da _check_against_table(), cosi' se un
-giorno la tabella cambia il confronto salta e non restano figure che raccontano altri
-numeri.  --print-table rigenera le righe LaTeX per il confronto a vista.
+The C and L numbers at the candidate shown are those of tab:pbr-worked-example, written
+here once as INPUTS: means, deviations, V_LL, V_CL, V_CC, beta* and res are always
+recomputed and compared against the table by _check_against_table(), so that if one day
+the table changes the comparison fails and no figure is left telling different numbers.
+--print-table regenerates the LaTeX rows for a side-by-side check.
 
-Le aperture diverse da quella in tabella non esistono nella tesi e vanno modellate.
-Il modello e' quello di un cono che si allarga: la media sul cono decade verso la media
-sull'emisfero H_c con una rapidita' kappa_j che dipende dalla camera, perche' dipende da
-quanto e' compatta la sorgente attorno al suo raggio riflesso,
+Apertures other than the one in the table do not exist in the thesis and have to be
+modelled.  The model is that of a widening cone: the mean over the cone decays towards
+the hemisphere mean H_c at a rate kappa_j that depends on the camera, because it depends
+on how compact the source is around its reflected ray,
 
-    u(Theta) = 1 - cos(Theta/2)                       (angolo solido del cono / 2pi)
+    u(Theta) = 1 - cos(Theta/2)                       (cone solid angle / 2pi)
     L_jc(Theta) = H_c + (L*_jc - H_c) * phi_j(Theta)
     phi_j = (1 + kappa_j*u*) / (1 + kappa_j*u)        (phi_j(Theta*) = 1)
 
-Tre proprieta' lo rendono utilizzabile: al candidato della tabella riproduce ESATTAMENTE
-i suoi valori; per Theta -> 180 tutte le camere convergono su H_c, che e' quello che fa
-un cono che si allarga; e siccome kappa_j cambia con la camera, allargando il cono cambia
-la FORMA di Delta L fra camere e non solo la sua scala.  L'ultimo punto e' tutta la
-figura: con kappa uguale per tutte, Delta L verrebbe riscalato in blocco, beta si
-mangerebbe il fattore e la curva del residuo sarebbe piatta -- che e' poi il caso
-degenere del texel diffuso.
+Three properties make it usable: at the table's candidate it reproduces its values
+EXACTLY; as Theta -> 180 every camera converges on H_c, which is what a widening cone
+does; and since kappa_j changes with the camera, widening the cone changes the SHAPE of
+Delta L between cameras and not only its scale.  That last point is the whole figure:
+with kappa the same for all, Delta L would be rescaled as a block, beta would swallow
+the factor and the residual curve would be flat -- which is then the degenerate case of
+a diffuse texel.
 
-H_c e kappa_j non sono liberi: sono stati scelti con una ricerca su griglia perche'
-argmin_Theta res(Theta) cada sul candidato della tabella e il pozzo sia visibile
-(vicini ~12x il minimo, estremi ~120x).  _check_against_table() riverifica anche questo.
+H_c and kappa_j are not free: they were chosen by a grid search so that
+argmin_Theta res(Theta) falls on the table's candidate and the well is visible
+(neighbours ~12x the minimum, extremes ~120x).  _check_against_table() re-checks that too.
 """
 from __future__ import annotations
 
@@ -57,8 +57,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-# ── Dati dell'esempio: input, non risultati ───────────────────────────────────
-# tab:pbr-worked-example, blocco superiore.  (camera, canale)
+# ── Data of the example: inputs, not results ─────────────────────────────────
+# tab:pbr-worked-example, upper block.  (camera, channel)
 C_OBS = np.array([[1.2, 2.1, 2.0],
                   [2.2, 3.2, 2.1],
                   [2.8, 3.7, 1.5]])
@@ -66,46 +66,46 @@ L_STAR = np.array([[1.0, 2.0, 3.0],
                    [3.0, 4.0, 3.0],
                    [4.0, 5.0, 2.0]])
 
-# Griglia operativa delle aperture (images_generator.py, __main__): K = 14 candidati,
-# indice 0 = raggio specchio.  Il candidato della tabella e' 45 gradi.
+# Operational aperture grid (images_generator.py, __main__): K = 14 candidates,
+# index 0 = mirror ray.  The table's candidate is 45 degrees.
 APERTURES = np.array([0., 5., 10., 15., 20., 30., 45., 60., 80., 100., 120., 140., 160., 180.])
 K_STAR = 6
 
-H_ENV = np.array([1.5, 2.3, 1.3])     # media sull'emisfero, per canale
-KAPPA = np.array([20.0, 30.0, 3.0])   # compattezza della sorgente attorno a R_j
+H_ENV = np.array([1.5, 2.3, 1.3])     # hemisphere mean, per channel
+KAPPA = np.array([20.0, 30.0, 3.0])   # compactness of the source around R_j
 
-# Materiali della figura delle tre curve: stesso texel, stessa envmap, solo x e il lobo
-# cambiano.  Il rumore e' ASSOLUTO e comune (stesso bake, stesso sensore): e' cio' che
-# rende piatta la curva del diffuso senza doverla dichiarare piatta a mano.
+# Materials of the three-curve figure: same texel, same envmap, only x and the lobe
+# change.  The noise is ABSOLUTE and shared (same bake, same sensor): it is what makes
+# the diffuse curve flat without having to declare it flat by hand.
 NOISE_SIGMA = 0.045
 NOISE_SEED = 19
 MATERIALS = (("metal",     0.90, 2),
              ("glossy",    0.50, K_STAR),
              ("diffuse",   0.03, K_STAR))
-ALBEDO_TERM = np.array([0.22, 0.26, 0.20])   # a_c*E_c/pi, il colore diffuso del texel
+ALBEDO_TERM = np.array([0.22, 0.26, 0.20])   # a_c*E_c/pi, the texel's diffuse colour
 
-# ── Colori ────────────────────────────────────────────────────────────────────
-# I canali sono entita', non slot di palette: restano rosso/verde/blu.  Con questi passi
-# la coppia peggiore sta a Delta E 7.2 in deuteranopia, dentro la fascia 6-8 ammessa solo
-# con codifica secondaria -- che c'e': i canali sono sempre in ordine R, G, B e etichettati
-# sull'asse, quindi l'identita' non e' mai affidata al solo colore.
+# ── Colours ──────────────────────────────────────────────────────────────────
+# The channels are entities, not palette slots: they stay red/green/blue.  With these
+# steps the worst pair sits at Delta E 7.2 under deuteranopia, inside the 6-8 band that
+# is allowed only with a secondary encoding -- which is there: the channels are always in
+# R, G, B order and labelled on the axis, so identity never rests on colour alone.
 CH_COLORS = ("#e34948", "#008300", "#2a78d6")
 CH_NAMES = ("R", "G", "B")
 CAM_MARKERS = ("o", "s", "^")
-# Serie categoriche (i tre materiali): slot 1-3 della palette validata, passano tutte le
-# coppie.  L'aqua sta sotto 3:1 sul fondo chiaro, quindi le curve sono etichettate in
-# posto e non solo in legenda.
+# Categorical series (the three materials): slots 1-3 of the validated palette, every
+# pair passes.  The aqua sits below 3:1 on the light background, so the curves are
+# labelled in place and not only in the legend.
 MAT_COLORS = ("#2a78d6", "#eb6834", "#1baf7a")
-# I momenti hanno una palette loro: con blu/arancio/verde, tre barre affiancate in un
-# grafico dove altrove tre barre affiancate SONO i canali si leggono come un RGB.
-# Viola, ocra e magenta (slot 7, 4, 5 della stessa palette) non contengono ne' blu ne'
-# verde, quindi l'equivoco non e' proprio possibile.  Ocra e magenta stanno sotto 3:1
-# sul fondo chiaro: qui il rilievo c'e', ogni barra porta il suo valore scritto.
+# The moments have a palette of their own: with blue/orange/green, three bars side by
+# side in a plot where elsewhere three side-by-side bars ARE the channels would read as
+# an RGB.  Violet, ochre and magenta (slots 7, 4, 5 of the same palette) contain neither
+# blue nor green, so the confusion is simply not possible.  Ochre and magenta sit below
+# 3:1 on the light background: here the relief is there, every bar carries its value.
 MOMENT_COLORS = ("#4a3aa7", "#eda100", "#e87ba4")
 
-# Nomi accettati da --figures, senza il prefisso 'fit_' del file.  Le due pubblicate in
-# tesi sono worked_combined e moments_per_camera: Doc/images/pbr-fit tiene solo quelle,
-# il resto vive in figure_review finche' non e' approvato.
+# Names accepted by --figures, without the files' 'fit_' prefix.  The two published in
+# the thesis are worked_combined and moments_per_camera: Doc/images/pbr-fit keeps only
+# those, the rest live in figure_review until approved.
 FIGURES = ("color_raw", "color_centered", "cone_raw", "cone_centered",
            "worked_combined", "scatter", "moments_per_camera", "beta",
            "aperture_selection", "residual_materials")
@@ -113,23 +113,23 @@ FIGURES = ("color_raw", "color_centered", "cone_raw", "cone_centered",
 C_INK = "#222222"
 C_SOFT = "#6b6b6b"
 C_GRID = "#dcdcdc"
-C_FIT = "#c0392b"        # la retta del fit, come il raggio specchio in make_cone_diagram
+C_FIT = "#c0392b"        # the fit line, like the mirror ray in make_cone_diagram
 C_RESID = "#eb6834"
 
-# In pagina la figura viene rimpicciolita: le dimensioni sono scelte perche' il testo
-# resti leggibile DOPO la riduzione.
+# On the page the figure is shrunk: the sizes are chosen so that the text stays readable
+# AFTER the reduction.
 plt.rcParams.update({"font.size": 13, "axes.edgecolor": C_SOFT,
                      "axes.labelcolor": C_INK, "text.color": C_INK,
                      "xtick.color": C_SOFT, "ytick.color": C_SOFT})
 
 
-# ── Matematica del fit ────────────────────────────────────────────────────────
+# ── Mathematics of the fit ───────────────────────────────────────────────────
 def fit_moments(C: np.ndarray, L: np.ndarray) -> dict:
-    """Statistiche centrate e fit di un texel, per uno o piu' candidati.
+    """Centred statistics and fit of one texel, for one or more candidates.
 
-    Rispecchia pbr_solver.py:270-283: le somme sono POOLED sui tre canali (beta e'
-    condiviso, alpha_c no), beta e' clippato in [0,1] e il residuo e' diviso per il
-    numero di equazioni scalari 3*n_views.  C (n_cam, 3); L (n_cam, 3) oppure
+    Mirrors pbr_solver.py:270-283: the sums are POOLED over the three channels (beta is
+    shared, alpha_c is not), beta is clipped to [0,1] and the residual is divided by the
+    number of scalar equations 3*n_views.  C (n_cam, 3); L (n_cam, 3) or
     (n_cam, n_cand, 3).
     """
     single = L.ndim == 2
@@ -141,9 +141,9 @@ def fit_moments(C: np.ndarray, L: np.ndarray) -> dict:
     VCC = float((dC * dC).sum())
     beta = np.clip(VCL / np.maximum(VLL, 1e-12), 0.0, 1.0)
     res = (VCC - 2.0 * beta * VCL + beta ** 2 * VLL) / (3.0 * C.shape[0])
-    # Le due decomposizioni della stessa somma: _c per canale (somma sulle camere),
-    # _j per camera (somma sui canali).  Entrambe ritornano il totale se risommate,
-    # ed e' quello che _check_against_table verifica.
+    # The two decompositions of the same sum: _c per channel (summed over the cameras),
+    # _j per camera (summed over the channels).  Both give back the total when re-summed,
+    # and that is what _check_against_table verifies.
     out = dict(dC=dC, dL=dL[:, 0] if single else dL, VLL=VLL, VCL=VCL, VCC=VCC,
                beta=beta, res=res,
                VLL_c=(dL * dL).sum(axis=0), VCL_c=(dC[:, None, :] * dL).sum(axis=0),
@@ -160,14 +160,14 @@ def fit_moments(C: np.ndarray, L: np.ndarray) -> dict:
 
 
 def cone_curve() -> np.ndarray:
-    """(n_cam, n_cand, 3): L_jc a ogni apertura candidata.  Vedi il docstring."""
+    """(n_cam, n_cand, 3): L_jc at every candidate aperture.  See the docstring."""
     u = 1.0 - np.cos(np.radians(APERTURES) * 0.5)
     phi = (1.0 + KAPPA[:, None] * u[K_STAR]) / (1.0 + KAPPA[:, None] * u[None, :])
     return H_ENV[None, None, :] + (L_STAR - H_ENV[None, :])[:, None, :] * phi[:, :, None]
 
 
 def material_colors(L: np.ndarray) -> list[tuple]:
-    """Colori osservati sintetici per i tre materiali, dallo stesso modello diretto."""
+    """Synthetic observed colours for the three materials, from the same forward model."""
     out = []
     for name, beta_true, k_true in MATERIALS:
         rng = np.random.default_rng(NOISE_SEED)
@@ -178,39 +178,39 @@ def material_colors(L: np.ndarray) -> list[tuple]:
 
 
 def _check_against_table(fit: dict, res_curve: np.ndarray) -> None:
-    """La tabella della tesi e le figure devono raccontare gli stessi numeri."""
+    """The thesis table and the figures have to tell the same numbers."""
     exp = {"VLL": 10.0, "VCL": 16.0 / 3.0, "VCC": 2.853333, "beta": 8.0 / 15.0,
            "res": 9.876543e-4}
     for k, v in exp.items():
         got = float(fit[k])
-        assert abs(got - v) < 5e-6, f"{k}: atteso {v} da tab:pbr-worked-example, ottenuto {got}"
+        assert abs(got - v) < 5e-6, f"{k}: expected {v} from tab:pbr-worked-example, got {got}"
     assert np.allclose(fit["VLL_c"], [14 / 3, 14 / 3, 2 / 3], atol=5e-6), fit["VLL_c"]
     assert np.allclose(fit["VCL_c"], [2.466667, 2.5, 0.366667], atol=5e-6), fit["VCL_c"]
-    # Una decomposizione che non risomma al totale e' l'unico errore che le figure
-    # per camera potrebbero nascondere: la barra sbagliata sembrerebbe solo un dato.
+    # A decomposition that does not re-sum to the total is the only error the per-camera
+    # figures could hide: the wrong bar would just look like data.
     for k in ("VLL", "VCL", "VCC"):
         for suffix in ("_c", "_j"):
             if k + suffix in fit:
                 s = float(np.sum(fit[k + suffix]))
-                assert abs(s - float(fit[k])) < 5e-6, f"{k}{suffix} somma {s}, non {fit[k]}"
+                assert abs(s - float(fit[k])) < 5e-6, f"{k}{suffix} sums to {s}, not {fit[k]}"
     w = fit["VLL_j"] / fit["VLL"]
     assert abs(float((w * (fit["VCL_j"] / fit["VLL_j"])).sum()) - fit["beta"]) < 5e-6, \
-        "beta non e' la media di beta_j pesata su V_LL_j"
+        "beta is not the V_LL_j-weighted mean of beta_j"
     k = int(np.argmin(res_curve))
-    assert k == K_STAR, (f"il minimo del residuo cade a {APERTURES[k]:.0f} gradi e non "
-                         f"sul candidato della tabella ({APERTURES[K_STAR]:.0f}): "
-                         f"H_ENV/KAPPA vanno ritarati")
+    assert k == K_STAR, (f"the residual minimum falls at {APERTURES[k]:.0f} degrees and not "
+                         f"on the table's candidate ({APERTURES[K_STAR]:.0f}): "
+                         f"H_ENV/KAPPA need retuning")
 
 
-# ── Utility di disegno ────────────────────────────────────────────────────────
+# ── Drawing utilities ────────────────────────────────────────────────────────
 def _tonemap(rgb: np.ndarray, scale: float) -> np.ndarray:
-    """HDR -> sRGB con esposizione condivisa: le swatch di C e L sono confrontabili."""
+    """HDR -> sRGB with a shared exposure: the C and L swatches are comparable."""
     return np.clip(rgb / scale, 0.0, 1.0) ** (1.0 / 2.2)
 
 
 def _bars(ax, values: np.ndarray, ylim: tuple, means: np.ndarray | None,
           fmt: str = "{:.3f}") -> None:
-    """Tre barre R/G/B con etichetta diretta, griglia sullo sfondo."""
+    """Three R/G/B bars with a direct label, grid in the background."""
     x = np.arange(3)
     ax.axhline(0.0, color=C_SOFT, lw=1.0, zorder=2)
     ax.bar(x, values, width=0.62, color=CH_COLORS, zorder=3)
@@ -221,14 +221,14 @@ def _bars(ax, values: np.ndarray, ylim: tuple, means: np.ndarray | None,
     span = ylim[1] - ylim[0]
     for i, v in enumerate(values):
         if means is None:
-            # Barre centrate: sopra la barra, che e' dove il numero si cerca
+            # Centred bars: above the bar, which is where the number is looked for
             off = 0.028 * span * (1 if v >= 0 else -1)
             ax.text(i, v + off, fmt.format(v), ha="center", color=C_INK, fontsize=11,
                     va="bottom" if v >= 0 else "top", zorder=5)
         else:
-            # Barre grezze: dentro la barra.  Sopra finirebbe a cavallo del trattino
-            # della media quando la barra e' piu' bassa della media, e il numero
-            # sembrerebbe l'etichetta della media invece che della barra.
+            # Raw bars: inside the bar.  Above it would straddle the mean's dash when the
+            # bar is lower than the mean, and the number would look like the mean's label
+            # rather than the bar's.
             ax.text(i, v - 0.035 * span, fmt.format(v), ha="center", color="white",
                     fontsize=11, va="top", zorder=5)
     ax.set_xticks(x)
@@ -252,7 +252,7 @@ def _swatch(ax, rgb: np.ndarray, scale: float, label: str) -> None:
 
 
 def _panel_grid(fig, specs, values, means, ylim, scale, titles, fmt="{:.3f}"):
-    """Una riga di tre pannelli (una camera ciascuno), con swatch se scale non e' None."""
+    """A row of three panels (one camera each), with a swatch when scale is not None."""
     axes = []
     for j in range(3):
         if scale is not None:
@@ -291,9 +291,9 @@ def fig_bars(values, means, ylim, scale, out: Path, suptitle: str, note: str,
 
 def fig_combined(fit: dict, L_star_mean, C_mean, ylim_raw, ylim_cen, scale,
                  out: Path) -> None:
-    """I quattro pannelli in una griglia sola: e' questa la figura che va in tesi,
-    quindi la spaziatura e' stretta -- a \\linewidth la versione larga si mangiava
-    quasi una pagina intera."""
+    """The four panels in a single grid: this is the figure that goes in the thesis, so
+    the spacing is tight -- at \\linewidth the wide version ate almost a whole page."""
+
     fig = plt.figure(figsize=(9.6, 10.6))
     gs = fig.add_gridspec(4, 3, hspace=0.42, wspace=0.12)
     rows = ((C_OBS, C_mean, ylim_raw, scale,
@@ -309,16 +309,16 @@ def fig_combined(fit: dict, L_star_mean, C_mean, ylim_raw, ylim_cen, scale,
         axes = _panel_grid(fig, [gs[r, j] for j in range(3)], vals, means, ylim, sc,
                            titles)
         axes[0].set_ylabel("radiance", color=C_INK)
-        # Sopra la fascia della swatch quando c'e': il titolo di riga e' lungo e alla
-        # quota dell'asse delle barre finirebbe steso sulla swatch della camera 1.
-        # Nella prima riga sopra la swatch ci sono anche i nomi delle camere.
+        # Above the swatch band when there is one: the row title is long and at the height
+        # of the bar axis it would lie across camera 1's swatch.
+        # In the first row the camera names are above the swatch too.
         title_y = (1.46 if r == 0 else 1.32) if sc is not None else 1.04
         axes[0].text(-0.34, title_y, title, transform=axes[0].transAxes, fontsize=14,
                      color=C_INK, ha="left", va="bottom")
     _finish(fig, out)
 
 
-# ── Figura 5: la regressione centrata ─────────────────────────────────────────
+# ── Figure 5: the centred regression ─────────────────────────────────────────
 def _scatter_fit(ax, dL, dC, beta, res, xlim=None, drops=True, legend=False) -> None:
     lim = xlim or (np.abs(dL).max() * 1.35)
     xs = np.array([-lim, lim])
@@ -331,10 +331,10 @@ def _scatter_fit(ax, dL, dC, beta, res, xlim=None, drops=True, legend=False) -> 
             for c in range(3):
                 ax.plot([dL[j, c], dL[j, c]], [dC[j, c], beta * dL[j, c]],
                         color=C_RESID, lw=1.6, zorder=4, solid_capstyle="butt")
-    # Marker piu' piccoli sui canali successivi: due punti possono coincidere quasi
-    # esattamente (camera 1 in R e G differiscono di 0.03) e a parita' di taglia il
-    # secondo sparirebbe sotto il primo.  La taglia e' ridondante, non informativa:
-    # il canale resta il colore.
+    # Smaller markers on the later channels: two points can nearly coincide (camera 1 in
+    # R and G differ by 0.03) and at equal size the second would vanish under the first.
+    # The size is redundant, not informative: the channel stays the colour.
+    #
     for c in range(3):
         for j in range(dL.shape[0]):
             ax.plot(dL[j, c], dC[j, c], marker=CAM_MARKERS[j], ms=(12.0, 9.0, 6.5)[c],
@@ -359,9 +359,9 @@ def _scatter_fit(ax, dL, dC, beta, res, xlim=None, drops=True, legend=False) -> 
 
 
 def fig_scatter(fit: dict, out: Path) -> None:
-    """La regressione e, accanto, quello che le resta: senza il secondo pannello i
-    residui di questo texel (terza cifra decimale) sono sotto la larghezza della retta
-    e la figura direbbe solo 'i punti sono allineati'."""
+    """The regression and, next to it, what it leaves behind: without the second panel
+    this texel's residuals (third decimal) are below the width of the line and the figure
+    would only say 'the points are aligned'."""
     fig = plt.figure(figsize=(12.6, 5.4))
     gs = fig.add_gridspec(1, 2, width_ratios=(1.55, 1.0), wspace=0.26)
 
@@ -379,8 +379,8 @@ def fig_scatter(fit: dict, out: Path) -> None:
 
     axr = fig.add_subplot(gs[1])
     resid = fit["dC"] - fit["beta"] * fit["dL"]
-    # Gruppi staccati: le etichette dei due valori a cavallo fra una camera e la
-    # successiva si toccherebbero.
+    # Separated groups: the labels of the two values straddling one camera and the next
+    # would touch.
     x = np.array([4.4 * j + 1.15 * c for j in range(3) for c in range(3)])
     axr.axhline(0.0, color=C_SOFT, lw=1.0, zorder=2)
     axr.bar(x, resid.ravel(), width=0.66, color=list(CH_COLORS) * 3, zorder=3)
@@ -417,15 +417,15 @@ def fig_scatter(fit: dict, out: Path) -> None:
     _finish(fig, out)
 
 
-# ── Figura 6: i momenti, camera per camera ────────────────────────────────────
+# ── Figure 6: the moments, camera by camera ──────────────────────────────────
 def fig_moments_per_camera(fit: dict, out: Path) -> None:
-    """V_LL, V_CL, V_CC per camera piu' il gruppo dei totali.
+    """V_LL, V_CL, V_CC per camera plus the group of totals.
 
-    Il gruppo 'total' non e' decorazione: sono i tre numeri che entrano davvero in
-    beta, e averli come quarta colonna evita di dover annotare a parte cosa somma a
-    cosa.  Le etichette su OGNI barra sono obbligatorie qui: su scala lineare la
-    camera 2 vale 0.33 contro i 5.67 della camera 1 e senza numero sarebbe un
-    filetto illeggibile -- che poi e' esattamente la cosa da far vedere.
+    The 'total' group is not decoration: they are the three numbers that really enter
+    beta, and having them as a fourth column avoids annotating separately what sums to
+    what.  The labels on EVERY bar are mandatory here: on a linear scale camera 2 is 0.33
+    against camera 1's 5.67 and without a number it would be an unreadable sliver -- which
+    is then exactly the thing to show.
     """
     vals = np.stack([fit["VLL_j"], fit["VCL_j"], fit["VCC_j"]], axis=1)   # (3 cam, 3)
     tot = np.array([fit["VLL"], fit["VCL"], fit["VCC"]])
@@ -466,17 +466,17 @@ def fig_moments_per_camera(fit: dict, out: Path) -> None:
     _finish(fig, out)
 
 
-# ── Figura 7: da dove esce beta ───────────────────────────────────────────────
+# ── Figure 7: where beta comes from ──────────────────────────────────────────
 def fig_beta(fit: dict, out: Path) -> None:
     trials = (0.20, fit["beta"], 0.90)
-    # Due grigi diversi e non uno solo: i segmenti dei residui non hanno tratteggio,
-    # quindi a parita' di colore non si saprebbe a quale pendenza appartengono.
+    # Two different greys and not one: the residual segments have no dash pattern, so at
+    # equal colour one could not tell which slope they belong to.
     t_col = ("#9a9a9a", C_FIT, "#4d4d4d")
     t_ls = ((0, (5, 2)), "-", (0, (1, 2)))
     fig = plt.figure(figsize=(14.6, 4.9))
     gs = fig.add_gridspec(1, 3, width_ratios=(1.15, 1.0, 1.0), wspace=0.38)
 
-    # (a) tre pendenze di prova sugli stessi nove punti
+    # (a) three trial slopes on the same nine points
     ax = fig.add_subplot(gs[0])
     lim = np.abs(fit["dL"]).max() * 1.35
     xs = np.array([-lim, lim])
@@ -502,7 +502,7 @@ def fig_beta(fit: dict, out: Path) -> None:
     ax.set_title("Try a slope, measure what is left", fontsize=13.5, color=C_INK, pad=8)
     ax.legend(loc="upper left", fontsize=10.5, frameon=False, labelspacing=0.3)
 
-    # (b) la parabola: e' qui che beta viene fuori
+    # (b) the parabola: this is where beta comes out
     axp = fig.add_subplot(gs[1])
     b = np.linspace(-0.15, 1.25, 400)
     sse = fit["VCC"] - 2 * b * fit["VCL"] + b ** 2 * fit["VLL"]
@@ -531,14 +531,14 @@ def fig_beta(fit: dict, out: Path) -> None:
     axp.set_title(r"$\beta^\star$ is where the parabola bottoms out", fontsize=13.5,
                   color=C_INK, pad=8)
 
-    # (c) beta come media pesata delle pendenze delle singole camere
+    # (c) beta as a weighted mean of the per-camera slopes
     axw = fig.add_subplot(gs[2])
     w = fit["VLL_j"] / fit["VLL"]
     beta_j = fit["VCL_j"] / fit["VLL_j"]
-    # Punti e non barre: le tre pendenze differiscono di 0.04 su 0.53, quindi vanno
-    # guardate da vicino, e un asse zoomato con le barre partirebbe da un finto zero.
-    # L'area del punto e' il peso, ed e' cosi' che si vede beta* cadere accanto alla
-    # camera 1 (57%) e lontano dalla camera 2 (3%).
+    # Dots and not bars: the three slopes differ by 0.04 out of 0.53, so they have to be
+    # looked at closely, and a zoomed axis with bars would start from a fake zero.
+    # The dot's area is the weight, and that is how one sees beta* fall next to camera 1
+    # (57%) and far from camera 2 (3%).
     axw.axvline(fit["beta"], color=C_FIT, lw=2.0, zorder=4)
     for j in range(3):
         axw.plot([min(beta_j[j], fit["beta"]), max(beta_j[j], fit["beta"])],
@@ -547,8 +547,8 @@ def fig_beta(fit: dict, out: Path) -> None:
                     edgecolor="white", linewidth=1.5, zorder=5)
     axw.text(fit["beta"], -0.66, fr"$\beta^\star = {fit['beta']:.3f}$", ha="center",
              va="bottom", fontsize=12.5, color=C_FIT)
-    # Valori sulle etichette dell'asse e non accanto ai punti: l'asse e' stretto e
-    # qualunque testo dentro il pannello finirebbe a cavallo della riga di beta*.
+    # Values on the axis labels and not next to the dots: the axis is narrow and any text
+    # inside the panel would straddle the beta* line.
     axw.set_yticks([2, 1, 0])
     axw.set_yticklabels([f"camera {j + 1}\n$\\beta_{{{j + 1}}}$ = {beta_j[j]:.3f}\n"
                          f"$w_{{{j + 1}}}$ = {w[j] * 100:.0f}%"
@@ -571,14 +571,14 @@ def fig_beta(fit: dict, out: Path) -> None:
     _finish(fig, out)
 
 
-# ── Figura 8: perche' quell'apertura ──────────────────────────────────────────
+# ── Figure 8: why that aperture ──────────────────────────────────────────────
 def fig_aperture_selection(L: np.ndarray, curve: dict, out: Path) -> None:
-    show = (2, K_STAR, 10)          # 10 gradi (stretto), 45 (vincitore), 120 (largo)
+    show = (2, K_STAR, 10)          # 10 degrees (narrow), 45 (winner), 120 (wide)
     tags = ("A", "B", "C")
     fig = plt.figure(figsize=(10.4, 10.0))
-    # Due gridspec annidati e non uno solo: fra la riga degli scatter e il residuo
-    # serve aria (li' sotto ci sono le etichette di Delta L), fra residuo e beta no,
-    # perche' condividono l'asse x e devono leggersi come un blocco.
+    # Two nested gridspecs and not one: between the scatter row and the residual there
+    # needs to be air (the Delta L labels are down there), between residual and beta
+    # there does not, because they share the x axis and must read as one block.
     outer = fig.add_gridspec(2, 1, height_ratios=(1.30, 1.55), hspace=0.30)
     gs = outer[0].subgridspec(1, 3, wspace=0.16)
     gs_bot = outer[1].subgridspec(2, 1, height_ratios=(1.0, 0.42), hspace=0.12)
@@ -604,7 +604,7 @@ def fig_aperture_selection(L: np.ndarray, curve: dict, out: Path) -> None:
                 transform=ax.transAxes, ha="left", va="top", fontsize=11.5,
                 color=C_INK, linespacing=1.5)
 
-    # residuo: e' questo che sceglie
+    # residual: this is what chooses
     axr = fig.add_subplot(gs_bot[0])
     axr.plot(APERTURES, curve["res"], color=C_FIT, lw=2.0, marker="o", ms=6.5,
              mec="white", mew=1.2, zorder=4)
@@ -630,7 +630,7 @@ def fig_aperture_selection(L: np.ndarray, curve: dict, out: Path) -> None:
     axr.set_ylabel(r"residual  $\mathrm{res}(\Theta)$")
     axr.set_title(r"The residual selects the aperture", fontsize=14, color=C_INK, pad=8)
 
-    # beta: cresce e basta, non ha un minimo -- non puo' scegliere
+    # beta: it only grows, it has no minimum -- it cannot choose
     axb = fig.add_subplot(gs_bot[1], sharex=axr)
     axb.plot(APERTURES, curve["beta"], color=C_INK, lw=2.0, marker="o", ms=5.5,
              mec="white", mew=1.0, zorder=4)
@@ -651,7 +651,7 @@ def fig_aperture_selection(L: np.ndarray, curve: dict, out: Path) -> None:
     _finish(fig, out)
 
 
-# ── Figura 7: metallo, lucido, diffuso ────────────────────────────────────────
+# ── Figure 7: metal, glossy, diffuse ─────────────────────────────────────────
 def fig_residual_materials(L: np.ndarray, out: Path) -> None:
     fig, ax = plt.subplots(figsize=(9.6, 5.8))
     lines, rmax = [], 1.0
@@ -665,15 +665,15 @@ def fig_residual_materials(L: np.ndarray, out: Path) -> None:
                 mec="white", mew=1.0, zorder=4)
         ax.plot(APERTURES[k], 1.0, marker="o", ms=13, color=MAT_COLORS[i],
                 mec="white", mew=2.0, zorder=6)
-        # Etichetta in posto sulla coda destra: la legenda in alto costringeva le tre
-        # scritte del minimo a impilarsi sull'asse x.  Serve anche come rilievo per
-        # l'aqua, che sul fondo chiaro sta sotto 3:1.
+        # Label in place on the right tail: the legend at the top forced the three minimum
+        # captions to stack on the x axis.  It also acts as relief for the aqua, which on
+        # the light background sits below 3:1.
         ax.annotate(f"{name}\npicks {APERTURES[k]:.0f}$^\\circ$, "
                     f"$\\beta^\\star$ = {f['beta'][k]:.2f}",
                     xy=(APERTURES[-1], r[-1]), xytext=(-4, 12),
                     textcoords="offset points", ha="right", va="bottom",
                     fontsize=12, color=MAT_COLORS[i], linespacing=1.4, zorder=7)
-        # tacca colorata sul candidato scelto: si legge senza inseguire la curva
+        # coloured tick on the chosen candidate: it reads without following the curve
         ax.plot([APERTURES[k]] * 2, [0.0, 0.045], color=MAT_COLORS[i], lw=3.0,
                 transform=blend, clip_on=False, zorder=7)
         lines.append((name, beta_true, k_true, k, f))
@@ -693,10 +693,10 @@ def fig_residual_materials(L: np.ndarray, out: Path) -> None:
     return lines
 
 
-# ── Riepilogo numerico ────────────────────────────────────────────────────────
+# ── Numeric summary ──────────────────────────────────────────────────────────
 def print_table(fit: dict) -> None:
-    """Righe di tab:pbr-worked-example rigenerate dagli input, per il confronto."""
-    print("\n% tab:pbr-worked-example, rigenerata (non trascritta)")
+    """Rows of tab:pbr-worked-example regenerated from the inputs, for comparison."""
+    print("\n% tab:pbr-worked-example, regenerated (not transcribed)")
     for j in range(3):
         print(f"        Camera {j + 1} & " + " & ".join(
             f"${v:.3f}$" for v in np.r_[C_OBS[j], L_STAR[j]]) + r" \\")
@@ -712,33 +712,33 @@ def print_table(fit: dict) -> None:
     print(f"        $V_{{LL}} = {fit['VLL']:.3f}$ \\quad $V_{{CL}} = {fit['VCL']:.3f}$ "
           f"\\quad $\\beta^\\star = {fit['beta']:.3f}$ \\quad "
           f"res $= {fit['res']:.2e}$")
-    print(f"% (V_CC = {fit['VCC']:.4f}, somma dei quadrati dei residui = "
-          f"{fit['res'] * 9:.5f} su 9 equazioni)")
+    print(f"% (V_CC = {fit['VCC']:.4f}, sum of squared residuals = "
+          f"{fit['res'] * 9:.5f} over 9 equations)")
 
 
 def print_curve(curve: dict, L: np.ndarray) -> None:
-    print("\n% res(Theta) sul texel della tabella")
+    print("\n% res(Theta) on the table's texel")
     print("  Theta    VLL     VCL    beta      res    res/min")
     rmin = curve["res"].min()
     for a in range(len(APERTURES)):
-        star = " <-- tabella" if a == K_STAR else ""
+        star = " <-- table" if a == K_STAR else ""
         print(f"  {APERTURES[a]:5.0f}  {curve['VLL'][a]:6.2f} {curve['VCL'][a]:6.2f} "
               f"{curve['beta'][a]:6.3f}  {curve['res'][a]:.3e} {curve['res'][a]/rmin:8.1f}"
               f"{star}")
-    print(f"  L min {L.min():.3f}  max {L.max():.3f}   (livello specchio: "
+    print(f"  L min {L.min():.3f}  max {L.max():.3f}   (mirror level: "
           f"{np.round(L[:, 0, :], 2).tolist()})")
 
 
 def print_per_camera(fit: dict) -> None:
-    """Decomposizione per camera: i numeri delle due figure nuove."""
+    """Per-camera decomposition: the numbers of the two new figures."""
     w = fit["VLL_j"] / fit["VLL"]
     beta_j = fit["VCL_j"] / fit["VLL_j"]
-    print("\n% momenti per camera (somma sui tre canali)")
-    print("           V_LL    V_CL    V_CC   beta_j   peso")
+    print("\n% per-camera moments (summed over the three channels)")
+    print("           V_LL    V_CL    V_CC   beta_j   weight")
     for j in range(3):
         print(f"  camera {j + 1} {fit['VLL_j'][j]:6.3f} {fit['VCL_j'][j]:7.3f} "
               f"{fit['VCC_j'][j]:7.3f}  {beta_j[j]:6.3f} {w[j] * 100:6.1f}%")
-    print(f"  totale   {fit['VLL']:6.3f} {fit['VCL']:7.3f} {fit['VCC']:7.3f}  "
+    print(f"  total    {fit['VLL']:6.3f} {fit['VCL']:7.3f} {fit['VCC']:7.3f}  "
           f"{fit['beta']:6.3f} {w.sum() * 100:6.1f}%")
 
 
@@ -747,11 +747,11 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
     ap.add_argument("--figures", default=None,
-                    help="sottoinsieme da generare, nomi separati da virgola senza il "
-                         "prefisso 'fit_' (default: tutte).  Serve per la copia in "
-                         "Doc/images/pbr-fit, che tiene solo le figure pubblicate")
+                    help="subset to generate, comma-separated names without the "
+                         "'fit_' prefix (default: all).  Needed for the copy in "
+                         "Doc/images/pbr-fit, which keeps only the published figures")
     ap.add_argument("--print-table", action="store_true",
-                    help="rigenera le righe LaTeX della tabella e il dettaglio numerico")
+                    help="regenerate the LaTeX table rows and the numeric detail")
     args = ap.parse_args()
     out = Path(args.out)
 
@@ -760,20 +760,20 @@ def main() -> int:
     else:
         asked = {s.strip() for s in args.figures.split(",") if s.strip()}
         unknown = asked - set(FIGURES)
-        # Un nome sbagliato deve fermare lo script: altrimenti la copia in tesi
-        # finisce a mani vuote e nessuno se ne accorge fino alla compilazione.
+        # A wrong name has to stop the script: otherwise the copy in the thesis ends up
+        # empty-handed and nobody notices until the build.
         if unknown:
-            raise SystemExit(f"--figures: nomi sconosciuti {sorted(unknown)}; "
-                             f"disponibili {sorted(FIGURES)}")
+            raise SystemExit(f"--figures: unknown names {sorted(unknown)}; "
+                             f"available {sorted(FIGURES)}")
         want = asked.__contains__
-    out.mkdir(parents=True, exist_ok=True)   # dopo il controllo: un refuso non crea cartelle
+    out.mkdir(parents=True, exist_ok=True)   # after the check: a typo must not create folders
 
     L = cone_curve()
     fit = fit_moments(C_OBS, L_STAR)
     curve = fit_moments(C_OBS, L)
     _check_against_table(fit, curve["res"])
 
-    # Un'unica esposizione per tutte le swatch: C e L devono restare confrontabili
+    # A single exposure for every swatch: C and L have to stay comparable
     scale = float(max(C_OBS.max(), L_STAR.max()))
     ylim_raw = (0.0, scale * 1.16)
     ylim_cen = float(max(np.abs(fit["dC"]).max(), np.abs(fit["dL"]).max())) * 1.30
@@ -816,16 +816,16 @@ def main() -> int:
     print_per_camera(fit)
     print_curve(curve, L)
     if mats is not None:
-        print("\n% materiali (sigma assoluto comune "
-              f"{NOISE_SIGMA}, seme {NOISE_SEED})")
+        print("\n% materials (shared absolute sigma "
+              f"{NOISE_SIGMA}, seed {NOISE_SEED})")
         for name, beta_true, k_true, k, f in mats:
-            print(f"  {name:8s} beta vero {beta_true:.2f} a {APERTURES[k_true]:5.0f} "
-                  f"gradi  ->  sceglie {APERTURES[k]:5.0f}, beta* {f['beta'][k]:.3f}, "
-                  f"res {f['res'].min():.2e}, curva max/min "
+            print(f"  {name:8s} true beta {beta_true:.2f} at {APERTURES[k_true]:5.0f} "
+                  f"degrees  ->  picks {APERTURES[k]:5.0f}, beta* {f['beta'][k]:.3f}, "
+                  f"res {f['res'].min():.2e}, curve max/min "
                   f"{f['res'].max() / f['res'].min():8.1f}")
     if args.print_table:
         print_table(fit)
-    print(f"\n[ok] esposizione swatch = {scale:.1f}")
+    print(f"\n[ok] swatch exposure = {scale:.1f}")
     return 0
 
 
