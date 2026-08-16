@@ -3882,8 +3882,8 @@ if __name__ == "__main__":
     # skybox_path) are empty here and get overridden for every SceneConfig.
     # Every other rendering/NeRF parameter is shared across the scenes.
     template = PipelineConfig(
-        run_step1 = False,  # Step 1 outputs already on disk (exp_l1_d02)
-        run_step2 = False,  # NeRF checkpoint and Step 2b renders already on disk
+        run_step1 = True,   # full run from scratch: geometry passes + NeRF dataset
+        run_step2 = True,   # full run from scratch: NeRF training + Step 2b renders
         run_step3 = True,   # texture-space passes up to the spec-cone bake
         run_step4 = True,   # PBR+albedo reconstruction (set run_step3=False to iterate here alone)
 
@@ -4024,14 +4024,14 @@ if __name__ == "__main__":
         #     # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
         #     skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # ),
-        # SceneConfig(
-        #     name             = "TableAndOtherInteriorWithSpecular",
-        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
-        #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
-        #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
-        #     # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
-        #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
-        # ),
+        SceneConfig(
+            name             = "TableAndOtherInteriorWithSpecular",
+            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
+            model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+            external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
+            # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
+            # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+        ),
         #  SceneConfig(
         #     name             = "TableAndOtherInteriorWithSpecularHighDetails",
         #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRHighDetails/transforms.json",
@@ -4040,14 +4040,14 @@ if __name__ == "__main__":
         #     # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
         #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # ),
-        SceneConfig(
-                    name             = "TableAndOtherInteriorWithSpecularNight",
-                    transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmoothNight/transforms.json",
-                    model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
-                    external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmoothNight/BakedMaterial_normal.exr",
-                    # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
-                    # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
-                ),
+        # SceneConfig(
+        #             name             = "TableAndOtherInteriorWithSpecularNight",
+        #             transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmoothNight/transforms.json",
+        #             model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+        #             external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmoothNight/BakedMaterial_normal.exr",
+        #             # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
+        #             # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+        #         ),
         # SceneConfig(
         #     name             = "TableAndOtherInteriorNoSpecular",
         #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenExrSmoothNoDiffuse/transforms.json",
@@ -4094,7 +4094,7 @@ if __name__ == "__main__":
         # ("exp_mse",            "exp",      "mse")
     ]
     DECAYS     = (0.2,)
-    SWEEP_ROOT = "D:/tesi_output/test_mask_irradiance"
+    SWEEP_ROOT = "D:/tesi_output/handoff_check"
 
     for name, act, loss in EXPERIMENTS:
         for decay in DECAYS:
