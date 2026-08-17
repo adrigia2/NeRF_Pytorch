@@ -12,7 +12,7 @@
 #
 # It is only needed by pipeline Steps 1 and 3 (the OptiX ray tracing passes).
 # Step 2 (NeRF training) needs a CUDA GPU but not the extension, and Step 4
-# (PBR reconstruction) plus everything under figures/ needs neither.
+# (PBR reconstruction) needs neither.
 #
 # Versions are pinned to the ones the thesis results were produced with.
 name: tesi-nerf
