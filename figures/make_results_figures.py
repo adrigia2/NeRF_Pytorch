@@ -333,26 +333,57 @@ def _metrics(run: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 def do_curves(out: Path) -> None:
     dst = out / "collapse"
     dst.mkdir(parents=True, exist_ok=True)
-    it, mse, _ = _metrics(CURVE_RUN)
+    it, mse, loss = _metrics(CURVE_RUN)
 
+    # The LOSS and not the MSE, since 2026-08-22.  The chapter now also shows the losses
+    # of the six configurations of the sweep, and a reader who wants to know what this
+    # curve should have looked like has to be able to put the two side by side: same
+    # quantity, and here even the same objective, the L1 of exp/l1, on another scene.  The
+    # MSE stays in the chapter's table, which compares two runs trained on DIFFERENT
+    # losses and where it is therefore the only comparable column.
     fig, ax = plt.subplots(figsize=(5.2, 3.2))
-    ax.plot(it, mse, color="#c0392b", lw=1.5)
+    ax.plot(it, loss, color="#c0392b", lw=1.5)
     ax.set_yscale("log")
     ax.set_xlabel("iteration")
-    ax.set_ylabel("MSE on the training batch")
+    ax.set_ylabel("$L_1$ loss on the training batch")
     ax.set_xlim(0, 75000)
-    # Limits on the percentiles and not on the extremes: eight batches out of 808 shoot up
-    # to 7e12 and come back within one display interval, and on a scale that contains them
-    # all the plateau, which is the subject, becomes a single line.  This way they leave
-    # the frame as vertical strokes, visible but not decisive for the scale.
-    lo, hi = np.percentile(mse, 1), np.percentile(mse, 98)
+    # Limits on the percentiles and not on the extremes: two batches out of 808 shoot up
+    # to 5e3 and come back within one display interval, and on a scale that contains them
+    # the plateau, which is the subject, becomes a single line.  This way they leave the
+    # frame as vertical strokes, visible but not decisive for the scale.
+    lo, hi = np.percentile(loss, 1), np.percentile(loss, 98)
     ax.set_ylim(lo / 1.6, hi * 1.6)
     ax.grid(alpha=0.25, which="both", lw=0.4)
+
+    # Plain numbers on the y axis.  The scale is logarithmic, as in the sweep's grid this
+    # figure is meant to be read against, but the range here is a third of a decade and
+    # the default locator labels it "$6\\times10^{-1}$", which is three symbols to say
+    # 0.6.  The ticks are picked from a 1-1.5-2-3-5-7 ladder inside the limits, so they
+    # follow the data instead of being written down for this one run; if the range ever
+    # widens enough that the ladder gives more than six, the default is left alone.
+    from matplotlib.ticker import FixedLocator, FuncFormatter, NullFormatter
+    ladder = np.concatenate([np.array([1.0, 1.5, 2.0, 3.0, 5.0, 7.0]) * 10.0 ** k
+                             for k in range(-8, 9)])
+    ticks = ladder[(ladder >= lo / 1.6) & (ladder <= hi * 1.6)]
+    if 0 < len(ticks) <= 6:
+        ax.yaxis.set_major_locator(FixedLocator(ticks))
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+        ax.yaxis.set_minor_formatter(NullFormatter())
+    # Same tick marks as the panels of the sweep grid: the two figures are put side by
+    # side by the text, and a reader should not have to re-read the axis to do it.
+    ax.set_xticks([0, 25000, 50000, 75000])
+    ax.set_xticklabels(["0", "25k", "50k", "75k"])
 
     fig.tight_layout()
     fig.savefig(dst / f"{CURVE_NAME}.png", dpi=200)
     plt.close(fig)
-    print(f"  + {dst / CURVE_NAME}.png   {mse[0]:.6g} -> {mse[-1]:.6g}")
+    out_of_frame = int(np.sum((loss < lo / 1.6) | (loss > hi * 1.6)))
+    print(f"  + {dst / CURVE_NAME}.png")
+    print(f"      loss {loss[0]:.6g} -> {loss[-1]:.6g}   "
+          f"min {loss.min():.6g}  max {loss.max():.6g}")
+    print(f"      {len(loss)} points, {out_of_frame} outside the frame, "
+          f"p5 {np.percentile(loss, 5):.4g}  p95 {np.percentile(loss, 95):.4g}")
+    print(f"      (mse, for the table: {mse[0]:.6g} -> {mse[-1]:.6g})")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

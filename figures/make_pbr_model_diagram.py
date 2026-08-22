@@ -4,11 +4,17 @@
     python make_pbr_model_diagram.py --out ../Doc/images/pbr-model
     python make_pbr_model_diagram.py --out ../figure_review/pbr-model --figures kernel
 
-Writes two PNGs:
+Writes three PNGs:
 
   pbr_model.png       one texel, its normal, the hemisphere the diffuse irradiance
                       arrives from, and two cameras with their own reflected ray
                       and the cone of aperture Theta around it.
+
+  idea_texel.png      the same scene for the Idea section (3.1): no symbols and no
+                      Theta/2 arc, plain-word labels, plus a swatch at each camera
+                      with the colour it records, i.e. the crude overview (what
+                      does each camera see, what light does the patch gather, what
+                      light around each mirror direction) before any formalism.
 
   tophat_vs_ggx.png   the SAME rays seen along the reflected direction, weighted in
                       the two ways: flat inside the cone (top-hat) and with the GGX
@@ -196,17 +202,38 @@ def luminance(rgb: np.ndarray) -> np.ndarray:
     return rgb @ np.array([0.2126, 0.7152, 0.0722])
 
 
-def build_case() -> dict:
-    """Geometry, integrals and the three terms of the equation."""
+def terms(case: dict, cam: dict, *, x: float = X_DIFFUSE,
+          albedo: np.ndarray = ALBEDO) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(diffuse, specular, C) of the model, for one camera and one material.
+
+    Split out of `build_case` so that a figure can draw a SECOND material on the same
+    scene without a second copy of the equation.  The Idea storyboard needs exactly
+    that: its first pair of panels differs only in x, one at 1 (perfectly diffuse, the
+    colour is the same for every camera by construction) and one at X_DIFFUSE.
+    Neither E nor L_j depends on x, so both materials come out of a single case.
+    """
+    diffuse = albedo * x / np.pi * case["E"]
+    spec = (1.0 - x) * cam["L"]
+    return diffuse, spec, diffuse + spec
+
+
+def build_case(cams: tuple = CAMS) -> dict:
+    """Geometry, integrals and the three terms of the equation.
+
+    `cams` is a parameter and not the constant because the Idea storyboard draws the
+    same scene in section, which needs the two cameras COPLANAR with the normal; the
+    integrals it prints stay the three-dimensional ones computed here.
+    """
     n = np.array([0.0, 0.0, 1.0])
     dirs = fibonacci_hemisphere(S_INT)
     half = THETA / 2.0
 
-    cams = []
-    for spec in CAMS:
+    cam_list = []
+    for spec in cams:
         v = sph(spec["theta"], spec["phi"])
         r = 2.0 * np.dot(n, v) * n - v          # Reflected ray equation
-        cams.append(dict(spec, v=v, r=r))
+        cam_list.append(dict(spec, v=v, r=r))
+    cams = cam_list
 
     # The sun sits near R_1, offset by SUN_OFFSET towards the normal.
     r1 = cams[0]["r"]
@@ -245,12 +272,12 @@ def build_case() -> dict:
         # solid angle, the mean is the plain one.
         c["L_check"] = sky(cone_directions(c["r"], half, 20_000), sun_dir).mean(axis=0)
 
-    diffuse = ALBEDO * X_DIFFUSE / np.pi * e_irr
+    case = dict(n=n, cams=cams, sun_dir=sun_dir, E=e_irr, half=half)
+    diffuse = None
     for c in cams:
-        c["spec"] = (1.0 - X_DIFFUSE) * c["L"]
-        c["C"] = diffuse + c["spec"]
-
-    return dict(n=n, cams=cams, sun_dir=sun_dir, E=e_irr, diffuse=diffuse, half=half)
+        diffuse, c["spec"], c["C"] = terms(case, c)
+    case["diffuse"] = diffuse
+    return case
 
 
 def make_tonemap(case: dict):
@@ -266,10 +293,27 @@ def make_tonemap(case: dict):
     return tm
 
 
-# ────────────────────────────────────────────────────────── panel (a), in 3D
-def panel_geometry(ax, case: dict, tm) -> None:
-    n = case["n"]
+# ──────────────────────────────── the 3D scene shared by model and idea panels
+def draw_scene_base(ax, case: dict, tm, *, dome: bool = True, sun: bool = True,
+                    arrows: bool = True, scale: float = 1.0,
+                    n_dome: int = S_DOME) -> None:
+    """Framing, ground plane, dome, sun and incoming arrows.
 
+    Everything `panel_geometry` and `panel_idea` draw identically lives here,
+    so the idea figure of Section 3.1 cannot drift from the model figure of
+    Section 3.5: same geometry, same environment, same weights on the dots.
+
+    The keywords exist for the storyboard of Section 3.1, which takes the same scene
+    apart panel by panel: `dome`, `sun` and `arrows` switch off what a given panel is
+    not about.  `scale` is the ratio between that figure's canvas and this one's, and
+    it is NOT cosmetic: a panel printed at 0.48\linewidth is reduced to 0.39 against
+    the 0.66 of `pbr_model.png`, so a 13 pt label would land at 5 pt on the page.  It
+    multiplies every LINEWIDTH by itself and every scatter AREA by its square, because
+    `s` is in points squared while `lw` is in points; getting that exponent wrong is
+    how the panels would silently stop matching the figure they come from.  `n_dome`
+    thins the dome for the same reason: 520 dots over an area 2.8 times smaller read
+    as a smear.  The defaults reproduce the previous behaviour exactly.
+    """
     # The framing is fixed BEFORE drawing, because `label3d` projects by hand and reads
     # the projection matrix: changing it afterwards would leave the labels where they
     # were.  The box ratio MUST follow the extent of the data, otherwise the vertical
@@ -289,9 +333,10 @@ def panel_geometry(ax, case: dict, tm) -> None:
     g = np.linspace(-0.62, 0.62, 2)
     gx, gy = np.meshgrid(g, g)
     ax.plot_surface(gx, gy, np.zeros_like(gx), color="0.82", alpha=0.6,
-                    edgecolor="0.5", linewidth=0.7, zorder=0)
+                    edgecolor="0.5", linewidth=0.7 * scale, zorder=0)
     a = np.linspace(0, 2 * np.pi, 200)
-    ax.plot(np.cos(a), np.sin(a), np.zeros_like(a), color="0.6", lw=0.9, zorder=1)
+    ax.plot(np.cos(a), np.sin(a), np.zeros_like(a), color="0.6", lw=0.9 * scale,
+            zorder=1)
 
     # The dome: the hemisphere directions coloured with the environment the radiance
     # comes from.  It is the same construction E is integrated with, and it makes visible
@@ -302,26 +347,36 @@ def panel_geometry(ax, case: dict, tm) -> None:
     # out against the horizon are not a rendering defect, they are grazing directions
     # that carry almost nothing; the hemisphere's silhouette is held by the equator
     # circle anyway.
-    dome = fibonacci_hemisphere(S_DOME)
-    ax.scatter(dome[:, 0] * 1.02, dome[:, 1] * 1.02, dome[:, 2] * 1.02,
-               s=DOME_S * dome[:, 2], c=tm(sky(dome, case["sun_dir"])),
-               depthshade=False, alpha=0.9, linewidths=0, zorder=2)
+    if dome:
+        d = fibonacci_hemisphere(n_dome)
+        ax.scatter(d[:, 0] * 1.02, d[:, 1] * 1.02, d[:, 2] * 1.02,
+                   s=DOME_S * scale ** 2 * d[:, 2], c=tm(sky(d, case["sun_dir"])),
+                   depthshade=False, alpha=0.9, linewidths=0, zorder=2)
     # The sun drawn separately: among the dome dots it would be a detail of a few
     # samples, and instead it is the reason L_1 and L_2 do not coincide.  Larger radius
     # than the cone samples that fall on top of it: it is the 3D depth ordering that
     # decides who covers whom.
-    ax.scatter(*(case["sun_dir"] * 1.07)[:, None], s=300, marker="o",
-               color=tm(sky(case["sun_dir"], case["sun_dir"])),
-               edgecolor=C_DIFF, linewidth=1.6, depthshade=False, zorder=3)
+    if sun:
+        ax.scatter(*(case["sun_dir"] * 1.07)[:, None], s=300 * scale ** 2, marker="o",
+                   color=tm(sky(case["sun_dir"], case["sun_dir"])),
+                   edgecolor=C_DIFF, linewidth=1.6 * scale, depthshade=False, zorder=3)
 
     # Incoming arrows scattered over the dome: the irradiance collects the whole
     # hemisphere.  Those that would fall inside a cone are skipped, it is already full there.
-    for d in fibonacci_hemisphere(13):
-        if d[2] < 0.25 or any(d @ c["r"] > np.cos(np.radians(case["half"] + 14))
-                              for c in case["cams"]):
-            continue
-        ax.quiver(*(d * 0.90), *(-d * 0.26), color=C_DIFF, lw=1.4,
-                  arrow_length_ratio=0.40, alpha=0.95, zorder=3)
+    if arrows:
+        for d in fibonacci_hemisphere(13):
+            if d[2] < 0.25 or any(d @ c["r"] > np.cos(np.radians(case["half"] + 14))
+                                  for c in case["cams"]):
+                continue
+            ax.quiver(*(d * 0.90), *(-d * 0.26), color=C_DIFF, lw=1.4 * scale,
+                      arrow_length_ratio=0.40, alpha=0.95, zorder=3)
+
+
+# ────────────────────────────────────────────────────────── panel (a), in 3D
+def panel_geometry(ax, case: dict, tm) -> None:
+    n = case["n"]
+    draw_scene_base(ax, case, tm)
+
     # The two captions live in axes coordinates and not in the scene: inside the dome
     # every free 3D position lands on n or on one of the R's.
     ax.text2D(0.12, 0.755, r"$E$:  the whole hemisphere", color=C_DIFF,
@@ -389,6 +444,77 @@ def panel_geometry(ax, case: dict, tm) -> None:
     ax.plot(arc[:, 0], arc[:, 1], arc[:, 2], color=C_INK, lw=1.1, zorder=6)
     label3d(ax, arc[len(arc) // 2] * 1.16, r"$\Theta/2$", color=C_INK, fontsize=14,
             va="center", bbox=HALO)
+
+
+# ─────────────────────────── the idea panel: the same scene, told in words
+def panel_idea(ax, case: dict, tm) -> None:
+    """The overview figure of Section 3.1 (Idea).
+
+    Same scene as `panel_geometry`, stripped of every symbol: no Theta/2 arc,
+    no v_j/R_j labels, because the section asks its three questions in words
+    (what colour does each camera see, what light does the patch gather
+    diffusely, what light arrives around each mirror direction) and the
+    drawing answers in the same register.  It adds the one thing the model
+    panel leaves out: the colour each camera actually records, drawn as a
+    swatch above the camera glyph, the closest the figure can get to "what
+    camera A sees".  The two swatches differ, and the environment on the dome
+    shows why: the bright spot falls inside one cone and outside the other.
+    """
+    n = case["n"]
+    draw_scene_base(ax, case, tm)
+
+    # The diffuse caption, in words instead of E.  Not in the model panel's
+    # top-left slot: that is where camera 1's swatch and its label live here,
+    # so it moves to the free band under the equator, still in axes
+    # coordinates because the dome leaves no free 3D anchor.
+    ax.text2D(0.22, 0.115, "light gathered over\nthe whole hemisphere",
+              color=C_DIFF, fontsize=12, transform=ax.transAxes,
+              linespacing=1.2)
+
+    ax.quiver(0, 0, 0, *n, color=C_INK, lw=2.0, arrow_length_ratio=0.12, zorder=6)
+    label3d(ax, n * 1.04 + np.array([0.02, 0.10, 0.02]), "normal",
+            color=C_INK, fontsize=11.5, bbox=HALO)
+    ax.scatter([0], [0], [0], color=C_INK, s=22, zorder=7)
+    label3d(ax, (0.20, -0.12, 0.02), "texel", color=C_INK, fontsize=12, bbox=HALO)
+
+    for k, c in enumerate(case["cams"], start=1):
+        v, r, col = c["v"], c["r"], c["color"]
+        # Same grammar as the model panel: dashed thin view ray, solid thick
+        # reflected ray, so the two figures read as the same scene.
+        ax.plot([0, v[0]], [0, v[1]], [0, v[2]], color=col, lw=1.5, ls=(0, (4, 2)),
+                zorder=6)
+        ax.quiver(0, 0, 0, *r, color=col, lw=2.2, arrow_length_ratio=0.12, zorder=6)
+        ax.scatter([v[0] * 1.13], [v[1] * 1.13], [v[2] * 1.13], marker="s", s=85,
+                   color=col, depthshade=False, zorder=8)
+
+        # The recorded colour, straight from build_case: diffuse term plus this
+        # camera's specular term, through the shared tonemap.  Edge in the
+        # camera's colour so the swatch reads as belonging to that camera.
+        sw = v * 1.13 + np.array([0.0, 0.0, 0.22])
+        ax.scatter([sw[0]], [sw[1]], [sw[2]], marker="s", s=240, color=[tm(c["C"])],
+                   edgecolor=col, linewidth=1.6, depthshade=False, zorder=9)
+        label3d(ax, sw + np.array([0.0, 0.0, 0.15]), f"camera {k} sees",
+                color=col, fontsize=12, ha="center", va="bottom", bbox=HALO)
+
+        cd = cone_directions(r, case["half"], CONE_DOTS)
+        ax.scatter(cd[:, 0] * 1.03, cd[:, 1] * 1.03, cd[:, 2] * 1.03, s=CONE_S,
+                   color=col, edgecolor="white", linewidth=0.5,
+                   depthshade=False, zorder=5)
+        rim = circle_on_sphere(r, case["half"], 90)
+        t = np.linspace(0.0, 1.0, 2)[:, None, None]
+        cone = t * rim[None, :, :]
+        ax.plot_surface(cone[..., 0], cone[..., 1], cone[..., 2], color=col,
+                        alpha=0.15, linewidth=0, shade=False, zorder=4)
+        ax.plot(rim[:, 0], rim[:, 1], rim[:, 2], color=col, lw=1.6, zorder=5)
+
+    # One cone caption is enough: doubled it would only say the same twice.
+    # For camera 1's cone, and in axes coordinates below it rather than
+    # anchored past the rim: past camera 2's rim the halo washed out camera
+    # 1's glyph, which sits near that cone (see the comment on CAMS), and
+    # past camera 1's rim it covered the cone and the sun inside it.
+    ax.text2D(0.865, 0.16, "light arriving around\nthe mirror direction",
+              color=case["cams"][0]["color"], fontsize=11.5, ha="center",
+              transform=ax.transAxes, linespacing=1.2)
 
 
 # ───────────────────────── figure 2: top-hat kernel against GGX lobe
@@ -594,6 +720,20 @@ def figure(case: dict, out: Path) -> None:
     print(f"  + {out}")
 
 
+def figure_idea(case: dict, out: Path) -> None:
+    """Same canvas geometry as `figure`, see the comments there."""
+    tm = make_tonemap(case)
+    fig = plt.figure(figsize=(7.0, 5.0))
+    ax = fig.add_axes([0.0, -0.07, 1.0, 1.10], projection="3d")
+    panel_idea(ax, case, tm)
+    fig.text(0.5, 0.84, "One texel, two cameras, and the light that reaches it",
+             ha="center", fontsize=14, color=C_INK)
+    fig.savefig(out, dpi=190, bbox_inches="tight")
+    plt.close(fig)
+    trim_white(out)
+    print(f"  + {out}")
+
+
 def report(case: dict) -> None:
     """Checks that the figure is showing what it says it shows."""
     e = case["E"]
@@ -625,18 +765,24 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--figures", default="model,kernel",
-                    help="which figures to write, comma-separated: model, kernel")
+    ap.add_argument("--figures", default="model,kernel,idea",
+                    help="which figures to write, comma-separated: "
+                         "model, kernel, idea")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     want = {f.strip() for f in args.figures.split(",") if f.strip()}
-    if not want <= {"model", "kernel"}:
-        ap.error(f"unknown figures: {sorted(want - {'model', 'kernel'})}")
+    if not want <= {"model", "kernel", "idea"}:
+        ap.error(f"unknown figures: {sorted(want - {'model', 'kernel', 'idea'})}")
 
-    if "model" in want:
+    if want & {"model", "idea"}:
         case = build_case()
-        figure(case, out / "pbr_model.png")
+        if "model" in want:
+            figure(case, out / "pbr_model.png")
+        if "idea" in want:
+            figure_idea(case, out / "idea_texel.png")
+        # One report for both figures: they draw the same case, so the checks
+        # and the printed numbers are shared.
         report(case)
     if "kernel" in want:
         kcase = build_kernel_case()

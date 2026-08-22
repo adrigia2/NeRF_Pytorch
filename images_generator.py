@@ -4024,11 +4024,19 @@ if __name__ == "__main__":
         #     # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
         #     skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # ),
+        # SceneConfig(
+        #     name             = "TableAndOtherInteriorWithSpecular",
+        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
+        #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+        #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
+        #     # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
+        #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+        # ),
         SceneConfig(
-            name             = "TableAndOtherInteriorWithSpecular",
+            name             = "TableAndOtherInteriorWithSpecularFlatNormal",
             transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
             model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
-            external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
+            external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal_flat.exr",
             # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
             # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         ),
@@ -4094,7 +4102,7 @@ if __name__ == "__main__":
         # ("exp_mse",            "exp",      "mse")
     ]
     DECAYS     = (0.2,)
-    SWEEP_ROOT = "D:/tesi_output/handoff_check"
+    SWEEP_ROOT = "D:/tesi_output/test_flat_normal"
 
     for name, act, loss in EXPERIMENTS:
         for decay in DECAYS:
