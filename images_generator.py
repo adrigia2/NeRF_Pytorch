@@ -3734,12 +3734,68 @@ def run_pipeline(
         return result
 
     finally:
+        try:
+            _append_run_timings(
+                cfg, timer.timings,
+                "ok" if sys.exc_info()[0] is None
+                else f"failed:{sys.exc_info()[0].__name__}")
+        except Exception as exc:                              # noqa: BLE001
+            print(f"  !  run_timings.jsonl not written: {exc}")
         logger.close()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-run manifest and multi-scene runner
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _append_run_timings(cfg: PipelineConfig, timings: "dict[str, float]",
+                        status: str = "ok") -> None:
+    """Append one record of the stage durations to <assets_dir>/run_timings.jsonl.
+
+    The durations already exist: StageTimer measures every step and sub-step. They only
+    ever reached TensorBoard, and log_timing_breakdown returns immediately when the
+    logger is disabled (monitoring.py), which is the case of every rerun launched from a
+    script. Without this the cost of a bake is measured and then thrown away.
+
+    assets_dir and not output_dir: with a ROI active the durations belong to the
+    sandbox, and the file of the full run has to stay the one measurement of the full
+    run. JSON Lines and not JSON: the append needs no read-modify-write, so a variant
+    that crashes cannot corrupt the records written before it, and a sweep of N variants
+    is N lines. Called from the finally of run_pipeline, so a run that dies halfway still
+    leaves the timings of the stages it completed.
+    """
+    rc = cfg.render
+    assets_dir, roi_tag = _roi_assets_dir(rc, Path(rc.output_dir))
+    record = {
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+        "status":    status,
+        "output_dir": rc.output_dir,
+        "roi_tag":   roi_tag,
+        "roi_rect":  list(rc.roi_rect) if rc.roi_rect else None,
+        # Same convention as the TensorBoard block above: the total is the sum of the
+        # top-level stages, so the two numbers mean the same thing.
+        "total_s":   sum(v for k, v in timings.items() if "/" not in k),
+        "steps":     {k: v for k, v in timings.items() if "/" not in k},
+        "substeps":  {k: v for k, v in timings.items() if "/" in k},
+        "params": {
+            "ium_texture_size":        list(rc.ium_texture_size),
+            "render_irradiance":       rc.render_irradiance,
+            "irradiance_sample_side":  rc.irradiance_sample_side,
+            "precompute_indirect":     rc.precompute_indirect,
+            "indirect_sample_side":    rc.indirect_sample_side,
+            "indirect_tile_size":      rc.indirect_tile_size,
+            "precompute_spec_cone":    rc.precompute_spec_cone,
+            "spec_cone_scheme":        rc.spec_cone_scheme,
+            "spec_cone_shared_samples": rc.spec_cone_shared_samples,
+            "nerf_num_iters":          cfg.nerf_num_iters,
+        },
+    }
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    with open(assets_dir / "run_timings.jsonl", "a", encoding="utf-8") as fh:
+        print(json.dumps(record, ensure_ascii=False, default=str), file=fh)
+    print(f"  timings saved -> {assets_dir / 'run_timings.jsonl'}  "
+          f"({record['total_s']:.1f} s total)")
+
 
 def _write_run_manifest(cfg: PipelineConfig, scene: SceneConfig, run_note: str) -> None:
     """Write run_manifest.json in output_dir: full config + timestamp + note."""

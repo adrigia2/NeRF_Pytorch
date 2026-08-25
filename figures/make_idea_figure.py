@@ -1,18 +1,25 @@
 #!/usr/bin/env python
-"""make_idea_figure.py -- the six-panel storyboard of Section 3.1 (Idea).
+"""make_idea_figure.py -- the storyboard of Section 3.1 (Idea).
 
     python make_idea_figure.py --out ../../Doc/images
     python make_idea_figure.py --out ../../figure_review/idea --register 2d
 
-Writes the same six panels twice, once per drawing register, into `<out>/idea-2d/`
-and `<out>/idea-3d/`, so the two can be compared on the compiled page and one picked:
+Writes the panels once per drawing register, into `<out>/idea-2d/` and `<out>/idea-3d/`,
+so the two can be compared on the compiled page and one picked:
 
+  idea_visibility.png    one texel, four cameras: two contribute, two are discarded
   idea_diffuse.png       one texel, two cameras, the two recorded colours EQUAL
   idea_glossy.png        the same scene with x lowered, the two colours DIFFERENT
   idea_hemisphere.png    the light the patch gathers from the whole sky, no cameras
   idea_cones.png         the light gathered around each camera's mirror direction
   idea_recap_diffuse.png the diffuse patch with the hemisphere: the whole story
   idea_recap_both.png    the other patch: hemisphere and cones, both needed
+
+The first panel exists in the 2D register ONLY (`registers` in `PANEL_SPEC`): seen in
+perspective the blocker sits on top of the texel instead of showing that it hides it
+from one camera and not from the others.  `\ideaset` therefore has to stay on
+`idea-2d` for as long as Section 3.1 shows that panel; switching to `idea-3d` leaves
+that one figure on the `example-image` placeholder rather than failing the build.
 
 The section asks its question in words and the figure has to answer in the same
 register, so there is not a symbol on it.  What keeps it honest is that every colour
@@ -48,7 +55,7 @@ import _paths  # noqa: F401
 from make_pbr_model_diagram import (CAMS, CONE_S, C_DIFF, C_INK, HALO, THETA,
                                     X_DIFFUSE, build_case, circle_on_sphere,
                                     cone_directions, draw_scene_base, label3d,
-                                    luminance, sky, terms)
+                                    luminance, sky, sph, terms)
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle, Wedge
@@ -116,6 +123,39 @@ CAMS_2D = (
 )
 VIEW_CONE_MARGIN = 8.0          # degrees of clearance the checks require
 
+# The two ways of losing a camera, one per side of the drawing, so the panel cannot be
+# read as if the reason depended on which way the camera lies.  Camera 3 stays INSIDE
+# the grazing threshold: its only reason to be discarded is the blocker, which is what
+# keeps the two rejections distinguishable at a glance.  Camera 4 has nothing in front
+# of it at all and is lost to the angle alone.  `report` asserts both halves of that
+# sentence instead of trusting these numbers.
+# The blocker has to stand between the texel and the camera it hides, so that camera can
+# only be the one BELOW an accepted one: on the left camera 1 already sits low, and a
+# blocker there would hide the texel from it first.  That leaves camera 3 under camera 2
+# on the right, in the window between it and the grazing threshold, and the sun sits in
+# the middle of that window: at 62 degrees the glyph landed on top of it.  Hence 70, and
+# an assert in `report` so the collision cannot come back unnoticed.
+CAMS_2D_OUT = (
+    dict(theta=70.0, phi=0.0,   name="camera 3", tag="blocked",
+         tag_dxy=(0.08, 0.0), label_dxy=(0.0, -0.14), label_va="top"),
+    dict(theta=84.0, phi=180.0, name="camera 4", tag="edge-on",
+         tag_at=0.42, tag_dxy=(0.0, 0.07),
+         label_dxy=(0.10, 0.10), label_ha="left"),
+)
+C_OUT_2D = "#8894a1"            # grey-blue of everything that does not contribute
+
+# The piece of scene that hides the texel from camera 3.  Slightly tapered so that it
+# reads as geometry and not as a chart element.  Which camera it blocks is COMPUTED, by
+# `hit_polygon`, and checked in `report`: a figure whose blocker is a line stopped by
+# hand can claim anything.
+OCCLUDER = np.array([(0.42, 0.0), (0.62, 0.0), (0.60, 0.46), (0.44, 0.40)])
+
+# The angle beyond which the color pass drops a camera, the one fig:grazing-cull draws.
+# Copied and not imported at module level, because importing make_geometry_diagrams runs
+# `matplotlib.use("Agg")` after pyplot is already loaded; `report` imports it late and
+# asserts that the two have not drifted apart.
+GRAZING_DEG = 75.0
+
 X_MATTE = 1.0                   # panels (a) and (e): C_1 == C_2 by construction
 X_GLOSSY = X_DIFFUSE            # panels (b) and (f): the case pbr_model.png draws
 
@@ -134,7 +174,10 @@ REGISTERS = ("2d", "3d")
 # texel is what makes the drawing read as a reflection at all.  What that costs is a
 # view ray passing near the other camera's cone, and `report` measures the clearance
 # instead of leaving it to a comment.
+#   occlusion the cameras that are discarded, with the blocker that discards one
+#   registers the registers the panel is drawn in, when it is not drawn in both
 PANEL_SPEC = {
+    "visibility":    dict(views=True, occlusion=True, registers=("2d",)),
     "diffuse":       dict(material="matte",  views=True),
     "glossy":        dict(material="glossy", views=True),
     "hemisphere":    dict(gather=True, cams=False),
@@ -148,7 +191,8 @@ PANELS = tuple(PANEL_SPEC)
 def spec(name: str) -> dict:
     """Panel settings with the defaults filled in."""
     return {"cams": True, "gather": False, "mirror": False, "views": False,
-            "material": None, **PANEL_SPEC[name]}
+            "material": None, "occlusion": False, "registers": REGISTERS,
+            **PANEL_SPEC[name]}
 
 
 # ────────────────────────────────────────────────────────── cases and materials
@@ -289,6 +333,87 @@ def camera_2d(ax, p, look, *, color, size, zorder=8) -> None:
                      p + d * 0.62 * size + n * 0.46 * size])
     for poly in (body, lens):
         ax.fill(poly[:, 0], poly[:, 1], color=color, zorder=zorder, lw=0)
+
+
+def hit_polygon(o, d, poly) -> float:
+    """Smallest t > 0 with `o + t*d` on the boundary of `poly`, inf when the ray misses.
+
+    Segment by segment, in the spirit of the `hit_*` helpers of make_geometry_diagrams:
+    the panel claims that one ray is stopped and the others are not, so where it stops
+    has to come out of an intersection and not out of a coordinate typed by hand.
+    """
+    o, d = np.asarray(o, float), np.asarray(d, float)
+    best = np.inf
+    for k in range(len(poly)):
+        a = np.asarray(poly[k], float)
+        e = np.asarray(poly[(k + 1) % len(poly)], float) - a
+        den = d[0] * e[1] - d[1] * e[0]
+        if abs(den) < 1e-12:                      # the ray is parallel to this edge
+            continue
+        w = a - o
+        t = (w[0] * e[1] - w[1] * e[0]) / den
+        s = (w[0] * d[1] - w[1] * d[0]) / den
+        if t > 1e-9 and -1e-9 <= s <= 1.0 + 1e-9:
+            best = min(best, t)
+    return best
+
+
+def occluder_2d(ax) -> None:
+    """The blocker, in the grey of the scene furniture.
+
+    Deliberately colourless: the only saturated inks on these panels belong to the
+    cameras and to the sky, and a blocker with a colour of its own would read as one
+    more actor of the model rather than as a piece of the object.
+    """
+    ax.fill(OCCLUDER[:, 0], OCCLUDER[:, 1], facecolor="0.70", edgecolor="0.45",
+            lw=1.1 * SCENE_SCALE, zorder=5)
+
+
+def rejected_cams_2d(ax, cams=CAMS_2D_OUT) -> None:
+    """The cameras that do not contribute, in grey, each showing the reason it is out.
+
+    The two rejections are drawn by two different devices, because they are two
+    different facts.  Camera 3's ray STOPS where it meets the blocker and carries a
+    cross there, and its continuation is drawn faintly BEHIND the blocker, so that the
+    ray reads as hidden by the geometry rather than as cut short by the draughtsman.
+    Camera 4's ray reaches the texel, because nothing is in its way: a cross on it would
+    claim a mechanism that is not the one at work, and what discards it is only how flat
+    it lies against the surface.
+    """
+    for c in cams:
+        v = p2(sph(c["theta"], c["phi"]))
+        pos = v * (R_SKY + 0.13)
+        t = hit_polygon((0.0, 0.0), v, OCCLUDER)
+        if np.isfinite(t):
+            hit = v * t
+            ax.plot([0.0, hit[0]], [0.0, hit[1]], color=C_OUT_2D,
+                    lw=1.5 * SCENE_SCALE, ls=(0, (4, 2)), zorder=6)
+            ax.plot([hit[0], pos[0]], [hit[1], pos[1]], color=C_OUT_2D,
+                    lw=1.5 * SCENE_SCALE, ls=(0, (4, 2)), alpha=0.35, zorder=4)
+            ax.scatter([hit[0]], [hit[1]], s=120 * SCENE_SCALE ** 2, marker="x",
+                       color=C_OUT_2D, linewidths=1.9 * SCENE_SCALE, zorder=9)
+            # Above the blocker rather than beside the cross: beside it the word lands
+            # in the wedge camera 2's view ray crosses, and it belongs to the blocker
+            # anyway.  Read off the polygon, so it follows if the blocker is reshaped.
+            anchor = np.array([OCCLUDER[:, 0].mean(), OCCLUDER[:, 1].max() + 0.06])
+        else:
+            ax.plot([0.0, pos[0]], [0.0, pos[1]], color=C_OUT_2D,
+                    lw=1.5 * SCENE_SCALE, ls=(0, (4, 2)), zorder=6)
+            anchor = v * c.get("tag_at", 0.5)
+        camera_2d(ax, pos, -v, size=0.19, color=C_OUT_2D)
+        # Neither name fits where the other four sit.  Camera 4 is so low that half of
+        # a centred name would run off the side the panel is allowed to bleed over, and
+        # the shared crop cannot give back what falls outside the canvas; camera 3 has
+        # the sun just inboard of it, and a name above the glyph reads as a caption of
+        # the sun instead of the camera.  So one goes to the right, the other below.
+        dx, dy = c.get("label_dxy", (0.0, 0.12))
+        ax.text(pos[0] + dx, pos[1] + dy, c["name"], color=C_OUT_2D, fontsize=FS,
+                ha=c.get("label_ha", "center"), va=c.get("label_va", "bottom"),
+                bbox=HALO, zorder=9)
+        tx, ty = c.get("tag_dxy", (0.0, 0.0))
+        ax.text(anchor[0] + tx, anchor[1] + ty, c["tag"], color=C_OUT_2D,
+                fontsize=FS - 1.5, ha="center", va="bottom", style="italic",
+                bbox=HALO, zorder=9)
 
 
 def scene_2d(ax, case: dict, tm, *, gather: bool, cones: bool) -> None:
@@ -451,6 +576,13 @@ def write_panel(name: str, register: str, case: dict, tm, out: Path) -> Path:
         # two more words to a panel that has to be read in a glance.
         kit["cams"](ax, case, views=s["views"], mirror=s["mirror"],
                     label=not s["material"])
+    if s["occlusion"]:
+        # 2D only, and `main` already filters on `registers`: the assert is here so that
+        # a panel moved to the 3D register by mistake fails loudly instead of quietly
+        # dropping the blocker it was built around.
+        assert register == "2d", "the occlusion panel is drawn in section only"
+        occluder_2d(ax)
+        rejected_cams_2d(ax)
     if s["material"]:
         draw_strip(fig, case, materials(case)[s["material"]], tm, register=register,
                    equal=s["material"] == "matte")
@@ -561,6 +693,44 @@ def report(cases: dict, tm, written: dict) -> None:
                 assert t + half <= 90.0, "2d: the cone crosses the horizon"
                 assert t > half, "2d: the cone crosses the zenith"
 
+            # The visibility panel claims that exactly one camera is behind the blocker
+            # and exactly one is past the grazing threshold.  Both halves are checked: a
+            # blocker that also clipped camera 2 would still LOOK right while making the
+            # panel say something else entirely, and a camera 3 past the threshold would
+            # be discarded twice over, which is the confusion the panel exists to avoid.
+            from make_geometry_diagrams import FIG_GRAZING
+            assert GRAZING_DEG == FIG_GRAZING["threshold_deg"], \
+                "the grazing threshold has drifted from the one fig:grazing-cull draws"
+            reach = R_SKY + 0.13
+            blocked_by_design = {"camera 3"}
+            grazing_by_design = {"camera 4"}
+            for c in tuple(case["cams"]) + CAMS_2D_OUT:
+                v = p2(sph(c["theta"], c["phi"]))
+                t = hit_polygon((0.0, 0.0), v, OCCLUDER)
+                blocked = bool(t < reach)
+                where = f"blocked at t = {t:.3f}" if blocked else "reaches the texel"
+                print(f"    {c['name']}: {c['theta']:.0f} deg from the normal, {where}")
+                assert blocked == (c["name"] in blocked_by_design), \
+                    f"2d: {c['name']} is on the wrong side of the blocker"
+                assert (c["theta"] > GRAZING_DEG) == (c["name"] in grazing_by_design), \
+                    f"2d: {c['name']} is on the wrong side of the grazing threshold"
+
+            glyphs = [p2(sph(c["theta"], c["phi"])) * reach
+                      for c in tuple(case["cams"]) + CAMS_2D_OUT]
+            gap = min(float(np.linalg.norm(a - b))
+                      for i, a in enumerate(glyphs) for b in glyphs[i + 1:])
+            print(f"    closest pair of camera glyphs: {gap:.3f} "
+                  f"(glyph side 0.19, needs > 0.30)")
+            assert gap > 0.30, "2d: two camera glyphs overlap"
+
+            # The bright spot of the sky is drawn ON the band, and a camera glyph sits
+            # just outside it: the two collide long before two glyphs do.  Covering the
+            # sun would hide the one feature the panels that follow are built around.
+            sun = p2(case["sun_dir"]) * (R_SKY - W_SKY * 0.5)
+            near = min(float(np.linalg.norm(g - sun)) for g in glyphs)
+            print(f"    closest camera glyph to the sun: {near:.3f} (needs > 0.25)")
+            assert near > 0.25, "2d: a camera glyph covers the sun"
+
         if reg in written:
             box, paths = written[reg]
             print(f"    {len(paths)} panels, shared crop {box[2] - box[0]}"
@@ -597,9 +767,17 @@ def main() -> int:
 
     written = {}
     for reg in want:
+        # Not every panel exists in every register.  Filtering here and not inside
+        # `write_panel` keeps `crop_shared` on a list it can actually union: given an
+        # empty one it would index a panel that was never written.
+        use = [p for p in panels if reg in spec(p)["registers"]]
+        if not use:
+            print(f"  register {reg}: none of the requested panels is drawn here, "
+                  f"skipped")
+            continue
         out = Path(args.out) / f"idea-{reg}"
         out.mkdir(parents=True, exist_ok=True)
-        paths = [write_panel(name, reg, cases[reg], tm, out) for name in panels]
+        paths = [write_panel(name, reg, cases[reg], tm, out) for name in use]
         box = crop_shared(paths, LAYOUT[reg]["bleed"])
         written[reg] = (box, paths)
         for p in paths:

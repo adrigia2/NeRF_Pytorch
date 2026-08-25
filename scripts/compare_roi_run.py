@@ -9,11 +9,15 @@ The criterion is not uniform, and the distinction is the informative content of 
   A  DETERMINISTIC, must be bit-identical.  Per-texel passes with no NeRF query:
      IUM, visibility, color texture, camera_texture, camera_mask, pixel_change,
      irradiance, n_views. A single difference here is a bug in the ROI.
-  B  STOCHASTIC by construction.  Everything that goes through query_radiance:
-     indirect and spec_cone. raw2outputs adds Gaussian noise to the density and
-     (nerf/rays.py:68, `noise = torch.randn_like(...) * raw_noise_std`) e
-     raw_noise_std comes from the checkpoint WITHOUT an eval guard, so two identical
-     executions of the same bake already give different maps.
+  B  NOT REPRODUCIBLE TO THE BIT.  Everything that goes through query_radiance:
+     indirect and spec_cone. The compact ray buffer is filled with atomicAdd
+     (deviceProgramsIndirect.cu, deviceProgramsSpecCone.cu), so the ray ORDER, and with
+     it the foreground/background split inside each query_radiance chunk, varies between
+     launches: two identical bakes agree to float32 rounding, not to the bit. Until
+     2026-08-12 the residue was far larger, because raw2outputs added Gaussian noise to
+     the density on every inference path with no eval guard; noise_std now defaults to 0
+     and only the training forward passes cfg.raw_noise_std (nerf/train.py). Maps baked
+     before that date therefore differ from a bake made today by a BIAS, not by noise.
   C  like B, propagated: maps derived from the PBR fit.
   D  like B, but passed through an argmin over 14 candidates: roughness and lobe_param
      jump from one candidate to another where two residuals nearly tie.
@@ -46,11 +50,11 @@ from pbr_solver import _ExrBandReader  # noqa: E402
 
 GROUP_DESC = {
     "A": "deterministic, bit-identical",
-    "B": "stochastic (raw_noise_std)",
+    "B": "NeRF-queried, not bit-reproducible",
     "C": "derived from the fit",
     "D": "argmin over candidates",
 }
-# Only group A has a threshold on the values: the others are stochastic in themselves.
+# Only group A has a threshold on the values: the others are not bit-reproducible.
 STRICT = {"A"}
 
 _SAMPLE_PER_BAND = 60_000    # for the percentiles of the relative error, without keeping everything in RAM
@@ -247,7 +251,7 @@ def main() -> int:
         ref_label = f"sandbox {args.reference} (same ROI → intrinsic noise)"
 
     print(f"Reference   : {ref}\n              {ref_label}")
-    print(f"Confrontata : {roi}")
+    print(f"Compared    : {roi}")
     print(f"ROI         : rect={fp.get('rect')}  {fp['texels']} texels  "
           f"on an IUM of {W}×{H}  (sha1 {fp['sha1'][:12]})")
 
@@ -256,10 +260,13 @@ def main() -> int:
         with open(manifest, encoding="utf-8") as fh:
             std = json.load(fh)["config"].get("nerf_raw_noise_std")
         if std:
-            print(f"\n  ⚠  nerf_raw_noise_std = {std}: raw2outputs aggiunge rumore "
-                  f"Gaussian noise to the density at EVERY NeRF query, with no eval guard\n"
-                  f"     (nerf/rays.py:68). Groups B/C/D are therefore stochastic in "
-                  f"themselves: use --reference <other-tag> for a yardstick.")
+            print(f"\n  ·  nerf_raw_noise_std = {std} in the manifest. It no longer "
+                  f"reaches inference: noise_std defaults to 0 in nerf/render.py and "
+                  f"only the\n     training forward passes it (fix of 2026-08-12). A map "
+                  f"in group B baked BEFORE that date carries the noise, and differs "
+                  f"from\n     one baked today by a bias rather than by noise: compare "
+                  f"it against a second sandbox (--reference <other-tag>), not against "
+                  f"the full run.")
     print(f"\n  Verdict on the values only for group A; for every group the "
           f"'outside the ROI must be zero' holds.\n")
 
@@ -314,7 +321,7 @@ def main() -> int:
         n = sum(s.n for s in sts)
         p50 = float(np.median([s.percentiles()[0] for s in sts]))
         p99 = max(s.percentiles()[1] for s in sts)
-        print(f"  gruppo {g} ({GROUP_DESC[g]}): {len(sts)} file, "
+        print(f"  group {g} ({GROUP_DESC[g]}): {len(sts)} files, "
               f"{100 * n_ex / max(n, 1):.4f}% bit-identical, "
               f"rel p50 median {p50:.2e}, rel p99 max {p99:.2e}, "
               f"max outside the ROI {max(s.max_outside for s in sts):.1e}")
@@ -324,7 +331,7 @@ def main() -> int:
         for m in missing[:10]:
             print(f"    · {m}")
         if len(missing) > 10:
-            print(f"    … e altri {len(missing) - 10}")
+            print(f"    … and {len(missing) - 10} more")
 
     if failures:
         print(f"\n✗ {len(failures)} controlli falliti:")
