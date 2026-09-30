@@ -985,7 +985,7 @@ class RenderConfig:
     # Sources from which ALL the source-dependent Step 3 outputs are produced.
     # Each source is processed in full and identically, under sources/{src}/:
     # color_texture/, camera_texture/, pixel_change/, albedo/, metallic/, roughness/,
-    # albedo_pbr/, pbr/. Inner names are NOT suffixed (the source is the folder name).
+    # base_color/, pbr/. Inner names are NOT suffixed (the source is the folder name).
     # The source-independent passes (ium, visibility, irradiance, spec_cone, indirect)
     # stay at the top level, shared.
     # "gt"   → ground-truth images
@@ -3461,7 +3461,7 @@ def _step4_reconstruction(
     sources/{src}/color_texture/, irradiance/ and ium/ already produced by Step 3, so
     it can be re-run on its own (run_step1/2/3=False, run_step4=True) to iterate on the
     reconstruction without re-baking the cones. It updates transforms_extended.json in
-    place with the metallic/roughness/albedo_pbr/albedo keys.
+    place with the metallic/roughness/base_color/albedo keys.
 
     With a ROI active it reads and writes inside the roi/<tag>/ sandbox, where Step 3
     left ium/, spec_cone/ and sources/ already restricted: no ROI logic is needed here,
@@ -3485,9 +3485,9 @@ def _step4_reconstruction(
         output_json = json.load(fh)
     ium_result_data: dict = output_json.get("ium", {})
 
-    # ── PBR maps (metallic / roughness from the spec-cone fit) ───────────────
+    # ── PBR maps (metallic / base colour / roughness from the spec-cone fit) ─
     # Run for EVERY source in color_texture_image_sources, under sources/{src}/.
-    # solve_pbr reads everything from disk (spec_cone/, camera_texture/, pixel_change/).
+    # solve_pbr reads everything from disk (spec_cone/, camera_texture/, irradiance/).
     if rc.render_pbr_maps:
         _t4_pbr = time.perf_counter()
         spec_meta = assets_dir / "spec_cone" / "spec_cone_meta.json"   # source-independent
@@ -3506,9 +3506,8 @@ def _step4_reconstruction(
                     pbr_out["metallic_path"], assets_dir_str)
                 ium_result_data[f"roughness_path_{src}"] = _as_relative_to(
                     pbr_out["roughness_path"], assets_dir_str)
-                if pbr_out.get("albedo_pbr_path"):
-                    ium_result_data[f"albedo_pbr_path_{src}"] = _as_relative_to(
-                        pbr_out["albedo_pbr_path"], assets_dir_str)
+                ium_result_data[f"base_color_path_{src}"] = _as_relative_to(
+                    pbr_out["base_color_path"], assets_dir_str)
                 # The returned dict also carries the full-resolution maps (~900 MiB):
                 # only the paths are needed here, and without the del they would stay
                 # alive throughout the next source.

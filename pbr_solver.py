@@ -1,22 +1,35 @@
-"""Multi-view PBR fit with hard-cutoff specular cones (a pure mean over the cone):
+"""Multi-view PBR fit with hard-cutoff specular cones (a pure mean over the cone),
+exported in the metal/roughness convention of Blender's Principled BSDF:
 
-    C_j = (a·x/π) · E + (1 − x) · L_j        (per channel c)
+    C_jc = D_c · E_c / π + S_c · L_jc          (per channel c)
 
     C_j   colour observed by camera j        (sources/{source}/camera_texture/<stem>.exr)
     E     view-independent hemispherical irradiance (irradiance/irradiance.exr
           + irradiance_indirect.exr when present; a shared input, not per-source).
-          Needed ONLY for the albedo: metallic and roughness do not require it.
-    a     diffuse albedo (unknown, RGB, in [0,1])
-    x     weight of the DIFFUSE term (x=1 → no view dependence);
-          the specularity/metallic is 1−x
+          Required: D, hence metallic and base colour, depend on it.
+    D     diffuse reflectance (RGB): the fraction of E re-emitted diffusely
+    S     specular reflectance (RGB): the colour of the reflection
     L_j   PURE solid-angle MEAN of the ambient radiance over the cone around the
           reflected ray (no cosθ_R weight). The solver does NOT reconstruct it: it
           reads it from the bake, which writes one RGB channel per candidate into
           spec_cone/cam_{j:03d}.exr (the "cones" format of images_generator.py).
           Candidates = mirror + one cone per aperture of the grid;
           roughness = aperture/180. Being a mean, L stays in radiance units at
-          EVERY aperture (the mirror included): metallic = 1−x is a specular
-          fraction homogeneous across the candidates.
+          EVERY aperture (the mirror included), so S is a reflectance homogeneous
+          across the candidates.
+
+(D, S) are six numbers per texel; the metal/roughness convention compresses them
+into four, a base colour b and a metallic m, through
+    D_c = (1−m) · b_c        S_c = F0_d · (1−m) + m · b_c        (F0_d = 0.04)
+i.e. a dielectric has a coloured diffuse and a grey 4% reflection, a metal no
+diffuse and a reflection tinted by b. These are the equations Blender renders, so
+(m, b) reproduces (D, S) there. m is solved on the channel means D̄, S̄ (metalness
+has no colour; the equations are linear in b, so they survive the averaging):
+    S̄ ≤ F0_d → m = 0,  else  u = 2·D̄ / (s + sqrt(s² − 4·F0_d·D̄)),  s = S̄+D̄,  m = 1−u
+(the stable form of the smaller root of F0_d·u² − s·u + D̄ = 0, the only one in
+[0,1]). With m known, b_c is the least-squares solution of its two equations:
+    b_c = [(1−m)·D_c + m·(S_c − F0_d·(1−m))] / [(1−m)² + m²]
+which reduces to D at m=0 and to S at m=1.
 
 The mean over the cone is closed by the bake (images_generator._cones_from_rings_*):
 here it is enough to know that a level's channel (cone_045deg — the name carries
@@ -27,21 +40,27 @@ Note: the resolution on the cone width is quantized by the bake's aperture grid
 (spec_cone_apertures_deg) — a deliberate choice, with no sub-grid refinement in
 this version.
 
-For each candidate r the model is a per-texel linear regression:
-    C_jc = α_c + β·L_jc        α_c = x·a_c·E_c/π  (intercept, per channel)
-                               β   = 1−x          (slope, shared across channels)
+For each candidate r the model is a per-texel, per-channel linear regression:
+    C_jc = α_c + β_c·L_jc      α_c = D_c·E_c/π  (intercept: the diffuse radiance)
+                               β_c = S_c        (slope: the specular reflectance)
 The diffuse term is identical for every view, so any variation of C between the
 cameras is attributable to L alone: centring on the per-camera means eliminates α
-(equivalent to working on the differences C_i − C_j) and gives β in closed form.
-Sufficient statistics, accumulated streaming, one camera at a time:
-    Sw = Σ w_j     SC_c = Σ w_j·C     SCC = Σ_{j,c} w_j·C²
-    SL_c(r) = Σ w_j·L     SLL(r) = Σ_{j,c} w_j·L²     SCL(r) = Σ_{j,c} w_j·C·L
-    VLL = SLL − Σ_c SL²/Sw    VCL = SCL − Σ_c SC·SL/Sw    VCC = SCC − Σ_c SC²/Sw
-    β*(r) = clip(VCL / VLL, 0, 1)
-    res(r) = (VCC − 2β·VCL + β²·VLL) / (3·n_views)   →   argmin over r
-From the winning candidate: x = 1−β,  α_c = (SC_c − β·SL_c)/Sw (≥ 0),
-    a_c = clip(π·α_c / (max(E_c, albedo_eps)·x), 0, 1);  x < X_EPS → a = 0
-(metal convention: a fully specular texel has no diffuse albedo).
+(equivalent to working on the differences C_i − C_j) and gives β_c in closed form,
+without E. Sufficient statistics, accumulated streaming, one camera at a time:
+    Sw = Σ w_j     SC_c = Σ w_j·C     SCC_c = Σ w_j·C²
+    SL_c(r) = Σ w_j·L     SLL_c(r) = Σ w_j·L²     SCL_c(r) = Σ w_j·C·L
+    VLL_c = SLL_c − SL_c²/Sw    VCL_c = SCL_c − SC_c·SL_c/Sw    VCC_c = SCC_c − SC_c²/Sw
+    β_c*(r) = clip(VCL_c / VLL_c, 0, 1)
+    res(r) = Σ_c (VCC_c − 2β_c·VCL_c + β_c²·VLL_c) / (3·n_views)   →   argmin over r
+The aperture is one per texel (the lobe shape is geometry, not colour), so the
+argmin runs on the residual summed over the channels. From the winning candidate:
+    α_c = max((SC_c − β_c·SL_c)/Sw, 0),   D_c = π·α_c / max(E_c, albedo_eps),
+    S_c = β_c,   SE_c = sqrt(RSS_c / max(n_views−2, 1) / VLL_c)
+where SE_c is the standard error of the slope: large where L barely changes
+between the views in that channel, i.e. where the specular colour is not measured.
+Until 2026-09-30 the slope was one β shared by the three channels (a VLL-weighted
+mean of the β_c) and was written as metallic: it was the achromatic specular
+reflectance, not the metalness, and the tint of a coloured metal leaked into α.
 
 RAM scales with neither the camera count nor the texture resolution: the outer
 loop is over BANDS of texels (blocks of whole scanlines, `tile_texels`) and the
@@ -54,37 +73,48 @@ per band instead of one per channel (at 4096² with 14 apertures the cone file h
 
 
 Validity:
-  - the lobe is reliable only where the specularity exceeds spec_threshold: below
-    that, roughness is set to 1.0 and the texel is flagged in pbr/r_valid.png.
+  - the lobe is reliable only where the mean specular reflectance S̄ exceeds
+    spec_threshold: below that, roughness is set to 1.0 and the texel is flagged
+    in pbr/r_valid.png.
+  - unsolvable texels (fewer than min_views cameras) are taken as diffuse: β = 0,
+    α = the mean of C across cameras, so D ≡ the classic Lambertian albedo,
+    m = 0 and b = D.
 
 Final maps, for the given `source` (call once per source to process: the outputs
 live under sources/{source}/ and the inner names are not suffixed):
 
-  <out>/sources/{source}/metallic/metallic.exr      = 1−x   (0=diffuse, 1=fully specular)
+  <out>/sources/{source}/metallic/metallic.exr      = m  (Principled "Metallic")
+  <out>/sources/{source}/base_color/base_color.exr  = b  (Principled "Base Color")
   <out>/sources/{source}/roughness/roughness.exr    = aperture/180 of the winning cone
     (0 = mirror), 1.0 elsewhere — a cone-width index, NOT a GGX α: a
     Disney-compliant texture needs an aperture→α calibration downstream
-  <out>/sources/{source}/albedo_pbr/albedo_pbr.exr  = a from the fit (diffuse albedo
-    with the per-view specular removed; it coexists with the classic Lambertian
-    albedo in <out>/sources/{source}/albedo/). Requires irradiance/irradiance.exr
-    on disk (irradiance_indirect.exr is added when present); if it is missing the
-    map is skipped with a warning. On unsolvable texels x=1 is assumed (diffuse,
-    α = the mean across cameras → a ≡ the classic Lambertian albedo).
 metallic and roughness are also written as metallic_rgb.exr / roughness_rgb.exr
 next to the originals (the same values on three float32 R/G/B channels, the
 convention of Blender's bakes) unless blender_rgb=False.
-Diagnostics in <out>/sources/{source}/pbr/: diffuse_weight.exr (x),
-diffuse_term.exr (α, the estimated diffuse radiance), lobe_param.exr (aperture of
-the winning cone in degrees, 0 = mirror), residual.exr, n_views.exr,
-r_valid.png, plus absolute-scale PNG previews.
+Diagnostics in <out>/sources/{source}/pbr/: spec_color.exr (S), diffuse_albedo.exr
+(D, not clipped above 1, so an underestimated E stays visible), diffuse_term.exr
+(α, the estimated diffuse radiance), slope_se.exr (SE_c), consistency.exr
+(mean_c |D−D̂| + |S−Ŝ|, how far (D, S) is from what (m, b) can represent: mixed
+materials, borders, a wrong E), lobe_param.exr (aperture of the winning cone in
+degrees, 0 = mirror), residual.exr, n_views.exr, r_valid.png, plus
+absolute-scale PNG previews.
+Before 2026-09-30 the solver wrote albedo_pbr/ (a = D/x) and pbr/diffuse_weight.exr
+(x) instead of base_color/: x no longer exists once the slope is per channel.
 
 Shared inputs (source-independent, not under sources/{source}/): spec_cone/,
-ium/ium_masks.exr, visibility/visibility.exr, irradiance/.
+ium/ium_masks.exr, visibility/visibility.exr, irradiance/ (required).
+
+`roi_rects` (CLI --roi, repeatable) restricts the fit to the union of rectangles
+[x0, y0, w, h] in IUM texels, ANDed with the IUM mask: bands with no active texel
+are skipped and every output is 0 outside. Being a per-texel fit, the texels inside
+get bit-identical values to a full run. Unlike the pipeline ROI (roi/<tag>/
+sandbox, Step 3 re-run), this reads the full-resolution Step 3 cache in place.
 
 Usage:
-    python pbr_solver.py <output_dir> [--source gt] [--cv-gate 0.05]
-                         [--spec-threshold 0.2] [--min-views 2] [--albedo-eps 1e-3]
+    python pbr_solver.py <output_dir> [--source gt] [--spec-threshold 0.2]
+                         [--min-views 2] [--albedo-eps 1e-3]
                          [--tile-texels 1048576] [--no-blender-rgb]
+                         [--roi X0 Y0 W H] [--roi ...]
 """
 
 from __future__ import annotations
@@ -102,9 +132,9 @@ from images_generator import (  # noqa: E402
 )
 from exr_to_blender_rgb import write_blender_rgb  # noqa: E402
 
-# Below this x the texel counts as fully specular: the diffuse albedo is not
-# defined (α/x → 0/0) and is written as 0 (the metal convention).
-X_EPS = 1e-3
+# Normal-incidence reflectance of a dielectric in the metal/roughness convention:
+# IOR 1.5, the default of Blender's Principled BSDF.
+F0_DIELECTRIC = 0.04
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -253,6 +283,104 @@ def read_cones(path: Path, apertures_deg, y0: int = 0,
 # Solver
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _fit_band(SC: np.ndarray, SCC: np.ndarray, SL: np.ndarray, SLL: np.ndarray,
+              SCL: np.ndarray, nv: np.ndarray, eps: float = 1e-12) -> dict:
+    """Closed-form per-channel fit of C_jc = α_c + β_c·L_jc(r) for every candidate r,
+    then the argmin over r of the residual summed over the channels.
+
+    Inputs are the band's sufficient statistics (float64): SC, SCC (T, 3);
+    SL, SLL, SCL (T, K, 3); nv (T,) the number of valid cameras. Pure, so the
+    synthetic test can drive it without EXRs. The (T, K, 3) temporaries are built
+    in place: at 1 M texels and K=14 each one is 336 MB.
+
+    Returns best_k (T,), beta (T, 3), alpha (T, 3), res (T,) the mean residual per
+    equation, se (T, 3) the standard error of each slope.
+    """
+    T = SC.shape[0]
+    Sw = np.maximum(nv.astype(np.float64), 1.0)[:, None, None]      # (T, 1, 1)
+
+    VLL = SL * SL
+    VLL /= Sw
+    np.subtract(SLL, VLL, out=VLL)
+    np.maximum(VLL, 0.0, out=VLL)
+
+    VCL = SC[:, None, :] * SL
+    VCL /= Sw
+    np.subtract(SCL, VCL, out=VCL)
+
+    VCC = np.maximum(SCC - SC * SC / Sw[:, 0], 0.0)                  # (T, 3)
+
+    beta = VCL / np.maximum(VLL, eps)
+    np.clip(beta, 0.0, 1.0, out=beta)
+
+    # RSS_c(r) = VCC_c − 2β_c·VCL_c + β_c²·VLL_c, clamped: cancellation can leave
+    # it a few ULP below zero.
+    rss = beta * VCL
+    rss *= -2.0
+    rss += beta * beta * VLL
+    rss += VCC[:, None, :]
+    np.maximum(rss, 0.0, out=rss)
+    del VCL
+
+    res_all = rss.sum(axis=-1) / np.maximum(3.0 * nv, 1.0)[:, None]  # (T, K)
+    best_k = np.argmin(res_all, axis=1).astype(np.int32)
+    idx = np.arange(T)
+
+    beta_b = beta[idx, best_k]                                       # (T, 3)
+    alpha = np.maximum((SC - beta_b * SL[idx, best_k]) / Sw[:, 0], 0.0)
+    dof = np.maximum(nv.astype(np.float64) - 2.0, 1.0)[:, None]
+    se = np.sqrt(rss[idx, best_k] / dof / np.maximum(VLL[idx, best_k], eps))
+    return {"best_k": best_k, "beta": beta_b, "alpha": alpha,
+            "res": res_all[idx, best_k], "se": se}
+
+
+def _metal_from_reflectances(D: np.ndarray, S: np.ndarray,
+                             f0_dielectric: float = F0_DIELECTRIC):
+    """(D, S) → (m, b, D̂, Ŝ) in the metal/roughness convention.
+
+    D, S: (..., 3) diffuse and specular reflectances. The model is
+        D_c = (1−m)·b_c        S_c = f0·(1−m) + m·b_c
+    m is solved once on the channel means (metalness has no colour, and averaging
+    the channels before solving keeps a dark channel of a coloured dielectric from
+    passing for metal): with u = 1−m, f0·u² − (S̄+D̄)·u + D̄ = 0. For S̄ > f0 exactly
+    one root lies in [0, 1] (f(0) = D̄ ≥ 0, f(1) = f0 − S̄ < 0), the smaller one,
+    written as 2·D̄ / (s + √Δ) to avoid the cancellation of (s − √Δ)/(2·f0) when D̄
+    is small. For S̄ ≤ f0 the reflection is no stronger than a dielectric's: m = 0.
+    b_c is then the least-squares solution of its two equations, clipped to [0,1].
+    D̂, Ŝ are what (m, b) reproduces: their distance from (D, S) is how far the
+    texel is from anything the convention can represent.
+    """
+    D = np.asarray(D, dtype=np.float64)
+    S = np.asarray(S, dtype=np.float64)
+    Dm = D.mean(axis=-1)
+    Sm = S.mean(axis=-1)
+    s = Sm + Dm
+    disc = np.maximum(s * s - 4.0 * f0_dielectric * Dm, 0.0)
+    u = 2.0 * Dm / np.maximum(s + np.sqrt(disc), 1e-30)
+    m = np.where(Sm > f0_dielectric, 1.0 - np.clip(u, 0.0, 1.0), 0.0)
+
+    um = (1.0 - m)[..., None]
+    mm = m[..., None]
+    b = (um * D + mm * (S - f0_dielectric * um)) / (um * um + mm * mm)
+    b = np.clip(b, 0.0, 1.0)
+    D_hat = um * b
+    S_hat = f0_dielectric * um + mm * b
+    return m, b, D_hat, S_hat
+
+
+def _roi_band_mask(roi_rects, y0: int, rows: int, W: int) -> "np.ndarray | None":
+    """Union of the ROI rectangles restricted to scanlines [y0, y0+rows) → (rows·W,)
+    bool, or None when no ROI is given."""
+    if not roi_rects:
+        return None
+    m = np.zeros((rows, W), dtype=bool)
+    for x0, ry0, w, h in roi_rects:
+        a, b = max(ry0, y0), min(ry0 + h, y0 + rows)
+        if a < b:
+            m[a - y0:b - y0, max(x0, 0):min(x0 + w, W)] = True
+    return m.reshape(-1)
+
+
 def solve_pbr(output_dir: str,
               source: str = "gt",
               spec_threshold: float = 0.2,
@@ -260,6 +388,7 @@ def solve_pbr(output_dir: str,
               albedo_eps: float = 1e-3,
               blender_rgb: bool = True,
               tile_texels: int = 1 << 20,
+              roi_rects=None,
               eps: float = 1e-12) -> dict:
     out = Path(output_dir)
     src_dir = out / "sources" / source     # source-dependent artefacts (camera_texture/, pixel_change/, PBR outputs)
@@ -317,19 +446,32 @@ def solve_pbr(output_dir: str,
         with _ExrBandReader(vis_path) as rd:
             vis_cols = [rd.names[j] for j in cams]
 
-    # Only the albedo needs this: the check sits outside the loop so the bands
-    # allocate nothing when the irradiance is missing.
+    # D = π·α/E, and metallic and base colour are built from D: without the
+    # irradiance nothing of the metal/roughness export can be computed.
     irr_path = out / "irradiance" / "irradiance.exr"
     ind_path = out / "irradiance" / "irradiance_indirect.exr"
-    has_irr  = irr_path.exists()
-    has_ind  = has_irr and ind_path.exists()
+    if not irr_path.exists():
+        raise FileNotFoundError(
+            f"{irr_path} not found: metallic and base colour need the irradiance "
+            f"(D = π·α/E). Run the irradiance pass of Step 3 first.")
+    has_ind  = ind_path.exists()
 
     cam_paths  = [src_dir / "camera_texture" / f"{stems[j]}.exr" for j in cams]
 
+    if roi_rects:
+        roi_rects = [tuple(int(v) for v in r) for r in roi_rects]
+        for r in roi_rects:
+            x0, y0, w, h = r
+            if len(r) != 4 or w <= 0 or h <= 0:
+                raise ValueError(f"ROI must be [x0, y0, w, h] with w, h > 0: {r!r}")
+            if x0 >= W or y0 >= H or x0 + w <= 0 or y0 + h <= 0:
+                raise ValueError(f"ROI {r!r} lies entirely outside the {W}x{H} texture")
+
     # ── Partition into bands of whole scanlines ──────────────────────────────
     # The fit is purely per-texel, so partitioning the texture does not change the
-    # result by a single bit; it changes only the peak RAM, which becomes
-    # ~tile_texels·n_cand·8B·20 instead of N·n_cand·8B·20.
+    # result by a single bit; it changes only the peak RAM. With the statistics
+    # kept per channel a band costs ~tile_texels·n_cand·3·8B·~10 (≈3-4 GiB at 1 M
+    # texels and 14 candidates) instead of N·n_cand·3·8B·~10.
     rows = max(1, int(tile_texels) // W)
     if rows >= 16:
         rows = (rows // 16) * 16      # aligned to the ZIP block: no double decompressions
@@ -339,20 +481,25 @@ def solve_pbr(output_dir: str,
     print(f"[pbr_solver] {N} texels, {len(cams)} cameras, "
           f"{n_cand} candidates ({K - 1} mean-cones + mirror)")
     print(f"             {n_tiles} bands of {rows} scanlines ({rows * W} texels)")
+    if roi_rects:
+        print(f"             ROI: {len(roi_rects)} rectangle(s) {roi_rects}")
 
-    # ── Full-resolution outputs (float32/int32/bool: ~870 MiB at 4096²) ──────
+    # ── Full-resolution outputs (float32/int32/bool) ─────────────────────────
     n_views    = np.zeros(N, dtype=np.int32)
-    diffuse_w  = np.zeros(N, dtype=np.float32)     # x
-    metallic   = np.zeros(N, dtype=np.float32)     # β = 1−x (specularity)
+    metallic   = np.zeros(N, dtype=np.float32)       # m
+    base_color = np.zeros((N, 3), dtype=np.float32)  # b
+    spec_color = np.zeros((N, 3), dtype=np.float32)  # S = β_c
+    diff_alb   = np.zeros((N, 3), dtype=np.float32)  # D = π·α/E (not clipped above)
+    slope_se   = np.zeros((N, 3), dtype=np.float32)  # SE_c
+    consist    = np.zeros(N, dtype=np.float32)
     lobe_param = np.zeros(N, dtype=np.float32)
     roughness  = np.zeros(N, dtype=np.float32)
     residual   = np.zeros(N, dtype=np.float32)
     r_valid    = np.zeros(N, dtype=bool)
     alpha      = np.zeros((N, 3), dtype=np.float32)
-    albedo_flat = np.zeros((N, 3), dtype=np.float32) if has_irr else None
 
-    tot_solvable = tot_rvalid = 0
-    best_counts  = np.zeros(n_cand, dtype=np.int64)
+    tot_active = tot_solvable = tot_rvalid = tot_metal = 0
+    best_counts = np.zeros(n_cand, dtype=np.int64)
 
     bar = _tile_bar(n_tiles, f"Fit PBR ({source})")
     for y0 in range(0, H, rows):
@@ -363,27 +510,30 @@ def solve_pbr(output_dir: str,
 
         mask_t = (_read_band(mask_path, y0, r) > 0.5) if has_mask \
             else np.ones(T, dtype=bool)
+        roi_t = _roi_band_mask(roi_rects, y0, r, W)
+        if roi_t is not None:
+            mask_t &= roi_t
 
-        # Band entirely outside the IUM mask: with no valid texel every output of
-        # the band would be zero, and the arrays are already zero-initialised, so
-        # skipping it is bit-identical. It avoids the two pixel_change reads and,
-        # above all, the loop over cameras, which is the expensive part (one band of
-        # camera_texture plus one of cam_XXX.exr per camera). It always pays off —
-        # the UV atlas has empty regions — but it is what makes a reconstruction
-        # restricted to a ROI nearly free.
+        # Band with no active texel (outside the IUM mask or the ROI): every output
+        # of the band would be zero, and the arrays are already zero-initialised, so
+        # skipping it is bit-identical. It avoids the loop over cameras, which is
+        # the expensive part (one band of camera_texture plus one of cam_XXX.exr per
+        # camera). It always pays off — the UV atlas has empty regions — but it is
+        # what makes a reconstruction restricted to a ROI nearly free.
         if not mask_t.any():
             bar.update(1)
             continue
+        tot_active += int(mask_t.sum())
 
         # A single read per band instead of one per camera.
         vis_t = (_read_band(vis_path, y0, r, vis_cols) > 0.5) if has_vis else None
 
-        # ── Streaming scan: one camera at a time, sufficient statistics ──────
+        # ── Streaming scan: one camera at a time, per-channel statistics ─────
         SC  = np.zeros((T, 3))             # Σ w·C          (candidate-independent)
-        SCC = np.zeros(T)                  # Σ w·C² pooled  (candidate-independent)
+        SCC = np.zeros((T, 3))             # Σ w·C²         (candidate-independent)
         SL  = np.zeros((T, n_cand, 3))     # Σ w·L          per candidate
-        SLL = np.zeros((T, n_cand))        # Σ w·L² pooled  per candidate
-        SCL = np.zeros((T, n_cand))        # Σ w·C·L pooled per candidate
+        SLL = np.zeros((T, n_cand, 3))     # Σ w·L²         per candidate
+        SCL = np.zeros((T, n_cand, 3))     # Σ w·C·L        per candidate
         nv_t = np.zeros(T, dtype=np.int32)
 
         for jj in range(len(cams)):
@@ -400,109 +550,99 @@ def solve_pbr(output_dir: str,
 
             nv_t += w_j
 
-            wf = w_j.astype(np.float64)
-            SC  += wf[:, None] * C_j
-            SCC += wf * (C_j * C_j).sum(axis=-1)
+            wf = w_j.astype(np.float64)[:, None]
+            SC  += wf * C_j
+            SCC += wf * C_j * C_j
             for c_idx in range(n_cand):
                 L = cones[:, c_idx]
-                SL[:, c_idx]  += wf[:, None] * L
-                SLL[:, c_idx] += wf * (L * L).sum(axis=-1)
-                SCL[:, c_idx] += wf * (C_j * L).sum(axis=-1)
+                SL[:, c_idx]  += wf * L
+                SLL[:, c_idx] += wf * L * L
+                SCL[:, c_idx] += wf * C_j * L
+            del cones
 
         solvable = mask_t & (nv_t >= min_views)
 
-        # ── Fit per candidate: centred regression in closed form ────────────
-        Sw  = np.maximum(nv_t.astype(np.float64), 1.0)
-        VLL = np.maximum(SLL - (SL ** 2).sum(axis=-1) / Sw[:, None], 0.0)
-        VCL = SCL - np.einsum("nc,nkc->nk", SC, SL) / Sw[:, None]
-        VCC = np.maximum(SCC - (SC ** 2).sum(axis=-1) / Sw, 0.0)
+        # ── Fit per candidate and channel, argmin over candidates ───────────
+        fit = _fit_band(SC, SCC, SL, SLL, SCL, nv_t, eps)
+        del SL, SLL, SCL
+        best_k = fit["best_k"]
+        fitted = solvable & np.isfinite(fit["res"])
 
-        beta_all = np.clip(VCL / np.maximum(VLL, eps), 0.0, 1.0)    # β = 1−x
-        res_all  = VCC[:, None] - 2.0 * beta_all * VCL + beta_all ** 2 * VLL
-        res_all /= np.maximum(3.0 * nv_t, 1.0)[:, None]  # mean residual per equation
+        # Unsolvable texels of the mask are diffuse: β = 0, α = mean of C across
+        # cameras ⇒ D ≡ the classic Lambertian albedo, m = 0, b = D.
+        Sw = np.maximum(nv_t.astype(np.float64), 1.0)[:, None]
+        beta_t  = np.where(fitted[:, None], fit["beta"], 0.0)
+        alpha_t = np.where(fitted[:, None], fit["alpha"], SC / Sw)
+        se_t    = np.where(fitted[:, None], fit["se"], 0.0)
+        alpha_t[~mask_t] = 0.0
+        beta_t[~mask_t]  = 0.0
+        se_t[~mask_t]    = 0.0
 
-        target    = solvable
-        best_k    = np.argmin(res_all, axis=1).astype(np.int32)
-        _idx      = np.arange(T)
-        best_res  = res_all[_idx, best_k]
-        best_beta = beta_all[_idx, best_k]
-
-        # ── Compose the band's outputs ──────────────────────────────────────
-        fitted = target & np.isfinite(best_res)
-
-        dw_t = np.zeros(T, dtype=np.float32)
-        dw_t[fitted] = (1.0 - best_beta[fitted]).astype(np.float32)
-
-        met_t = np.zeros(T, dtype=np.float32)
-        met_t[fitted] = best_beta[fitted].astype(np.float32)
+        # ── Reflectances → metal/roughness convention ───────────────────────
+        # Computed here from the band's float64 α/β: redoing it downstream from the
+        # saved float32 maps would change the last bits.
+        E = _read_band(irr_path, y0, r).astype(np.float64)
+        if has_ind:
+            E += _read_band(ind_path, y0, r).astype(np.float64)
+        D_t = np.pi * alpha_t / np.maximum(E, albedo_eps)
+        D_c = np.clip(D_t, 0.0, 1.0)
+        m_t, b_t, D_hat, S_hat = _metal_from_reflectances(D_c, beta_t)
+        cons_t = (np.abs(D_c - D_hat) + np.abs(beta_t - S_hat)).mean(axis=-1)
+        m_t[~mask_t] = 0.0
+        b_t[~mask_t] = 0.0
+        cons_t[~mask_t] = 0.0
 
         lobe_t = np.zeros(T, dtype=np.float32)
         lobe_t[fitted] = param_vals[best_k[fitted]]
 
-        # the lobe is reliable only with enough specularity; elsewhere roughness=1
-        rval_t = fitted & (met_t >= spec_threshold)
+        # the lobe is reliable only with enough specular reflectance; elsewhere roughness=1
+        rval_t = fitted & (beta_t.mean(axis=-1) >= spec_threshold)
         rgh_t  = np.where(mask_t, 1.0, 0.0).astype(np.float32)
         rgh_t[rval_t] = rough_vals[best_k[rval_t]]
 
         res_t = np.zeros(T, dtype=np.float32)
-        res_t[fitted] = best_res[fitted].astype(np.float32)
-
-        # ── Intercept α = x·a·E/π (the estimated diffuse radiance) ──────────
-        # x and α are complete over the whole mask: gated/unfittable texels are
-        # diffuse (x=1, α = mean of C across cameras ⇒ a ≡ classic Lambertian albedo)
-        C_bar = SC / Sw[:, None]
-        X_t   = np.ones(T)
-        X_t[fitted] = 1.0 - best_beta[fitted]
-        SL_best = SL[_idx, best_k]                                   # (T, 3)
-        alpha_t = C_bar.copy()
-        alpha_t[fitted] = ((SC[fitted] - best_beta[fitted, None] * SL_best[fitted])
-                           / Sw[fitted, None])
-        alpha_t = np.maximum(alpha_t, 0.0)
-        alpha_t[~mask_t] = 0.0
+        res_t[fitted] = fit["res"][fitted].astype(np.float32)
 
         n_views[sl]    = nv_t
-        diffuse_w[sl]  = dw_t
-        metallic[sl]   = met_t
+        metallic[sl]   = m_t.astype(np.float32)
+        base_color[sl] = b_t.astype(np.float32)
+        spec_color[sl] = beta_t.astype(np.float32)
+        diff_alb[sl]   = D_t.astype(np.float32)
+        slope_se[sl]   = se_t.astype(np.float32)
+        consist[sl]    = cons_t.astype(np.float32)
         lobe_param[sl] = lobe_t
         roughness[sl]  = rgh_t
         residual[sl]   = res_t
         r_valid[sl]    = rval_t
         alpha[sl]      = alpha_t.astype(np.float32)
 
-        # ── PBR albedo: a = π·α / (max(E_sky+E_ind, albedo_eps)·x) ──────────
-        # Computed here from the band's float64 α/x: redoing it downstream from the
-        # saved float32 α would change the last bits.
-        if has_irr:
-            E = _read_band(irr_path, y0, r).astype(np.float64)
-            if has_ind:
-                E += _read_band(ind_path, y0, r).astype(np.float64)
-            denom = np.maximum(E, albedo_eps)
-            x_col = np.maximum(X_t, X_EPS)[:, None]
-            alb_t = np.clip(np.pi * alpha_t / (denom * x_col), 0.0, 1.0)
-            alb_t[X_t < X_EPS] = 0.0    # fully specular: zero albedo
-            alb_t[~mask_t] = 0.0
-            albedo_flat[sl] = alb_t.astype(np.float32)
-
         tot_solvable += int(solvable.sum())
         tot_rvalid   += int(rval_t.sum())
+        tot_metal    += int((fitted & (m_t > 0.5)).sum())
         best_counts  += np.bincount(best_k[fitted], minlength=n_cand)
         bar.update(1)
     bar.close()
 
+    if roi_rects:
+        print(f"  active texels (IUM mask ∩ ROI): {tot_active}")
     print(f"  solvable texels: {tot_solvable}")
     for c_idx, (label, rough, _param) in enumerate(candidates):
         print(f"  candidate {label:>11} (roughness={rough:.3f}) → best for "
               f"{int(best_counts[c_idx])} texels")
-    print(f"  texels with a reliable r (metallic≥{spec_threshold}): {tot_rvalid}")
+    print(f"  texels with a reliable r (mean S≥{spec_threshold}): {tot_rvalid}")
+    print(f"  texels with metallic > 0.5: {tot_metal}")
 
-    # ── Final maps (dedicated folders, like the albedo) ───────────────────────
+    # ── Final maps (dedicated folders) ───────────────────────────────────────
     fmt = ImageFormat.OPENEXR
-    met_dir = src_dir / "metallic";  met_dir.mkdir(parents=True, exist_ok=True)
-    rgh_dir = src_dir / "roughness"; rgh_dir.mkdir(parents=True, exist_ok=True)
-    metallic_path  = (met_dir / "metallic.exr").resolve().as_posix()
-    roughness_path = (rgh_dir / "roughness.exr").resolve().as_posix()
+    met_dir = src_dir / "metallic";   met_dir.mkdir(parents=True, exist_ok=True)
+    rgh_dir = src_dir / "roughness";  rgh_dir.mkdir(parents=True, exist_ok=True)
+    bc_dir  = src_dir / "base_color"; bc_dir.mkdir(parents=True, exist_ok=True)
+    metallic_path   = (met_dir / "metallic.exr").resolve().as_posix()
+    roughness_path  = (rgh_dir / "roughness.exr").resolve().as_posix()
+    base_color_path = (bc_dir / "base_color.exr").resolve().as_posix()
     _save_layer(metallic.reshape(H, W), metallic_path, fmt, DataLayer.METALLIC)
     _save_layer(roughness.reshape(H, W), roughness_path, fmt, DataLayer.ROUGHNESS)
+    _save_layer(base_color.reshape(H, W, 3), base_color_path, fmt, DataLayer.ALBEDO)
 
     # R/G/B variant in the convention of Blender's bakes, next to the
     # single-channel originals (which stay the input of the internal readers).
@@ -518,10 +658,16 @@ def solve_pbr(output_dir: str,
     # ── Diagnostics ───────────────────────────────────────────────────────────
     pbr_dir = src_dir / "pbr"
     pbr_dir.mkdir(parents=True, exist_ok=True)
-    _save_layer(diffuse_w.reshape(H, W), (pbr_dir / "diffuse_weight.exr").as_posix(),
-                fmt, DataLayer.METALLIC)
+    _save_layer(spec_color.reshape(H, W, 3),
+                (pbr_dir / "spec_color.exr").as_posix(), fmt, DataLayer.ALBEDO)
+    _save_layer(diff_alb.reshape(H, W, 3),
+                (pbr_dir / "diffuse_albedo.exr").as_posix(), fmt, DataLayer.ALBEDO)
     _save_layer(alpha.reshape(H, W, 3),
                 (pbr_dir / "diffuse_term.exr").as_posix(), fmt, DataLayer.ALBEDO)
+    _save_layer(slope_se.reshape(H, W, 3),
+                (pbr_dir / "slope_se.exr").as_posix(), fmt, DataLayer.ALBEDO)
+    _save_layer(consist.reshape(H, W), (pbr_dir / "consistency.exr").as_posix(),
+                fmt, DataLayer.SPEC_CONE_R)
     _save_layer(lobe_param.reshape(H, W), (pbr_dir / "lobe_param.exr").as_posix(),
                 fmt, DataLayer.SPEC_CONE_R)
     _save_layer(residual.reshape(H, W), (pbr_dir / "residual.exr").as_posix(),
@@ -538,29 +684,12 @@ def solve_pbr(output_dir: str,
                     ).save(pbr_dir / "metallic_preview.png")
     Image.fromarray((np.clip(roughness, 0, 1).reshape(H, W) * 255).astype(np.uint8)
                     ).save(pbr_dir / "roughness_preview.png")
+    Image.fromarray((np.clip(base_color, 0, 1).reshape(H, W, 3) * 255).astype(np.uint8)
+                    ).save(pbr_dir / "base_color_preview.png")
 
-    # ── PBR albedo: a = π·α / (max(E_sky+E_ind, albedo_eps)·x) ───────────────
-    # The albedo comes straight out of the fit, with the per-view specular already
-    # removed; it coexists with the classic Lambertian albedo in
-    # <out>/sources/{source}/albedo/. It was computed band by band: here it is only written.
-    albedo_pbr_path = None
-    albedo_pbr = None
-    if has_irr:
-        albedo_pbr = albedo_flat.reshape(H, W, 3)
-
-        alb_dir = src_dir / "albedo_pbr"; alb_dir.mkdir(parents=True, exist_ok=True)
-        albedo_pbr_path = (alb_dir / "albedo_pbr.exr").resolve().as_posix()
-        _save_layer(albedo_pbr, albedo_pbr_path, fmt, DataLayer.ALBEDO)
-        Image.fromarray((albedo_pbr * 255).astype(np.uint8)
-                        ).save(pbr_dir / "albedo_pbr_preview.png")
-        print(f"✓ albedo_pbr: {albedo_pbr_path} (indirect: "
-              f"{'yes' if has_ind else 'no'})")
-    else:
-        print(f"    ⚠  albedo_pbr skipped: {irr_path} not found "
-              "(the irradiance pass is required)")
-
-    print(f"✓ metallic:  {metallic_path}")
-    print(f"✓ roughness: {roughness_path}")
+    print(f"✓ metallic:   {metallic_path}")
+    print(f"✓ base_color: {base_color_path} (indirect: {'yes' if has_ind else 'no'})")
+    print(f"✓ roughness:  {roughness_path}")
     if metallic_rgb_path and roughness_rgb_path:
         print(f"✓ Blender RGB variants: {Path(metallic_rgb_path).name}, "
               f"{Path(roughness_rgb_path).name}")
@@ -568,14 +697,17 @@ def solve_pbr(output_dir: str,
     return {
         "metallic_path": metallic_path,
         "roughness_path": roughness_path,
+        "base_color_path": base_color_path,
         "metallic_rgb_path": metallic_rgb_path,
         "roughness_rgb_path": roughness_rgb_path,
-        "albedo_pbr_path": albedo_pbr_path,
-        "albedo_pbr": albedo_pbr,
         "metallic": metallic.reshape(H, W),
         "roughness": roughness.reshape(H, W),
-        "diffuse_weight": diffuse_w.reshape(H, W),
+        "base_color": base_color.reshape(H, W, 3),
+        "spec_color": spec_color.reshape(H, W, 3),
+        "diffuse_albedo": diff_alb.reshape(H, W, 3),
         "diffuse_term": alpha.reshape(H, W, 3),
+        "slope_se": slope_se.reshape(H, W, 3),
+        "consistency": consist.reshape(H, W),
         "lobe_param": lobe_param.reshape(H, W),
         "residual": residual.reshape(H, W),
         "n_views": n_views.reshape(H, W),
@@ -585,26 +717,32 @@ def solve_pbr(output_dir: str,
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
-        description="PBR fit C_j = (a·x/π)·E + (1-x)·L_j(r) → "
-                    "metallic/roughness/albedo_pbr")
+        description="PBR fit C_jc = D_c·E_c/π + S_c·L_jc(r) → "
+                    "metallic/base_color/roughness")
     ap.add_argument("output_dir", help="the pipeline output_dir (holds spec_cone/, ...)")
     ap.add_argument("--source", type=str, default="gt",
                     help="source to process (sources/{source}/, e.g. gt or nerf)")
     ap.add_argument("--spec-threshold", type=float, default=0.2,
-                    help="minimum metallic for r to be reliable (below it: roughness=1)")
+                    help="minimum mean specular reflectance for r to be reliable "
+                         "(below it: roughness=1). The pipeline uses 0")
     ap.add_argument("--min-views", type=int, default=2,
                     help="minimum number of valid cameras per texel")
     ap.add_argument("--albedo-eps", type=float, default=1e-3,
-                    help="lower clamp on the irradiance in albedo_pbr")
+                    help="lower clamp on the irradiance in D = π·α/E")
     ap.add_argument("--tile-texels", type=int, default=1 << 20,
                     help="texels per band (rounded to whole scanlines): the peak "
                          "RAM scales with this, not with the resolution")
     ap.add_argument("--no-blender-rgb", action="store_true",
                     help="do not write the metallic_rgb/roughness_rgb variants "
                          "(R/G/B EXRs in the convention of Blender's bakes)")
+    ap.add_argument("--roi", type=int, nargs=4, action="append",
+                    metavar=("X0", "Y0", "W", "H"),
+                    help="restrict the fit to this rectangle of IUM texels; repeatable "
+                         "(union). Every output is 0 outside")
     args = ap.parse_args()
     solve_pbr(args.output_dir, source=args.source,
               spec_threshold=args.spec_threshold,
               min_views=args.min_views, albedo_eps=args.albedo_eps,
               blender_rgb=not args.no_blender_rgb,
-              tile_texels=args.tile_texels)
+              tile_texels=args.tile_texels,
+              roi_rects=args.roi)
