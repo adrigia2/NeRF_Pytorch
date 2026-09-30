@@ -44,6 +44,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
 plt.rcParams.update({"font.size": 13})
 
@@ -71,7 +72,11 @@ FIG_IUM       = dict(grid=(11, 11), z_start=0.95, z_end=-0.55,
                      view=(24.0, -60.0), size=(7.6, 5.4))
 FIG_GRAZING   = dict(threshold_deg=75.0, theta_ok=20.0, theta_no=82.0,
                      view=(14.0, -62.0), size=(7.4, 4.6))
-FIG_PROJ      = dict(fov_deg=36.0, near=0.62, cam=(1.30, -1.85, 1.15),
+# The field of view is narrow and the ground wide on purpose: at 36 degrees the frustum's
+# footprint covered 86% of the drawn plane, so "outside the frustum" was a miss by a few
+# degrees that no viewer could see.  At 22 it covers 44% and reads as a wedge, with unseen
+# ground on either side of it.
+FIG_PROJ      = dict(fov_deg=22.0, near=1.05, cam=(1.30, -1.85, 1.15), ground_half=1.45,
                      view=(20.0, 35.0), size=(7.8, 5.0))
 FIG_IRR       = dict(n_samples=72, sphere_c=(0.62, 0.05, 0.92), sphere_r=0.50,
                      view=(16.0, -62.0), size=(7.4, 5.0))
@@ -144,12 +149,22 @@ class Scene:
                      fontweight=weight, ha=ha, va=va, zorder=z)
         self._add(np.array([[xy[0] + dxy[0], xy[1] + dxy[1]]]))
 
-    def finish(self, pad=0.10):
+    def finish(self, pad=0.10, square=True):
+        """Fit the frame to what was drawn.
+
+        `square=False` fits each axis on its own instead of on the larger half-range.
+        The aspect stays equal either way, so nothing is distorted; what changes is that
+        a drawing much wider than it is tall no longer carries a band of empty paper
+        above and below it.  It is off by default only because the other four figures
+        were framed with it on.
+        """
         pts = np.vstack(self.pts)
         lo, hi = pts.min(axis=0), pts.max(axis=0)
-        c, r = 0.5 * (lo + hi), 0.5 * (hi - lo).max() * (1.0 + pad)
-        self.ax.set_xlim(c[0] - r, c[0] + r)
-        self.ax.set_ylim(c[1] - r, c[1] + r)
+        c, half = 0.5 * (lo + hi), 0.5 * (hi - lo) * (1.0 + pad)
+        r = half.max()
+        rx, ry = (r, r) if square else (half[0], half[1])
+        self.ax.set_xlim(c[0] - rx, c[0] + rx)
+        self.ax.set_ylim(c[1] - ry, c[1] + ry)
         self.ax.set_aspect("equal")
         self.ax.axis("off")
 
@@ -159,8 +174,8 @@ def new_scene(view, size):
     return fig, ax, Scene(ax, Projector(*view))
 
 
-def save(fig, sc, out: Path, note: str = "") -> None:
-    sc.finish()
+def save(fig, sc, out: Path, note: str = "", square: bool = True) -> None:
+    sc.finish(square=square)
     fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"  {out.name}{('  ' + note) if note else ''}")
@@ -412,6 +427,31 @@ def fig_grazing_cull(out: Path) -> None:
 
 # ── 3.10 -- Projection of the texel into the pixel ───────────────────────────
 
+def clip_square(poly, half: float):
+    """Sutherland-Hodgman clip of an xy polygon to [-half, half]^2.
+
+    The frustum's footprint on the ground runs to the horizon -- the top edge of a
+    36-degree cone from 1.15 above the plane leaves it at about 7 degrees, so it lands
+    some nine units away -- while the drawn ground is 1.15 across.  Without the clip the
+    figure has to zoom out until the geometry is a speck.
+    """
+    for axis, sign in ((0, +1), (0, -1), (1, +1), (1, -1)):
+        out, n = [], len(poly)
+        if n == 0:
+            return []
+        inside = lambda q: sign * q[axis] <= half + 1e-12          # noqa: E731
+        for i in range(n):
+            a, b = poly[i], poly[(i + 1) % n]
+            ia, ib = inside(a), inside(b)
+            if ia:
+                out.append(a)
+            if ia != ib:
+                da, db = sign * a[axis] - half, sign * b[axis] - half
+                out.append(a + (b - a) * (da / (da - db)))
+        poly = out
+    return poly
+
+
 def fig_color_texture(out: Path) -> None:
     p = FIG_PROJ
     cam = np.array(p["cam"], float)
@@ -422,7 +462,8 @@ def fig_color_texture(out: Path) -> None:
     w = h * 1.5
 
     fig, ax, sc = new_scene(p["view"], p["size"])
-    ground(sc, half=1.15)
+    half = p["ground_half"]
+    ground(sc, half=half)
 
     def pixel_of(P):
         """Where the segment P->camera crosses the image plane, and whether it lands
@@ -446,19 +487,50 @@ def fig_color_texture(out: Path) -> None:
             sc.text(X, "pixel", color, dxy=(0.02, 0.20), size=11, weight="bold")
         else:
             sc.line(P, cam, color, lw=1.8, ls=(0, (4, 3)), alpha=0.9, z=6)
-            sc.text(P, "outside the frustum", color, dxy=(-0.05, -0.22), size=11)
+            sc.text(P, "outside the frustum", color, dxy=(0.16, -0.20), size=11,
+                    ha="left")
 
+    # The frustum, and above all WHERE IT LANDS.  Four short edges to the near plane say
+    # "there is a camera"; what makes "outside the frustum" checkable instead of asserted
+    # is the region of the ground the camera can actually see, so the four corner rays are
+    # intersected with z = 0 and the footprint is drawn on the plane the two texels lie on.
+    corners, land = [], []
     for k in range(4):
-        sc.line(cam, rect[k], "#8894a1", lw=0.9, alpha=0.9, z=5)
-    sc.poly(rect, "#cfd8e2", alpha=0.55, edge="#5f6c79", lw=1.3, z=7)
-    draw_camera(sc, cam, f, r, u, size=0.11, z=8)
-    sc.text(c_near, "near plane", "#3c4750", dxy=(0.0, 0.30), size=11)
+        d = rect[k] - cam
+        t = hit_plane(cam, d)                     # the ray reaches the ground at t
+        if not np.isfinite(t):
+            continue
+        g = cam + d * t
+        corners.append(g)
+        if abs(g[0]) <= half and abs(g[1]) <= half:
+            land.append(g)
+    foot = clip_square([c[:2] for c in corners], half) if len(corners) == 4 else []
+    if len(foot) >= 3:
+        sc.poly([(q[0], q[1], 0.0) for q in foot], C_ACCEPT, alpha=0.13,
+                edge=C_ACCEPT, lw=1.6, z=1)
+    # The two corner rays that come down inside the drawn ground are carried all the way,
+    # so the pyramid visibly stands on the plane.  The other two leave the square and are
+    # left at the near plane: a segment stopping in mid-air reads as a stray line, and the
+    # footprint's own outline already says where the frustum goes.
+    for k in range(4):
+        sc.line(cam, rect[k], C_EDGE, lw=1.1, alpha=0.9, z=5)
+    for g in land:
+        sc.line(cam, g, C_EDGE, lw=1.4, alpha=0.95, z=5)
 
+    sc.poly(rect, "#cfd8e2", alpha=0.70, edge="#3c4750", lw=1.5, z=7)
+    draw_camera(sc, cam, f, r, u, size=0.11, z=8)
+    sc.text(c_near, "near plane", "#3c4750", dxy=(0.0, -0.30), size=11)
+
+    # Above the axes, in one row: with the frame fitted to the drawing there is no longer
+    # an empty corner inside it, and a legend over the geometry is worse than no legend.
     ax.legend(handles=[
         Line2D([], [], color=C_ACCEPT, lw=2.2, label="texel projects into a pixel"),
         Line2D([], [], color=C_REJECT, lw=2.0, ls=(0, (4, 3)), label="texel not seen"),
-    ], loc="upper left", frameon=False, fontsize=11)
-    save(fig, sc, out)
+        Patch(facecolor=C_ACCEPT, alpha=0.13, edgecolor=C_ACCEPT, lw=1.6,
+              label="what the camera sees on this plane"),
+    ], loc="lower left", bbox_to_anchor=(0.0, 1.005), ncol=3, frameon=False,
+        fontsize=11, columnspacing=1.6, handlelength=1.8)
+    save(fig, sc, out, square=False)
 
 
 # ── 3.11 -- Fibonacci hemisphere, direct against indirect ────────────────────

@@ -74,6 +74,16 @@ Three things that would break everything without a symptom
          Scenes/SwordShield Thesis/Blender/assets/hdrs/cobblestone_street_night_4k.exr
 3. The OBJ is already in the Blender frame: `wm.obj_import(forward_axis='Y', up_axis='Z')`
    gives an identity `matrix_world`.  No axis correction on the camera poses.
+
+-------------------------------------------------------------------------------
+The scene alone, without a render
+-------------------------------------------------------------------------------
+`--no-render` builds the scene and saves `scene.blend` without rendering a single frame:
+it is the mode for simply looking at the reconstructed material in Blender.  Paired with
+`--asset-dir`, everything the blend links to that does not already live in the output
+folder (the normal, the GT maps, the HDR) is copied there and the links are rewritten as
+relative, so the output tree can be moved, or handed over, as it is.
+`export_rerender_scenes.py` drives exactly this combination over a whole run.
 """
 from __future__ import annotations
 
@@ -339,6 +349,46 @@ def _prepare_textures(run_dir: Path, out_dir: Path, maps: dict,
     return resolved
 
 
+def _copy_asset(src, dst_dir):
+    """Copy `src` into `dst_dir`, reusing a copy already there with the same size.
+
+    The check is on the size alone.  These are the 800 MB EXRs of the bake and the HDRs:
+    files written once and never edited in place, for which hashing every one of them at
+    every invocation would cost more than the copy it saves.
+    """
+    import shutil
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / src.name
+    if dst.exists() and dst.stat().st_size == src.stat().st_size:
+        print(f"  = {dst.name} (already in the asset dir)")
+        return dst
+    shutil.copy2(src, dst)
+    print(f"  + {dst.name} ({dst.stat().st_size / 2 ** 20:.0f} MiB)")
+    return dst
+
+
+def _relocate_assets(maps: dict, skybox, asset_dir, out_dir):
+    """Bring under `asset_dir` everything the blend links to that is not already under
+    `out_dir`, and return the rewritten (maps, skybox).
+
+    The dilated maps already live in `<out>/textures/` and stay there: only what still
+    points into the repo gets copied, i.e. the normal, the GT maps and the HDR.  Together
+    with the relative paths written on the Blender side, this is what makes the output tree
+    movable: an absolute link into the repo would silently turn into a pink texture the
+    moment the folder is opened on another machine.
+    """
+    asset_dir = asset_dir.resolve()
+    out_dir = out_dir.resolve()
+    relocated = {}
+    for key, path in maps.items():
+        src = Path(path).resolve()
+        relocated[key] = str(src if out_dir in src.parents
+                             else _copy_asset(src, asset_dir))
+    sky = Path(skybox).resolve()
+    sky_out = sky if out_dir in sky.parents else _copy_asset(sky, asset_dir)
+    return relocated, sky_out
+
+
 def launcher() -> int:
     import argparse
     import subprocess
@@ -372,9 +422,19 @@ def launcher() -> int:
     ap.add_argument("--blender", default=DEFAULT_BLENDER)
     ap.add_argument("--save-blend", action="store_true", dest="save_blend",
                     help="also save scene.blend (unpacked: the textures stay linked)")
+    ap.add_argument("--no-render", action="store_true", dest="no_render",
+                    help="build the scene and save scene.blend without rendering a single "
+                         "frame (implies --save-blend)")
+    ap.add_argument("--asset-dir", default=None, dest="asset_dir",
+                    help="copy into DIR every texture and the skybox that live outside the "
+                         "output folder, and write the paths inside scene.blend as relative: "
+                         "that is what makes the output tree movable")
     ap.add_argument("--dry-run", action="store_true", dest="dry_run",
                     help="resolve everything and print the job without launching Blender")
     args = ap.parse_args()
+    if args.no_render:
+        # A run that renders nothing and saves nothing would do nothing at all.
+        args.save_blend = True
 
     run_dir = Path(args.run_dir).resolve()
     manifest_path = run_dir / "run_manifest.json"
@@ -421,15 +481,22 @@ def launcher() -> int:
         stems = [s for s in stems if s in set(args.frames)]
     if args.limit > 0:
         stems = stems[:args.limit]
-    todo = stems if args.force else [s for s in stems if not (out_images / f"{s}.exr").exists()]
-    skipped = len(stems) - len(todo)
-    print(f"frames    {len(todo)} to render"
-          + (f", {skipped} already on disk (--force to redo them)" if skipped else ""))
-    if not todo:
-        print("nothing to do.")
-        return 0
+    if args.no_render:
+        todo = []
+        print("frames    0 (--no-render: only the scene is built)")
+    else:
+        todo = stems if args.force else [s for s in stems
+                                         if not (out_images / f"{s}.exr").exists()]
+        skipped = len(stems) - len(todo)
+        print(f"frames    {len(todo)} to render"
+              + (f", {skipped} already on disk (--force to redo them)" if skipped else ""))
+        if not todo:
+            print("nothing to do.")
+            return 0
 
-    out_images.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not args.no_render:
+        out_images.mkdir(parents=True, exist_ok=True)
     if args.materials == "pbr":
         print("reconstructed material:")
         _report_material_stats(run_dir, resolved["maps"])
@@ -437,11 +504,16 @@ def launcher() -> int:
     maps = _prepare_textures(run_dir, out_dir, resolved["maps"],
                              resolved["reconstructed"], args.dilate)
 
+    skybox_job = skybox
+    if args.asset_dir:
+        print("assets:")
+        maps, skybox_job = _relocate_assets(maps, skybox, Path(args.asset_dir), out_dir)
+
     job = {
         "run_dir": str(run_dir),
         "transforms": str(tf_path),
         "model": str(model),
-        "skybox": str(skybox),
+        "skybox": str(skybox_job),
         "materials": args.materials,
         "source": args.source,
         "maps": maps,
@@ -451,6 +523,8 @@ def launcher() -> int:
         "device": args.device,
         "no_normal": args.no_normal,
         "save_blend": args.save_blend,
+        "no_render": args.no_render,
+        "relative_paths": bool(args.asset_dir),
         "out_dir": str(out_dir),
         "frames": todo,
         "script_dir": str(Path(__file__).resolve().parent),
@@ -474,6 +548,10 @@ def launcher() -> int:
     print(f"\nBlender exited with {rc} after {dt / 60.0:.1f} min")
     if rc != 0:
         return rc
+
+    if args.no_render:
+        print(f"scene     {out_dir / 'scene.blend'}")
+        return 0
 
     done = sorted(p.name for p in out_images.glob("*.exr"))
     print(f"{len(done)} images in {out_images}")
@@ -659,14 +737,20 @@ def blender_main(job_path: str) -> None:
 
     out_dir = Path(job["out_dir"])
     out_images = out_dir / "images"
-    out_images.mkdir(parents=True, exist_ok=True)
+    if job["frames"]:
+        out_images.mkdir(parents=True, exist_ok=True)
 
     tf = load_transforms(job["transforms"])
     intr = tf.intrinsics
     wanted = set(job["frames"])
     frames = [f for f in tf.frames if Path(f.file_path).stem in wanted]
-    print(f"[rerender] {len(frames)} frames, {intr.w}x{intr.h}, "
-          f"{job['samples']} samples, materials {job['materials']}")
+    no_render = bool(job.get("no_render", False))
+    if no_render:
+        print(f"[rerender] --no-render: scene only, {intr.w}x{intr.h}, "
+              f"materials {job['materials']}")
+    else:
+        print(f"[rerender] {len(frames)} frames, {intr.w}x{intr.h}, "
+              f"{job['samples']} samples, materials {job['materials']}")
 
     check_skybox(job)
 
@@ -701,6 +785,13 @@ def blender_main(job_path: str) -> None:
         scene.cycles.device = "CPU"
 
     t0 = time.time()
+    if no_render and tf.frames:
+        # Nothing to render, but the blend still has to open on a sensible view: the camera
+        # goes to the first frame of the dataset instead of staying wherever create_camera
+        # left it.
+        set_camera_pose(cam_obj, tf.frames[0].transform_matrix,
+                        apply_axis_correction=False)
+        bpy.context.view_layer.update()
     for i, frame in enumerate(frames, 1):
         stem = Path(frame.file_path).stem
         set_camera_pose(cam_obj, frame.transform_matrix, apply_axis_correction=False)
@@ -736,7 +827,24 @@ def blender_main(job_path: str) -> None:
 
     if job["save_blend"]:
         blend = str(out_dir / "scene.blend")
+        # The OBJ import builds a material out of the .mtl, and check_skybox pulls in the
+        # World of the source Baked.blend: both leave Image datablocks with zero users
+        # behind, pointing back into the repo.  They end up written into a blend that is
+        # meant to link only to its own folder, so they go first.  Purging is safe: what
+        # the scene really uses has a user.
+        bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True,
+                                       do_recursive=True)
         bpy.ops.wm.save_as_mainfile(filepath=blend, check_existing=False)
+        if job.get("relative_paths"):
+            # make_paths_relative needs the file to already have a path on disk, which is
+            # what the save above gives it; the second save is the one that actually writes
+            # the relative links.
+            bpy.ops.file.make_paths_relative()
+            bpy.ops.wm.save_as_mainfile(filepath=blend, check_existing=False)
+            n_abs = sum(1 for i in bpy.data.images
+                        if i.filepath and not i.filepath.startswith("//"))
+            print(f"[rerender] paths made relative"
+                  + (f", {n_abs} image(s) still absolute" if n_abs else ""))
         print(f"[rerender] scene.blend -> {blend}")
 
 
