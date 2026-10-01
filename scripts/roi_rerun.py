@@ -144,6 +144,19 @@ def main() -> int:
     ap.add_argument("--mask", default="", help="ROI mask image (optional)")
     ap.add_argument("--mask-threshold", type=float, default=0.5)
     ap.add_argument("--tag", default="", help="sandbox name (default: derived)")
+    ap.add_argument("--grazing-normal", choices=("normal_map", "mesh"), default=None,
+                    help="override render.color_texture_grazing_normal (an A/B test of "
+                         "the grazing filter: the comparison with the reference is then "
+                         "no longer an identity check)")
+    ap.add_argument("--sources", nargs="+", choices=("gt", "nerf"), default=None,
+                    help="override render.color_texture_image_sources (e.g. only gt, to "
+                         "skip the nerf colour texture and its Step 4)")
+    ap.add_argument("--mesh-normals", choices=("triangle", "obj"), default=None,
+                    help="override render.ium_mesh_normals: the mesh normal flat per "
+                         "triangle or read from the OBJ (an A/B test)")
+    ap.add_argument("--external-normal", default=None, metavar="PATH",
+                    help="override render.external_normal_path (e.g. a filtered normal "
+                         "map): an A/B test, not an identity check")
     ap.add_argument("--dry-run", action="store_true",
                     help="rebuild and check the config, then stop")
     args = ap.parse_args()
@@ -172,8 +185,28 @@ def main() -> int:
     cfg.render.roi_mask_path = args.mask
     cfg.render.roi_mask_threshold = args.mask_threshold
     cfg.render.roi_tag = args.tag
+    expected = set(_EXPECTED_DIFFS)
+    if args.grazing_normal is not None:
+        cfg.render.color_texture_grazing_normal = args.grazing_normal
+        expected.add("render.color_texture_grazing_normal")
+        print(f"  override: color_texture_grazing_normal = {args.grazing_normal!r}")
+    if args.sources is not None:
+        cfg.render.color_texture_image_sources = list(args.sources)
+        expected.add("render.color_texture_image_sources")
+        print(f"  override: color_texture_image_sources = {list(args.sources)!r}")
+    if args.mesh_normals is not None:
+        cfg.render.ium_mesh_normals = args.mesh_normals
+        expected.add("render.ium_mesh_normals")
+        print(f"  override: ium_mesh_normals = {args.mesh_normals!r}")
+    if args.external_normal is not None:
+        if not Path(args.external_normal).exists():
+            print(f"✗ normal map not found: {args.external_normal}")
+            return 2
+        cfg.render.external_normal_path = args.external_normal
+        expected.add("render.external_normal_path")
+        print(f"  override: external_normal_path = {args.external_normal!r}")
 
-    diffs = check_against_manifest(cfg, manifest)
+    diffs = check_against_manifest(cfg, manifest, expected)
     if diffs:
         print("\n✗ the rebuilt config diverges from the manifest on unexpected keys:")
         for d in diffs:

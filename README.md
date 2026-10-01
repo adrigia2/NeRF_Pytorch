@@ -181,7 +181,7 @@ Passed as `PipelineConfig(render=RenderConfig(...))`. The knobs that matter in p
 |---|---|---|
 | `render_ium`, `render_visibility` | `True` | Step 3 geometry passes. Everything below depends on them. |
 | `ium_texture_size` | `[512, 512]` | Texture-space resolution, `[w, h]`. Production runs use `[4096, 4096]`. |
-| `external_normal_path` | `None` | Baked normal map replacing the OptiX face normals. |
+| `external_normal_path` | `None` | Baked normal map replacing the OptiX mesh normals. |
 | `external_normal_resolution_mode` | `None` | `"resample"` (rescale the map), `"adapt"` (rescale the IUM instead), `None` (ask at runtime). |
 | `apply_scale` | `False` | **Must stay `False`.** The `scale` in `transforms.json` would also have to be applied to the camera translations; applying it on one side only puts the NeRF query points off the mesh surface. |
 | `render_color_texture` | `False` | Bakes the observed colour into texture space. |

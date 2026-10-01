@@ -561,14 +561,82 @@ def _save_visibility_map(visibility_map: np.ndarray, vis_path: str,
     _save_layer(vis_arr, vis_path, fmt, DataLayer.VISIBILITY)
 
 
-def _load_camera_masks(mask_dir: Path, stems: "list[str]", num_pix: int) -> "np.ndarray | None":
+CAMERA_MASK_META = "camera_mask_meta.json"
+
+
+def _camera_mask_params(rc) -> dict:
+    """What the per-camera masks depend on beyond the geometry: written next to them
+    and into spec_cone_meta.json, so a bake made with other masks is not reused.
+
+    The mesh normal enters only when the masks read it: in "mesh" grazing mode, or
+    when there is no external normal map (then ium_normals IS the mesh normal, and
+    every shading pass uses it too, spec cone included)."""
+    params = {"grazing_max_deg": float(rc.color_texture_grazing_max_deg),
+              "grazing_normal": rc.color_texture_grazing_normal}
+    if rc.color_texture_grazing_normal == "mesh" or not rc.external_normal_path:
+        params["mesh_normals"] = rc.ium_mesh_normals
+    return params
+
+
+def _camera_mask_params_match(saved: "dict | None", wanted: dict) -> bool:
+    """A meta written before 2026-09-30 does not exist (masks) or lacks the keys
+    (spec_cone): those runs all measured the angle on the normal-map normal, and their
+    grazing angle is not recorded, so only the normal is compared for them. The two
+    modes were called "shading" / "geometric" until 2026-10-01; test caches written
+    with those names are still recognised."""
+    saved = saved or {}
+    legacy = {"shading": "normal_map", "geometric": "mesh"}
+    got = saved.get("grazing_normal", "normal_map")
+    if legacy.get(got, got) != wanted["grazing_normal"]:
+        return False
+    # Masks written before the OBJ normals existed were built on the triangle normal.
+    if "mesh_normals" in wanted and saved.get("mesh_normals", "triangle") != wanted["mesh_normals"]:
+        return False
+    return ("grazing_max_deg" not in saved
+            or float(saved["grazing_max_deg"]) == wanted["grazing_max_deg"])
+
+
+def _check_spec_cone_masks(old_meta: dict, cfg, out_dir: Path) -> None:
+    """Refuse a spec_cone/ cache baked with other per-camera masks.
+
+    The bake processes, for each texel, only the cameras the visibility marks as
+    seeing it, and the visibility IS the colour-texture masks. A cache made with
+    another grazing test would be skipped camera by camera and keep the old camera
+    set: the pairs the new masks add would stay at valid = 0 and the solver would
+    drop them, with no signal."""
+    wanted = _camera_mask_params(cfg)
+    saved = old_meta.get("camera_masks")
+    if not _camera_mask_params_match(saved, wanted):
+        raise RuntimeError(
+            f"spec_cone: {out_dir} was baked with other per-camera masks\n"
+            f"    on disk:   {saved or 'legacy (normal map)'}\n"
+            f"    requested: {wanted}\n"
+            f"  Delete the spec_cone/ folder and re-bake it (≈2.6 h at 4096², far less "
+            f"on a ROI), or restore color_texture_grazing_normal / "
+            f"color_texture_grazing_max_deg.")
+
+
+def _load_camera_masks(mask_dir: Path, stems: "list[str]", num_pix: int,
+                       wanted_params: "dict | None" = None) -> "np.ndarray | None":
     """Reload the per-camera masks from <mask_dir>/{stem}.exr → (num_pix, n_cams) uint8.
 
     Returns None if the folder or even a single mask is missing, so the caller knows
-    it has to recompute color_texture to regenerate them.
+    it has to recompute color_texture to regenerate them. With `wanted_params` it also
+    returns None when the masks were built with another grazing test (see
+    _camera_mask_params): reusing them would silently keep the old visibility.
     """
     if not mask_dir.is_dir():
         return None
+    if wanted_params is not None:
+        meta_p = mask_dir / CAMERA_MASK_META
+        saved = None
+        if meta_p.exists():
+            with open(meta_p, encoding="utf-8") as fh:
+                saved = json.load(fh)
+        if not _camera_mask_params_match(saved, wanted_params):
+            print(f"[Step 3] camera_mask/ on disk was built with {saved or 'the legacy normal-map test'}, "
+                  f"requested {wanted_params} → not reused")
+            return None
     masks = np.zeros((num_pix, len(stems)), dtype=np.uint8)
     for j, stem in enumerate(stems):
         p = mask_dir / f"{stem}.exr"
@@ -683,6 +751,55 @@ def _apply_external_normal(rc, ium_res, ium_w: int, ium_h: int) -> None:
     ium_res.normals_np[:] = n.astype(np.float32)
     print(f"[IUM] External normal injected into the IUM buffer ({ium_w}×{ium_h}, "
           f"{int(np.count_nonzero(m) if ium_res.has_masks() else ium_w * ium_h)} valid texels).")
+
+
+def _orient_like(normals: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """Flip the rows of `normals` that point away from `ref` (in place, returned).
+
+    IUM_Generator derives the face normal from the triangle's edges assuming CCW
+    winding; a face wound the other way would get the inward normal, and the grazing
+    test on it would discard every camera. The external normal map is outward by
+    construction, so it fixes the sign. Rows where either vector is zero (outside the
+    mesh) are left alone."""
+    d = np.einsum("ij,ij->i", normals, ref)
+    flip = d < 0.0
+    normals[flip] *= -1.0
+    valid = np.count_nonzero(np.abs(d) > 0)
+    print(f"[IUM] mesh normals for the grazing test: {np.count_nonzero(flip)} of "
+          f"{valid} texels flipped to agree with the normal map "
+          f"({100.0 * np.count_nonzero(flip) / max(valid, 1):.3f}%)")
+    return normals
+
+
+@contextlib.contextmanager
+def _normals_swapped(ium_res, normals: "np.ndarray | None"):
+    """Temporarily put `normals` into the IUM result's normal buffer.
+
+    normals_np is a zero-copy view on the C++ vector, and a generator copies it to the
+    GPU at its own set_inputs: wrapping ONLY ColorTexGenerator.set_inputs makes the
+    grazing test see the mesh normals while every other pass keeps the normal map.
+    None is a no-op."""
+    if normals is None:
+        yield
+        return
+    saved = np.array(ium_res.normals_np, dtype=np.float32, copy=True)
+    ium_res.normals_np[:] = normals
+    try:
+        yield
+    finally:
+        ium_res.normals_np[:] = saved
+
+
+def _camera_faces_normal_map(positions: np.ndarray, normals: np.ndarray,
+                             cam_pos) -> np.ndarray:
+    """(num_pix,) bool: the camera lies strictly above the horizon of `normals`, the
+    normal-map normals.
+
+    Used in "mesh" grazing mode: the angle limit is taken on the mesh normal, but a
+    camera behind the horizon of the normal-map normal would make reflect(v, n) point
+    into the surface, so it is still discarded."""
+    v = np.asarray(cam_pos, dtype=np.float32)[None, :] - positions
+    return np.einsum("ij,ij->i", normals, v) > 0.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -951,6 +1068,17 @@ class RenderConfig:
 
     # IUM texture size [width, height]
     ium_texture_size: list[int] = field(default_factory=lambda: [512, 512])
+    # The mesh normal the IUM gives each texel (before any external normal map):
+    #   "triangle" → the normal of the triangle's plane: flat everywhere (the only
+    #                behaviour before 2026-10-01, hence the default: old manifests
+    #                reproduce).
+    #   "obj"      → the OBJ `vn` of the three corners, interpolated: smooth or flat
+    #                exactly as the file (and Blender's shading) says. Needs an OBJ
+    #                with normals. Checked against Blender's own flat normal map
+    #                (BakedMaterial_normal_flat.exr): p99 0.03° on the smooth objects.
+    # With an external normal map it matters only for the colour-texture grazing test
+    # in "mesh" mode; without one, every shading pass uses it.
+    ium_mesh_normals: str = "triangle"
 
     # Externally supplied IUM normal (overrides the one OptiX computes).
     # The file may be in any image format (PNG, JPG, EXR…).
@@ -997,6 +1125,20 @@ class RenderConfig:
     # contribution is discarded (too grazing a view → background bleed at the edges).
     # 90.0 = filter disabled; operational default 75° (discards within 15° of the tangent).
     color_texture_grazing_max_deg: float = 75.0
+    # Which normal the grazing test above measures the angle from:
+    #   "normal_map" → the normal read from the external normal map, i.e. ium_normals
+    #                  as the rest of the pipeline sees them (the behaviour of every run
+    #                  before 2026-09-30, hence the default: old manifests reproduce).
+    #   "mesh"       → the normal of the mesh triangle, which the IUM computes before
+    #                  the normal map overwrites it. The filter guards against a
+    #                  stretched texel footprint and background bleed, which the real
+    #                  surface decides, not the normal map: on bumpy detail (wood
+    #                  grooves) "normal_map" drops cameras that see the geometry fine.
+    #                  A camera behind the horizon of the normal-map normal is still
+    #                  discarded (reflect(v, n) would point into the surface).
+    # Identical when no external normal map is given. Called "shading" / "geometric"
+    # until 2026-10-01.
+    color_texture_grazing_normal: str = "normal_map"
 
     # Debug output
     debug_camera_texture: bool = False   # save a side-by-side of camera image vs camera_texture
@@ -1778,6 +1920,7 @@ def _precompute_spec_cone(
                 f"(per-ring means) are no longer readable: ever since the bake "
                 f"writes the cones directly, the solver no longer reconstructs "
                 f"them, so they have to be redone.")
+        _check_spec_cone_masks(old_meta, cfg, out_dir)
 
     def _cam_path(j: int) -> Path:
         return out_dir / f"cam_{j:03d}{fmt.extension}"
@@ -1893,6 +2036,7 @@ def _precompute_spec_cone(
         "num_levels": K,
         "cam_file_pattern": "cam_{cam:03d}" + fmt.extension,
         "skybox_yaw_degrees": cfg.skybox_yaw_degrees,
+        "camera_masks": _camera_mask_params(cfg),
     }
     with open(out_dir / "spec_cone_meta.json", "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2)
@@ -2027,6 +2171,7 @@ def _precompute_spec_cone_shared(
                 f"(per-ring means) are no longer readable: ever since the bake "
                 f"writes the cones directly, the solver no longer reconstructs "
                 f"them, so they have to be redone.")
+        _check_spec_cone_masks(old_meta, cfg, out_dir)
         if all(p.exists() for p in cam_paths.values()):
             print(f"    all {n_sel} cameras already on disk, skipped")
             return
@@ -2237,6 +2382,7 @@ def _precompute_spec_cone_shared(
         "num_levels": K,
         "cam_file_pattern": "cam_{cam:03d}" + ImageFormat.OPENEXR.extension,
         "skybox_yaw_degrees": cfg.skybox_yaw_degrees,
+        "camera_masks": _camera_mask_params(cfg),
     }
     with open(meta_path, "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2)
@@ -3075,6 +3221,13 @@ def _step3_posttrain_assets(
 
     ium_result_data: dict = output_json.get("ium", {})
 
+    if rc.color_texture_grazing_normal not in ("normal_map", "mesh"):
+        raise ValueError(f"color_texture_grazing_normal must be 'normal_map' or "
+                         f"'mesh', got {rc.color_texture_grazing_normal!r}")
+    # Mesh normals for the colour-texture grazing test ("mesh" mode with an external
+    # normal map only; None means the test uses ium_normals, the normal map, as they are).
+    mesh_normals: "np.ndarray | None" = None
+
     if rc.render_ium:
         _t3_ium = time.perf_counter()
         # IUM size: it may be adapted to the external normal map's resolution when
@@ -3087,6 +3240,16 @@ def _step3_posttrain_assets(
         ium_gen = optix_mod.IUMGenerator()
         ium_gen.set_traversable(model)
         ium_gen.set_texture_size([ium_w, ium_h])
+        if rc.ium_mesh_normals not in ("triangle", "obj"):
+            raise ValueError(f"ium_mesh_normals must be 'triangle' or 'obj', "
+                             f"got {rc.ium_mesh_normals!r}")
+        if rc.ium_mesh_normals == "obj" and not model.has_normals:
+            raise ValueError(f"ium_mesh_normals='obj' but {rc.model_path} has no "
+                             f"vertex normals (vn): export it with normals, or use 'triangle'")
+        ium_gen.set_mesh_normals(rc.ium_mesh_normals)
+        print(f"[Step 3] IUM mesh normals: {rc.ium_mesh_normals} "
+              f"({model.num_triangles} triangles, OBJ normals: "
+              f"{'yes' if model.has_normals else 'no'})")
         ium_gen.render()
         ium_res = ium_gen.get_result()
         print("[Step 3] IUM rendering complete")
@@ -3096,7 +3259,13 @@ def _step3_posttrain_assets(
         # When an external normal map was supplied, decode it and inject it into the
         # C++ buffer of IUM_Generator::Result before any downstream use.
         if rc.external_normal_path:
+            if rc.color_texture_grazing_normal == "mesh":
+                # The mesh normals OptiX computed, kept before the normal map
+                # overwrites them: only the colour-texture grazing test uses them.
+                mesh_normals = np.array(ium_res.normals_np, dtype=np.float32, copy=True)
             _apply_external_normal(rc, ium_res, ium_w, ium_h)
+            if mesh_normals is not None:
+                mesh_normals = _orient_like(mesh_normals, ium_res.normals_np)
 
         # ── ROI: the one place it is applied ─────────────────────────────────
         # masks_np is a writable view on the C++ vector, and every downstream generator
@@ -3185,6 +3354,11 @@ def _step3_posttrain_assets(
         # reused as the shared refined visibility.
         cam_mask_dir = assets_dir / "camera_mask"
         stems = [f.stem for f in tf.frames]
+        mask_params = _camera_mask_params(rc)
+        # "mesh" grazing: the angle limit is taken on the mesh normal inside the
+        # kernel, and a camera behind the horizon of the normal-map normal is discarded
+        # here, on the host (see RenderConfig.color_texture_grazing_normal).
+        check_normal_map_facing = mesh_normals is not None
         if (rc.render_color_texture and rc.render_ium and rc.render_visibility
                 and visibility_map is not None):
             _t3_ct = time.perf_counter()
@@ -3205,7 +3379,7 @@ def _step3_posttrain_assets(
                     # Cache hit: to avoid regressing the visibility we need the per-camera
                     # masks. If they are on disk we reload them and refine; if they are
                     # missing we do NOT use the cache (we recompute to regenerate them).
-                    masks_disk = _load_camera_masks(cam_mask_dir, stems, ium_w * ium_h)
+                    masks_disk = _load_camera_masks(cam_mask_dir, stems, ium_w * ium_h, mask_params)
                     if masks_disk is not None:
                         loaded = _load_exr_as_flat(ct_path)
                         if loaded is not None:
@@ -3228,8 +3402,9 @@ def _step3_posttrain_assets(
                     src, tf, all_cameras, intr, rc, cfg, json_dir, optix_mod)
 
                 ct_gen = optix_mod.ColorTexGenerator()
-                ct_gen.set_inputs(ium_res, visibility_map, optix_frames,
-                                  grazing_max_deg=rc.color_texture_grazing_max_deg)
+                with _normals_swapped(ium_res, mesh_normals):
+                    ct_gen.set_inputs(ium_res, visibility_map, optix_frames,
+                                      grazing_max_deg=rc.color_texture_grazing_max_deg)
                 ct_gen.render()
                 _ct_res = ct_gen.get_result()
 
@@ -3249,13 +3424,26 @@ def _step3_posttrain_assets(
                 save_masks = not visibility_refined
                 if save_masks:
                     os.makedirs(cam_mask_dir, exist_ok=True)
+                    with open(cam_mask_dir / CAMERA_MASK_META, "w", encoding="utf-8") as fh:
+                        json.dump(mask_params, fh, indent=2)
                 cam_masks = np.zeros((ium_w * ium_h, len(tf.frames)), dtype=np.uint8)
+                n_behind_normal_map = 0
                 for cam_idx, frame in enumerate(tf.frames):
                     cam_slice = ct_gen.download_camera_colors(cam_idx)  # (num_pix, 3) float32
+                    cam_masks[:, cam_idx] = ct_gen.download_camera_mask(cam_idx)  # (num_pix,) uint8
+                    if check_normal_map_facing:
+                        m_tf = frame.transform_matrix
+                        behind = ~_camera_faces_normal_map(
+                            ium_res.positions_np, ium_res.normals_np,
+                            [m_tf[0][3], m_tf[1][3], m_tf[2][3]])
+                        behind &= cam_masks[:, cam_idx] > 0
+                        n_behind_normal_map += int(np.count_nonzero(behind))
+                        cam_masks[behind, cam_idx] = 0
+                        cam_slice = np.array(cam_slice, dtype=np.float32, copy=True)
+                        cam_slice[behind] = 0.0     # camera_texture stays = the mask's support
                     cam_arr   = _reshape_flat(cam_slice, ium_w, ium_h)
                     cam_path  = (cam_tex_dir / f"{frame.stem}{rc.color_texture_format.extension}").resolve().as_posix()
                     _save_layer(cam_arr, cam_path, rc.color_texture_format, DataLayer.POSITION)
-                    cam_masks[:, cam_idx] = ct_gen.download_camera_mask(cam_idx)  # (num_pix,) uint8
                     if save_masks:
                         mask_path = (cam_mask_dir / f"{frame.stem}.exr").resolve().as_posix()
                         _save_layer(_reshape_flat(cam_masks[:, cam_idx], ium_w, ium_h),
@@ -3264,6 +3452,10 @@ def _step3_posttrain_assets(
                         src_img_path = images_out_dir_ct / Path(frame.file_path).name
                         _save_debug_comparison(src_img_path, cam_arr, frame.stem,
                                                src_dir / "debug_camera_texture")
+                if check_normal_map_facing:
+                    print(f"[Step 3] mesh-normal grazing ({src}): {n_behind_normal_map} "
+                          f"camera-texel pairs dropped as behind the horizon of the "
+                          f"normal-map normal")
 
                 # Refine the shared visibility with the per-camera mask (once):
                 # occlusion∧frustum∧grazing, so that spec_cone (which uses visibility_map
@@ -3311,7 +3503,7 @@ def _step3_posttrain_assets(
         # off) but the per-camera masks exist on disk, refine from those so spec_cone
         # and pbr_solver still use the frustum+grazing version.
         if not visibility_refined and visibility_map is not None and vis_path is not None:
-            masks_disk = _load_camera_masks(cam_mask_dir, stems, ium_w * ium_h)
+            masks_disk = _load_camera_masks(cam_mask_dir, stems, ium_w * ium_h, mask_params)
             if masks_disk is not None:
                 visibility_map = masks_disk
                 _save_visibility_map(visibility_map, vis_path, ium_h, ium_w,
@@ -4024,6 +4216,8 @@ if __name__ == "__main__":
             spec_cone_samples_budget = 1440,
 
             color_texture_grazing_max_deg = 75.0,
+            color_texture_grazing_normal  = "mesh",
+            ium_mesh_normals              = "obj",
 
             # Diagnostic GT vs NeRF-baked skybox heatmap (needs skybox_path in the SceneConfig)
             compare_skybox_to_gt = True,
