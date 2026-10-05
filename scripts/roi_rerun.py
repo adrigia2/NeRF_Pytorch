@@ -49,6 +49,12 @@ _EXPECTED_DIFFS = {
     # removed, but the manifests already written still contain it, and without this
     # entry every earlier run would be rejected.
     "render.pbr_diffuse_cv_gate",
+    # Deleted on 2026-10-01 for the same reason: normal maps are no longer resized, so
+    # the resize mode and the low-pass are gone. A run whose normal map is not
+    # ium_texture_size now stops at the size check; --external-normal points it at a
+    # bake of the right size, which makes the rerun an A/B rather than an identity check.
+    "render.external_normal_resolution_mode",
+    "render.external_normal_downsample_to",
 }
 
 

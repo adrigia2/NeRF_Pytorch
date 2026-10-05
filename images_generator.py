@@ -646,62 +646,66 @@ def _load_camera_masks(mask_dir: Path, stems: "list[str]", num_pix: int,
     return masks
 
 
-def _resolve_external_normal_size(
-    rc,
-    default_w: int,
-    default_h: int,
-) -> tuple[int, int, str | None]:
-    """Decide the effective IUM width/height when an external normal map is used.
+def _image_size(path: str) -> tuple[int, int]:
+    """(width, height) of an image from its header alone, without reading the pixels."""
+    if path.lower().endswith(".exr"):
+        import OpenEXR
+        dw = OpenEXR.InputFile(path).header()["dataWindow"]
+        return dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1
+    from PIL import Image
+    with Image.open(path) as img:
+        return img.size
 
-    When rc.external_normal_path is None it returns (default_w, default_h, None).
 
-    When the normal map's native resolution already matches default_w×default_h it
-    returns that same resolution with mode="match".
-
-    Otherwise:
-      - rc.external_normal_resolution_mode == "resample" → (default_w, default_h, "resample")
-      - rc.external_normal_resolution_mode == "adapt"    → (native_w, native_h, "adapt")
-      - rc.external_normal_resolution_mode is None       → asks the user at runtime
-    """
+def _check_external_normal_size(rc, w: int, h: int) -> None:
+    """The external normal map must already be at the atlas resolution: it is never
+    resized (since 2026-10-01). Every resize is a filter applied to an already-baked map
+    — the LANCZOS of the earlier runs ran on the encoded values with no mask, pulling the
+    empty background into the UV island borders — so a map of another size is an error,
+    and the right one is baked by Blender at that size."""
     if not rc.external_normal_path:
-        return default_w, default_h, None
-
-    native = _load_image_hw3_native(rc.external_normal_path)
-    native_h, native_w = native.shape[:2]
-
-    if native_w == default_w and native_h == default_h:
-        print(f"[IUM] External normal: native resolution {native_w}×{native_h} "
-              f"matches ium_texture_size → no resampling needed.")
-        return default_w, default_h, "match"
-
-    print(f"[IUM] External normal: native resolution {native_w}×{native_h}, "
-          f"ium_texture_size={default_w}×{default_h} — resolutions differ.")
-
-    mode = rc.external_normal_resolution_mode
-    if mode is None:
-        while True:
-            ans = input(
-                f"  Choose the resolution strategy:\n"
-                f"    1 = resample: resize the normal map to {default_w}×{default_h}\n"
-                f"    2 = adapt: adapt ium_texture_size to {native_w}×{native_h}\n"
-                f"  Choice [1/2]: "
-            ).strip()
-            if ans in ("1", "2"):
-                mode = "resample" if ans == "1" else "adapt"
-                break
-            print("  Invalid input, enter 1 or 2.")
-
-    if mode == "resample":
-        print(f"[IUM] Strategy: resample → the normal map will be resized to {default_w}×{default_h}.")
-        return default_w, default_h, "resample"
-    elif mode == "adapt":
-        print(f"[IUM] Strategy: adapt → the IUM will run at {native_w}×{native_h}.")
-        return native_w, native_h, "adapt"
-    else:
+        return
+    nw, nh = _image_size(rc.external_normal_path)
+    if (nw, nh) != (w, h):
         raise ValueError(
-            f"unrecognised external_normal_resolution_mode: {mode!r}. "
-            "Use 'resample', 'adapt' or None."
-        )
+            f"external normal map {rc.external_normal_path} is {nw}×{nh}, but "
+            f"ium_texture_size is {w}×{h}: normal maps are not resized. Bake it at "
+            f"{w}×{h} with NeRF_Pytorch/blender/bake_normal_variants.py "
+            f"(blender -b <source.blend> --python bake_normal_variants.py -- "
+            f"--out <dir> --sizes {w}).")
+    print(f"[IUM] External normal: {nw}×{nh}, matches ium_texture_size (no resize).")
+
+
+def _decode_external_normal(rc, ext: np.ndarray) -> np.ndarray:
+    """Decode a normal map from its source range into [-1,1] (float32, same shape).
+
+    The range must be declared explicitly in rc.external_normal_range: auto-detecting
+    it from the global min() was fragile, because LANCZOS ringing (on aggressive
+    downscales such as 4096→512) pushes some pixels below 0, which skipped the decode
+    and left the values in [0,1] — exactly the bug that was reported.
+    """
+    if rc.external_normal_range == "0_1":
+        return ext.astype(np.float32) * 2.0 - 1.0
+    if rc.external_normal_range == "-1_1":
+        return ext.astype(np.float32, copy=True)
+    raise ValueError(
+        f"unrecognised external_normal_range: {rc.external_normal_range!r} "
+        f"(expected '0_1' | '-1_1')."
+    )
+
+
+def _load_external_normal(rc, w: int, h: int) -> np.ndarray:
+    """The external normal map decoded into [-1,1] → (w·h, 3) float32, not yet
+    renormalised (the caller does that, after the optional green flip).
+
+    Read at its native resolution, which must be w×h (_check_external_normal_size):
+    no resize anywhere. For a map of the right size this is bit-identical to the
+    earlier path, whose _load_image_as_vec3 skipped the resize when the sizes matched.
+    """
+    n = _load_image_hw3_native(rc.external_normal_path)[..., :3]
+    if n.shape[:2] != (h, w):
+        raise ValueError(f"external normal map is {n.shape[1]}×{n.shape[0]}, expected {w}×{h}")
+    return _decode_external_normal(rc, n.reshape(-1, 3))
 
 
 def _apply_external_normal(rc, ium_res, ium_w: int, ium_h: int) -> None:
@@ -714,31 +718,13 @@ def _apply_external_normal(rc, ium_res, ium_w: int, ium_h: int) -> None:
     path = rc.external_normal_path
     print(f"[IUM] Loading external normal map: {path}")
 
-    # Load and resize to ium_texture_size (LANCZOS).
-    # _load_image_as_vec3 returns (N, 3) float32:
-    #   - EXR → raw HDR values (possibly already in [-1,1] or [0,1])
-    #   - LDR (PNG/JPG) → uint8/255, hence in [0,1]
-    ext = _load_image_as_vec3(path, ium_w, ium_h)  # (N, 3)
-
-    # Decode from the source range into [-1,1].
-    # The range must be declared explicitly in rc.external_normal_range: auto-detecting
-    # it from the global min() was fragile, because LANCZOS ringing (on aggressive
-    # downscales such as 4096→512) pushes some pixels below 0, which skipped the decode
-    # and left the values in [0,1] — exactly the bug that was reported.
-    if rc.external_normal_range == "0_1":
-        n = ext.astype(np.float32) * 2.0 - 1.0
-    elif rc.external_normal_range == "-1_1":
-        n = ext.astype(np.float32, copy=True)
-    else:
-        raise ValueError(
-            f"unrecognised external_normal_range: {rc.external_normal_range!r} "
-            f"(expected '0_1' | '-1_1')."
-        )
+    # Load at its native resolution (= ium_texture_size, never resized) and decode.
+    n = _load_external_normal(rc, ium_w, ium_h)  # (N, 3)
 
     if rc.external_normal_flip_green:
         n[:, 1] *= -1.0
 
-    # Renormalise: LANCZOS/interpolation can produce non-unit vectors.
+    # Renormalise: a bake averages unit normals over its footprint, so |n| ≤ 1.
     ln = np.linalg.norm(n, axis=1, keepdims=True)
     n = np.divide(n, ln, out=np.zeros_like(n), where=ln > 1e-8)
 
@@ -1081,15 +1067,12 @@ class RenderConfig:
     ium_mesh_normals: str = "triangle"
 
     # Externally supplied IUM normal (overrides the one OptiX computes).
-    # The file may be in any image format (PNG, JPG, EXR…).
+    # The file may be in any image format (PNG, JPG, EXR…). It must already be
+    # ium_texture_size: normal maps are never resized (since 2026-10-01; the
+    # "resample"/"adapt" modes are gone) — bake one per atlas size with
+    # blender/bake_normal_variants.py.
     # When None (the default) the normal computed by the IUM pass is used.
     external_normal_path: str | None = None
-    # Strategy to use when the external image resolution ≠ ium_texture_size.
-    #   "resample"  → resample the normal map to ium_texture_size (LANCZOS).
-    #   "adapt"     → adapt ium_texture_size to the normal map's native resolution
-    #                 (positions/mask are regenerated at that same resolution).
-    #   None        → ask the user at runtime.
-    external_normal_resolution_mode: str | None = None
     # Value range of the external normal map.
     #   "0_1"  → standard normal map encoded in [0,1]: applies the decode n = ext*2-1.
     #   "-1_1" → EXR already decoded to [-1,1] (e.g. a reloaded ium_normals): used as is.
@@ -3230,12 +3213,9 @@ def _step3_posttrain_assets(
 
     if rc.render_ium:
         _t3_ium = time.perf_counter()
-        # IUM size: it may be adapted to the external normal map's resolution when
-        # external_normal_resolution_mode == "adapt" (or the user picks it at runtime).
-        default_ium_w, default_ium_h = rc.ium_texture_size[0], rc.ium_texture_size[1]
-        ium_w, ium_h, _ext_norm_mode = _resolve_external_normal_size(
-            rc, default_ium_w, default_ium_h
-        )
+        ium_w, ium_h = rc.ium_texture_size[0], rc.ium_texture_size[1]
+        # Before the IUM render: a normal map of another size is an error, not a resize.
+        _check_external_normal_size(rc, ium_w, ium_h)
 
         ium_gen = optix_mod.IUMGenerator()
         ium_gen.set_traversable(model)
@@ -4117,6 +4097,36 @@ def run_pipeline_multi(
     return results
 
 
+def seed_run_from(src_scene_dir: str, dst_scene_dir: str) -> None:
+    """Prepare a scene folder for a run with Step 1 and Step 2 off, by reusing another run.
+
+    Copies from ``src_scene_dir``, **only where the destination lacks them**:
+      - transforms_extended.json  (the Step 1 output; run_pipeline checks it carries
+                                   depth_path/mask_path per frame)
+      - model/                    (the NeRF checkpoint, model/nerf_model_cache.pt)
+      - images/                   (the gt photos the colour texture projects)
+      - skybox_nerf_baked.exr     (reused by Step 3 instead of being re-baked)
+    Nothing is ever overwritten and the source is only read. Step 3 rewrites every
+    texture-space output, so nothing else of the source run is needed.
+    """
+    src, dst = Path(src_scene_dir), Path(dst_scene_dir)
+    items = ["transforms_extended.json", "model", "images", "skybox_nerf_baked.exr"]
+    missing = [i for i in items if not (src / i).exists()]
+    if missing:
+        raise FileNotFoundError(f"seed_run_from: {src} lacks {missing}")
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in items:
+        s, d = src / item, dst / item
+        if d.exists():
+            print(f"  seed: {d} already present, kept")
+            continue
+        if s.is_dir():
+            shutil.copytree(s, d)
+        else:
+            shutil.copy2(s, d)
+        print(f"  seed: {item} ← {s}")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
@@ -4142,8 +4152,6 @@ if __name__ == "__main__":
             model_path           = "",
             external_normal_path = None,
             output_dir           = "",  # set to <output_root>/<scene.name>
-
-            external_normal_resolution_mode = "resample",  # "adapt" | "resample" | "none"
 
             render_depth    = True,
             render_position = True,  # Step 1 produces only depth+mask
@@ -4216,7 +4224,8 @@ if __name__ == "__main__":
             spec_cone_samples_budget = 1440,
 
             color_texture_grazing_max_deg = 75.0,
-            color_texture_grazing_normal  = "mesh",
+            # The grazing test uses the mesh normal only when asked for explicitly.
+            color_texture_grazing_normal  = "normal_map",
             ium_mesh_normals              = "obj",
 
             # Diagnostic GT vs NeRF-baked skybox heatmap (needs skybox_path in the SceneConfig)
@@ -4261,7 +4270,22 @@ if __name__ == "__main__":
 
     )
 
-    # ── Scenes ────────────────────────────────────────────────────────────────
+    # ── Scenes: per-size normal maps ──────────────────────────────────────────
+    # Normal maps are never resized (since 2026-10-01): the map must already be
+    # ium_texture_size, or Step 3 stops. blender/bake_normal_variants.py bakes one per
+    # size into <dir>/normal_<N>/BakedMaterial_normal.exr, N = 4096 / 2048 / 1024 / 512.
+    # In every scene leave exactly ONE external_normal_path line uncommented, the one
+    # whose N equals ium_texture_size (4096 in the template above). With all of them
+    # commented the scene gets no normal map and is shaded with the OBJ normals
+    # (ium_mesh_normals).
+    #   SWORD_NORMALS  valid for SwordShieldStudio and SwordShieldNight: BakedStudio and
+    #                  BakedNight share a byte-identical Baked.obj, and the normal does
+    #                  not depend on the lighting.
+    #   TABLE_NORMALS  valid for every scene on ModelsSmooth/Baked.obj (WithSpecular,
+    #                  Night, NoSpecular, HighDetails): same UV layout, same normal.
+    SWORD_NORMALS = f"{REPO}/Scenes/SwordShield Thesis/BakedStudio"
+    TABLE_NORMALS = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth"
+
     # Add or comment out SceneConfig entries to choose which scenes to process.
     # The output of each scene lands in <output_root>/<scene.name>/.
     SCENES = [
@@ -4269,7 +4293,9 @@ if __name__ == "__main__":
         #     name             = "TableAndOtherInterior",
         #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXR/transforms.json",
         #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/Models/Baked.obj",
-        #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBaked/BakedMaterial_normal.exr",
+        #     # No per-size normal map yet: Models/Baked.obj has its own UV layout (not
+        #     # TABLE_NORMALS) and BlenderBaked/BakedMaterial_normal.exr is 8192. Bake one
+        #     # with blender/bake_normal_variants.py from the .blend BlenderBaked/ came from.
         #     # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
         #     skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # ),
@@ -4277,42 +4303,56 @@ if __name__ == "__main__":
         #     name             = "TableAndOtherInteriorWithSpecular",
         #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
         #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
-        #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
-        #     # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
-        #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
-        # ),
-        SceneConfig(
-            name             = "TableAndOtherInteriorWithSpecularFlatNormal",
-            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
-            model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
-            external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal_flat.exr",
-            # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
-            # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
-        ),
-        #  SceneConfig(
-        #     name             = "TableAndOtherInteriorWithSpecularHighDetails",
-        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRHighDetails/transforms.json",
-        #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
-        #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmooth/BakedMaterial_normal.exr",
+        #     external_normal_path = f"{TABLE_NORMALS}/normal_4096/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{TABLE_NORMALS}/normal_2048/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{TABLE_NORMALS}/normal_1024/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{TABLE_NORMALS}/normal_512/BakedMaterial_normal.exr",
         #     # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
         #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
         # ),
         # SceneConfig(
-        #             name             = "TableAndOtherInteriorWithSpecularNight",
-        #             transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmoothNight/transforms.json",
-        #             model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
-        #             external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmoothNight/BakedMaterial_normal.exr",
-        #             # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
-        #             # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
-        #         ),
+        #     name             = "TableAndOtherInteriorWithSpecularFlatNormal",
+        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
+        #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+        #     # Flat normal: no external_normal_path. With ium_mesh_normals="obj" the OBJ
+        #     # normals reproduce Blender's flat bake (p99 0.03° on sphere and bunny), and
+        #     # BakedMaterial_normal_flat.exr exists only at 8192.
+        #     # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
+        #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+        # ),
+        # SceneConfig(
+        #     name             = "TableAndOtherInteriorWithSpecularHighDetails",
+        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRHighDetails/transforms.json",
+        #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+        #     external_normal_path = f"{TABLE_NORMALS}/normal_4096/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{TABLE_NORMALS}/normal_2048/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{TABLE_NORMALS}/normal_1024/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{TABLE_NORMALS}/normal_512/BakedMaterial_normal.exr",
+        #     # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
+        #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+        # ),
+        # SceneConfig(
+        #     name             = "TableAndOtherInteriorWithSpecularNight",
+        #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmoothNight/transforms.json",
+        #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+        #     external_normal_path = f"{TABLE_NORMALS}/normal_4096/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{TABLE_NORMALS}/normal_2048/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{TABLE_NORMALS}/normal_1024/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{TABLE_NORMALS}/normal_512/BakedMaterial_normal.exr",
+        #     # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
+        #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
+        # ),
         # SceneConfig(
         #     name             = "TableAndOtherInteriorNoSpecular",
         #     transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenExrSmoothNoDiffuse/transforms.json",
         #     model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
-        #     external_normal_path = f"{REPO}/Scenes/TableAndOtherInterior/BlenderBakedSmoothNoDiffuse/BakedMaterial_normal.exr",
+        #     external_normal_path = f"{TABLE_NORMALS}/normal_4096/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{TABLE_NORMALS}/normal_2048/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{TABLE_NORMALS}/normal_1024/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{TABLE_NORMALS}/normal_512/BakedMaterial_normal.exr",
         #     # GT HDR used only as a reference for compare_skybox_to_gt (not for rendering)
         #     # skybox_path      = f"{REPO}/Scenes/TableAndOtherInterior/Blender/assets/hdri/wooden_studio_13_4k.exr",
-        # )
+        # ),
         # SceneConfig(
         #     name            = "SwordShield",
         #     transforms_path = f"{REPO}/Scenes/SwordShield/NerfOpenEXR/transforms.json",
@@ -4322,18 +4362,95 @@ if __name__ == "__main__":
         #     name             = "SwordShieldStudio",
         #     transforms_path  = f"{REPO}/Scenes/SwordShield Thesis/NerfStudio/transforms.json",
         #     model_path       = f"{REPO}/Scenes/SwordShield Thesis/BakedStudio/Baked.obj",
-        #     external_normal_path = f"{REPO}/Scenes/SwordShield Thesis/BakedStudio/BakedMaterial_normal.exr",
+        #     external_normal_path = f"{SWORD_NORMALS}/normal_4096/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{SWORD_NORMALS}/normal_2048/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{SWORD_NORMALS}/normal_1024/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{SWORD_NORMALS}/normal_512/BakedMaterial_normal.exr",
         # ),
         # SceneConfig(
         #     name             = "SwordShieldNight",
         #     transforms_path  = f"{REPO}/Scenes/SwordShield Thesis/NerfNight/transforms.json",
         #     model_path       = f"{REPO}/Scenes/SwordShield Thesis/BakedNight/Baked.obj",
-        #     external_normal_path = f"{REPO}/Scenes/SwordShield Thesis/BakedNight/BakedMaterial_normal.exr",
-        # )
-
+        #     external_normal_path = f"{SWORD_NORMALS}/normal_4096/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{SWORD_NORMALS}/normal_2048/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{SWORD_NORMALS}/normal_1024/BakedMaterial_normal.exr",
+        #     # external_normal_path = f"{SWORD_NORMALS}/normal_512/BakedMaterial_normal.exr",
+        # ),
     ]
 
-    # ── Execution ─────────────────────────────────────────────────────────────
+    # To rerun Steps 3-4 on an existing run's NeRF, seed the new folder with
+    # seed_run_from(<run>/<scene>, <new root>/<scene>) and turn Steps 1-2 off.
+
+    # ── What to run ───────────────────────────────────────────────────────────
+    # RUN_NORMAL_AB: the shading-normal A/B below (Steps 3+4 only, reusing a NeRF).
+    # RUN_SWEEP: the NeRF training sweep below (full runs from scratch). Off: its
+    #   SWEEP_ROOT is test_flat_normal, a reference run that must not be touched.
+    RUN_NORMAL_AB    = True
+    RUN_SWEEP        = False
+
+    # ── Shading-normal A/B (2026-10-01) ───────────────────────────────────────
+    # Which normal shades the reconstruction, everything else equal:
+    #   normal_map   the Blender bake at NORMAL_AB_SIZE drives every pass (irradiance,
+    #                indirect, cones, grazing test)
+    #   mesh_normal  no normal map: the OBJ normals (ium_mesh_normals="obj") everywhere
+    # Steps 3+4 only, on the NeRF of NORMAL_AB_SOURCE, which seed_run_from copies into
+    # each test folder (the source is only read). Each test keeps its own Step 3 cache:
+    # the normal changes every shading pass.
+    NORMAL_AB_SOURCE = "D:/tesi_output/test_sword_shield_after_fix_irradiance/exp_l1_d02"
+    NORMAL_AB_ROOT   = "D:/tesi_output/test_normal_ab_1024"
+    NORMAL_AB_SIZE   = 1024
+    NORMAL_AB_SCENES = [
+        SceneConfig(
+            name             = "SwordShieldStudio",
+            transforms_path  = f"{REPO}/Scenes/SwordShield Thesis/NerfStudio/transforms.json",
+            model_path       = f"{REPO}/Scenes/SwordShield Thesis/BakedStudio/Baked.obj",
+            external_normal_path = f"{SWORD_NORMALS}/normal_{NORMAL_AB_SIZE}/BakedMaterial_normal.exr",
+        ),
+        SceneConfig(
+            name             = "TableAndOtherInteriorWithSpecular",
+            transforms_path  = f"{REPO}/Scenes/TableAndOtherInterior/NerfOpenEXRSmooth/transforms.json",
+            model_path       = f"{REPO}/Scenes/TableAndOtherInterior/ModelsSmooth/Baked.obj",
+            external_normal_path = f"{TABLE_NORMALS}/normal_{NORMAL_AB_SIZE}/BakedMaterial_normal.exr",
+        ),
+    ]
+
+    if RUN_NORMAL_AB:
+        ab_cfg = copy.deepcopy(template)
+        ab_cfg.run_step1 = ab_cfg.run_step2 = False
+        ab_cfg.run_step3 = ab_cfg.run_step4 = True
+        # NeRF fields of the source run (exp_l1_d02): Step 2 is skipped, but the manifest
+        # must describe the checkpoint it actually reuses.
+        ab_cfg.nerf_num_iters      = 75000
+        ab_cfg.nerf_lr_decay_steps = 100000
+        ab_cfg.nerf_rgb_activation = "exp"
+        ab_cfg.nerf_loss_type      = "l1"
+        ab_cfg.nerf_lr_decay       = 0.2
+        ab_cfg.render.skybox_source               = "nerf"
+        ab_cfg.render.ium_texture_size            = [NORMAL_AB_SIZE, NORMAL_AB_SIZE]
+        ab_cfg.render.color_texture_image_sources = ["gt"]
+        for ab_tag, with_map in (("normal_map", True), ("mesh_normal", False)):
+            ab_scenes = []
+            for s in NORMAL_AB_SCENES:
+                s = copy.copy(s)
+                if not with_map:
+                    s.external_normal_path = None   # the template's None stays in force
+                ab_scenes.append(s)
+            for s in ab_scenes:
+                seed_run_from(f"{NORMAL_AB_SOURCE}/{s.name}", f"{NORMAL_AB_ROOT}/{ab_tag}/{s.name}")
+            run_pipeline_multi(
+                ab_cfg, ab_scenes,
+                output_root = f"{NORMAL_AB_ROOT}/{ab_tag}",
+                run_note    = (f"normal A/B: {ab_tag} | atlas {NORMAL_AB_SIZE} | Step 3+4 on the "
+                               f"NeRF of {NORMAL_AB_SOURCE}"),
+                tb_enabled  = False,
+            )
+        # Compare against the Blender GT, per scene (GT dir: BakedStudio / BlenderBakedSmooth):
+        #   python scripts/compare_grazing_ab.py \
+        #       <ROOT>/normal_map/<scene> <ROOT>/mesh_normal/<scene> \
+        #       --labels normal_map mesh_normal --gt-dir <GT dir> \
+        #       --rect 0 0 1024 1024 --crop 0 0 1024 1024 --out <ROOT>/<scene>_normal_ab.json
+
+    # ── NeRF sweep ────────────────────────────────────────────────────────────
     # Factorial 2×2×2 sweep: activation × loss × decay — 8 runs in total.
     # Each run gets its own output_root (isolated checkpoints: exp and softplus are
 
@@ -4353,11 +4470,8 @@ if __name__ == "__main__":
     DECAYS     = (0.2,)
     SWEEP_ROOT = "D:/tesi_output/test_flat_normal"
 
-    for name, act, loss in EXPERIMENTS:
+    for name, act, loss in (EXPERIMENTS if RUN_SWEEP else []):
         for decay in DECAYS:
-
-
-            
             cfg = copy.deepcopy(template)
             cfg.nerf_num_iters       = 75000
             cfg.nerf_lr_decay_steps  = 100000  # fixed anchor, aligned with num_iters

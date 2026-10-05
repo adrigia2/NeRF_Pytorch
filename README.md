@@ -148,9 +148,12 @@ Since there is no conversion on this side, the mesh has to be exported from Blen
 **Forward Axis = Y, Up Axis = Z**: the OBJ exporter defaults to −Z forward / Y up, which
 rotates the model 90° about X relative to the cameras without any error being raised.
 
-**A note on the mesh normals.** The OBJ loader reads positions, indices and UVs only, so
-the IUM pass computes *face* normals by cross product (CCW winding assumed). For smooth
-shading, supply a baked normal map through `external_normal_path`.
+**A note on the mesh normals.** By default (`ium_mesh_normals="triangle"`) the IUM pass
+computes *face* normals by cross product (CCW winding assumed); with `"obj"` it
+interpolates the OBJ's vertex normals (`vn`), smooth or flat as exported. For the full
+shading detail, supply a baked normal map through `external_normal_path`. **It must
+already be `ium_texture_size`**: normal maps are never resized, and a map of another size
+stops Step 3. Bake one per atlas size with `blender/bake_normal_variants.py` (below).
 
 ## 4. Configuring a run
 
@@ -181,8 +184,7 @@ Passed as `PipelineConfig(render=RenderConfig(...))`. The knobs that matter in p
 |---|---|---|
 | `render_ium`, `render_visibility` | `True` | Step 3 geometry passes. Everything below depends on them. |
 | `ium_texture_size` | `[512, 512]` | Texture-space resolution, `[w, h]`. Production runs use `[4096, 4096]`. |
-| `external_normal_path` | `None` | Baked normal map replacing the OptiX mesh normals. |
-| `external_normal_resolution_mode` | `None` | `"resample"` (rescale the map), `"adapt"` (rescale the IUM instead), `None` (ask at runtime). |
+| `external_normal_path` | `None` | Baked normal map replacing the OptiX mesh normals. Must match `ium_texture_size` exactly: it is never resized. |
 | `apply_scale` | `False` | **Must stay `False`.** The `scale` in `transforms.json` would also have to be applied to the camera translations; applying it on one side only puts the NeRF query points off the mesh surface. |
 | `render_color_texture` | `False` | Bakes the observed colour into texture space. |
 | `color_texture_image_sources` | `["gt"]` | Which images to bake from: `"gt"` (ground truth) and/or `"nerf"` (the Step 2b predictions). **Every entry gets a full, independent set of outputs** under `sources/<name>/`. |
@@ -341,7 +343,7 @@ python scripts/compare_roi_run.py <run_dir> --tag my_test
 | Folder | Content |
 |---|---|
 | `nerf/` | The NeRF implementation: `config`, `dataset`, `encoding`, `model`, `rays`, `render`, `train`, `metrics`, `csv_logger`, `checkpoint`. |
-| `blender/` | `bake_unified_material.py` — run **inside Blender** (Text Editor → Run Script, or installed as an add-on). Joins the scene meshes, bakes every material into one PBR texture set and assembles a new "Baked" scene. |
+| `blender/` | `bake_unified_material.py` — run **inside Blender** (Text Editor → Run Script, or installed as an add-on). Joins the scene meshes, bakes every material into one PBR texture set and assembles a new "Baked" scene. `bake_normal_variants.py` — run headless on the same source `.blend` (`blender -b <file> --python bake_normal_variants.py -- --out <dir> --sizes 4096 1024`): re-bakes only the normal map at each size, on the same UV layout (checked loop by loop against the file's "Baked" scene), into `<dir>/normal_<N>/`. |
 | `assets/` | A small self-contained sample scene (`SwordShield`). |
 | `scripts/` | Reruns, inspection and the two OptiX smoke tests used above. Not imported by the pipeline. |
 
